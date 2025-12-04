@@ -28,7 +28,7 @@ TRUNCATION_FOR_NODAL_SHAPE = {
 VALID_NODAL_SHAPES = tuple(TRUNCATION_FOR_NODAL_SHAPE.keys())
 VALID_TRUNCATIONS = tuple(TRUNCATION_FOR_NODAL_SHAPE.values())
 
-def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=None) -> CoordinateSystem:
+def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=None, hybrid_vertical=False) -> CoordinateSystem:
     f"""
     Returns a CoordinateSystem object for the given number of layers and one of the following horizontal resolutions: {VALID_TRUNCATIONS}.
     """
@@ -42,9 +42,6 @@ def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=Non
         raise ValueError(f"Invalid horizontal resolution: {spectral_truncation}. Must be one of: {VALID_TRUNCATIONS}.")
     horizontal_grid = getattr(dinosaur.spherical_harmonic.Grid, f'T{spectral_truncation}')
 
-    if layers not in SIGMA_LAYER_BOUNDARIES:
-        raise ValueError(f"Invalid number of layers: {layers}. Must be one of: {tuple(SIGMA_LAYER_BOUNDARIES.keys())}")
-
     physics_specs = PrimitiveEquationsSpecs.from_si(scale=SI_SCALE)
 
     if spmd_mesh is not None:
@@ -53,10 +50,20 @@ def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=Non
     else:
         spherical_harmonics_impl = RealSphericalHarmonics
 
+    if hybrid_vertical:
+        vertical = dinosaur.hybrid_coordinates.HybridCoordinates.analytic_ecmwf_like(
+            nlevels=layers
+        )
+    else:
+        if layers not in SIGMA_LAYER_BOUNDARIES:
+            raise ValueError(f"Invalid number of layers: {layers}. Must be one of: {tuple(SIGMA_LAYER_BOUNDARIES.keys())}")
+
+        vertical = dinosaur.sigma_coordinates.SigmaCoordinates(SIGMA_LAYER_BOUNDARIES[layers])
+
     return CoordinateSystem(
         horizontal=horizontal_grid(radius=physics_specs.radius, 
                                    spherical_harmonics_impl=spherical_harmonics_impl),
-        vertical=dinosaur.sigma_coordinates.SigmaCoordinates(SIGMA_LAYER_BOUNDARIES[layers]),
+        vertical=vertical,
         spmd_mesh=spmd_mesh
     )
 

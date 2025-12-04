@@ -35,11 +35,6 @@ class RadiationParameters:
     ch4_vmr: float           # CH4 volume mixing ratio
     n2o_vmr: float           # N2O volume mixing ratio
     
-    # Surface properties
-    surface_albedo_vis: float  # Visible band albedo
-    surface_albedo_nir: float  # Near-IR band albedo
-    surface_emissivity: float  # Longwave emissivity
-    
     # Numerical parameters
     min_cos_zenith: float    # Minimum cosine solar zenith angle (~88 deg)
     flux_epsilon: float      # Small value for flux calculations
@@ -53,9 +48,8 @@ class RadiationParameters:
                  lw_band_limits=((10, 350), (350, 500), (500, 2500)),
                  sw_band_limits=((4000, 14500), (14500, 50000)),
                  co2_vmr=400e-6, ch4_vmr=1.8e-6, n2o_vmr=0.32e-6,
-                 surface_albedo_vis=0.15, surface_albedo_nir=0.15,
-                 surface_emissivity=0.98, min_cos_zenith=0.035,
-                 flux_epsilon=1e-6, cld_tau_min=1e-6, cld_frac_min=1e-3) -> 'RadiationParameters':
+                 min_cos_zenith=0.035, flux_epsilon=1e-6, 
+                 cld_tau_min=1e-6, cld_frac_min=1e-3) -> 'RadiationParameters':
         """Return default radiation parameters"""
         return cls(
             dt_rad=jnp.array(dt_rad),
@@ -67,9 +61,6 @@ class RadiationParameters:
             co2_vmr=jnp.array(co2_vmr),
             ch4_vmr=jnp.array(ch4_vmr),
             n2o_vmr=jnp.array(n2o_vmr),
-            surface_albedo_vis=jnp.array(surface_albedo_vis),
-            surface_albedo_nir=jnp.array(surface_albedo_nir),
-            surface_emissivity=jnp.array(surface_emissivity),
             min_cos_zenith=jnp.array(min_cos_zenith),
             flux_epsilon=jnp.array(flux_epsilon),
             cld_tau_min=jnp.array(cld_tau_min),
@@ -97,12 +88,6 @@ class RadiationState(NamedTuple):
     cloud_fraction: jnp.ndarray      # Cloud fraction [nlev]
     cloud_water_path: jnp.ndarray    # Cloud water path (kg/m²) [nlev]
     cloud_ice_path: jnp.ndarray      # Cloud ice path (kg/m²) [nlev]
-    
-    # Surface properties
-    surface_temperature: jnp.ndarray # Surface temperature (K)
-    surface_albedo_vis: jnp.ndarray  # Visible surface albedo
-    surface_albedo_nir: jnp.ndarray  # Near-IR surface albedo
-    surface_emissivity: jnp.ndarray  # Surface emissivity
     
     # Aerosol properties (optional)
     aerosol_optical_depth: jnp.ndarray     # Aerosol optical depth [nlev, nbands]

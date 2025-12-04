@@ -193,6 +193,7 @@ class Model:
 
     def __init__(self, time_step=30.0, geometry: Geometry=None, coords: CoordinateSystem=None,
                  physics: Physics=None, diffusion: DiffusionFilter=None, spmd_mesh: tuple[int, ...]=None,
+                 use_hybrid_coords=None,
                  start_date: jdt.Datetime=jdt.to_datetime('2000-01-01')) -> None:
         """Initialize the model with the given time step, save interval, and total time.
         
@@ -209,6 +210,8 @@ class Model:
                 DiffusionFilter object describing horizontal diffusion filter params
             spmd_mesh:
                 Optional tuple describing the SPMD mesh for parallelization
+            use_hybrid_coords:
+                Whether to use hybrid vertical coordinates (default None, auto-detected based on physics type)
             start_date: 
                 jax_datetime.Datetime object containing start date of the simulation (default January 1, 2000)
 
@@ -227,8 +230,8 @@ class Model:
             self.geometry = geometry
             self.coords = coords_from_geometry(geometry, spmd_mesh=spmd_mesh)
         else:
-            self.coords = coords if coords is not None else get_coords(spmd_mesh=spmd_mesh)
-            self.geometry = Geometry.from_coords(coords=self.coords)
+            self.coords = coords if coords is not None else get_coords(spmd_mesh=spmd_mesh, hybrid_vertical=use_hybrid_coords)
+            self.geometry = Geometry.from_coords(coords=self.coords, hybrid_vertical=use_hybrid_coords)
 
         # Get the reference temperature and orography. This also returns the initial state function (if wanted to start from rest)
         self.default_state_fn, aux_features = primitive_equations_states.isothermal_rest_atmosphere(

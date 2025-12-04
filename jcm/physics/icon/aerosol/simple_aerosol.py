@@ -5,7 +5,7 @@ from jax.scipy.special import betainc
 from jcm.physics.icon.icon_physics_data import PhysicsData
 from jcm.physics.icon.icon_physics import PhysicsTendency
 from jcm.physics_interface import PhysicsState
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.geometry import Geometry
 from .aerosol_params import AerosolParameters
 
@@ -14,7 +14,7 @@ def get_simple_aerosol(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: AerosolParameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> Tuple[PhysicsTendency, PhysicsData]:
     """
@@ -35,7 +35,7 @@ def get_simple_aerosol(
     aerosol_params = parameters.aerosol
     
     # Get grid coordinates from geometry
-    nlon, nlat = boundaries.surface_temperature.shape
+    nlon, nlat = geometry.nodal_shape[1], geometry.nodal_shape[2]
     lat = jnp.tile(geometry.radang, nlon) * 180.0 / jnp.pi  # Convert to degrees
     longitudes = jnp.linspace(-180.0, 180.0, nlon, endpoint=False)  # degrees
     lon = jnp.repeat(longitudes, nlat)  # degrees East

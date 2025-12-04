@@ -85,24 +85,27 @@ def _initialize_vertical(kx):
     return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi
 
 def _initialize_hybrid_vertical(nlevels: int):
-        """Get vertical coordinates for hybrid system."""
-        hybrid_levels = ICONLevels.get_levels(nlevels)
-        
-        # Create approximate sigma levels for backward compatibility
-        hsg = hybrid_levels.b_boundaries
-        fsg = hybrid_levels.b_centers
-        dhs = jnp.diff(hsg)
-        
-        # Create pseudo-sigma logarithm (avoiding log(0))
-        fsg_safe = jnp.where(fsg > 1e-10, fsg, 1e-10)
-        sigl = jnp.log(fsg_safe)
-        
-        # Create dummy conversion factors (overridden by hybrid calculations)
-        grdsig = jnp.ones_like(dhs) * grav / p0
-        grdscp = grdsig / cp
-        wvi = jnp.zeros((nlevels, 2))
-        
-        return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels
+    """Get vertical coordinates for hybrid system."""
+    from jcm.physics.icon.icon_levels import get_icon_levels
+    hybrid_levels = get_icon_levels(nlevels)
+    
+    #FIXME: These might need to be updated every timestep to account for changing surface pressure. Possibly in 'apply_forcing'?
+
+    # Create approximate sigma levels for backward compatibility
+    hsg = hybrid_levels.b_boundaries
+    fsg = hybrid_levels.b_centers
+    dhs = jnp.diff(hsg)
+    
+    # Create pseudo-sigma logarithm (avoiding log(0))
+    fsg_safe = jnp.where(fsg > 1e-10, fsg, 1e-10)
+    sigl = jnp.log(fsg_safe)
+    
+    # Create dummy conversion factors (overridden by hybrid calculations)
+    grdsig = jnp.ones_like(dhs) * grav / p0
+    grdscp = grdsig / cp
+    wvi = jnp.zeros((nlevels, 2))
+    
+    return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels
 
 @tree_math.struct
 class Geometry:
@@ -151,13 +154,16 @@ class Geometry:
         phis0 = spectral_truncation(coords.horizontal, phi0, truncation_number=truncation_number)
 
         # Horizontal coordinates
-        radang, sia, coa = cls._get_horizontal_coords(coords)
-
+        # Horizontal functions of latitude (from south to north)
+        radang = coords.horizontal.latitudes
+        sia, coa = jnp.sin(radang), jnp.cos(radang)
+        
         # Vertical coordinates
         #TODO: This should all be dealt with by the coordinates object so we don't have to pass in the hybrid flag
+        # And in fact, this should just be easy to get from coords.vertical
         kx = coords.nodal_shape[0]
         if hybrid_vertical:
-            hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels = cls._get_hybrid_vertical_coords(kx)
+            hsg, fsg, dhs, sigl, grdsig, grdscp, wvi = _initialize_hybrid_vertical(kx)
         else:
             hsg, fsg, dhs, sigl, grdsig, grdscp, wvi = _initialize_vertical(kx)
 
@@ -261,7 +267,7 @@ class Geometry:
                    hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
                    grdsig=grdsig, grdscp=grdscp, wvi=wvi)
 
-def coords_from_geometry(geometry: Geometry, spmd_mesh=None) -> CoordinateSystem:
+def coords_from_geometry(geometry: Geometry, spmd_mesh=None, hybrid_vertical=False) -> CoordinateSystem:
     """Extract a dinosaur CoordinateSystem from a Geometry object.
 
     Args:
@@ -275,5 +281,6 @@ def coords_from_geometry(geometry: Geometry, spmd_mesh=None) -> CoordinateSystem
     return get_coords(
         layers=geometry.nodal_shape[0],
         spectral_truncation=TRUNCATION_FOR_NODAL_SHAPE[geometry.nodal_shape[1:]],
-        spmd_mesh=spmd_mesh
+        spmd_mesh=spmd_mesh,
+        hybrid_vertical=hybrid_vertical
     )

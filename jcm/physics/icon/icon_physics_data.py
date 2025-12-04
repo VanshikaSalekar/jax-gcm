@@ -20,6 +20,11 @@ class RadiationData:
     
     # Solar/geometric variables
     cos_zenith: jnp.ndarray           # Cosine solar zenith angle [1] (ncols,)
+
+    # Surface properties
+    surface_albedo_vis: jnp.ndarray    # Surface albedo visible [1] (ncols,)
+    surface_albedo_nir: jnp.ndarray    # Surface albedo near-infrared [1] (ncols,)
+    surface_emissivity: jnp.ndarray    # Surface emissivity [1] (ncols,)
     
     # Shortwave fluxes
     sw_flux_up: jnp.ndarray          # Upward SW flux [W/m²] (nlev+1, ncols)
@@ -46,6 +51,9 @@ class RadiationData:
     def zeros(cls, nodal_shape, nlev):
         return cls(
             cos_zenith=jnp.zeros(nodal_shape),
+            surface_albedo_vis=jnp.zeros(nodal_shape),
+            surface_albedo_nir=jnp.zeros(nodal_shape),
+            surface_emissivity=jnp.zeros(nodal_shape),
             sw_flux_up=jnp.zeros((nlev+1,) + nodal_shape),
             sw_flux_down=jnp.zeros((nlev+1,) + nodal_shape),
             sw_heating_rate=jnp.zeros((nlev,) + nodal_shape),
@@ -64,6 +72,9 @@ class RadiationData:
     def copy(self, **kwargs):
         new_data = {
             'cos_zenith': self.cos_zenith,
+            'surface_albedo_vis': self.surface_albedo_vis,
+            'surface_albedo_nir': self.surface_albedo_nir,
+            'surface_emissivity': self.surface_emissivity,
             'sw_flux_up': self.sw_flux_up,
             'sw_flux_down': self.sw_flux_down,
             'sw_heating_rate': self.sw_heating_rate,
@@ -232,6 +243,9 @@ class SurfaceData:
     # Surface temperatures
     surface_temperature: jnp.ndarray # Surface temperature [K] (ncols,)
     skin_temperature: jnp.ndarray    # Skin temperature [K] (ncols,)
+
+    # Surface properties
+    roughness_length: jnp.ndarray    # Surface roughness length [m] (ncols,)
     
     # Evaporation
     evaporation: jnp.ndarray         # Evaporation [kg/m²/s] (ncols,)
@@ -249,6 +263,7 @@ class SurfaceData:
             momentum_flux_v=jnp.zeros(nodal_shape),
             surface_temperature=jnp.zeros(nodal_shape),
             skin_temperature=jnp.zeros(nodal_shape),
+            roughness_length=jnp.zeros(nodal_shape),
             evaporation=jnp.zeros(nodal_shape),
             ch=jnp.zeros(nodal_shape),
             cm=jnp.zeros(nodal_shape),
@@ -262,6 +277,7 @@ class SurfaceData:
             'momentum_flux_v': self.momentum_flux_v,
             'surface_temperature': self.surface_temperature,
             'skin_temperature': self.skin_temperature,
+            'roughness_length': self.roughness_length,
             'evaporation': self.evaporation,
             'ch': self.ch,
             'cm': self.cm,

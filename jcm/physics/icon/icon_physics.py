@@ -14,7 +14,7 @@ import jax.numpy as jnp
 from collections import abc
 from typing import Tuple, Optional
 from jcm.physics_interface import PhysicsState, PhysicsTendency, Physics
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.geometry import Geometry
 from jcm.date import DateData
 from jcm.physics.icon.constants import physical_constants
@@ -32,6 +32,7 @@ from jcm.physics.icon.gravity_waves import gravity_wave_drag
 from jcm.physics.icon.chemistry import simple_chemistry, initialize_chemistry_tracers
 from jcm.physics.icon.aerosol.simple_aerosol import get_simple_aerosol
 from jcm.physics.icon.icon_physics_data import PhysicsData
+from jcm.physics.icon.forcing import apply_forcing_data
 
 class IconPhysics(Physics):
     """
@@ -68,6 +69,7 @@ class IconPhysics(Physics):
         # Build list of physics terms
         self.terms = [
             _prepare_common_physics_state,
+            apply_forcing_data,             # Time-varying boundary conditions
             get_simple_aerosol,            # Aerosol before radiation FIXME: get_CDNC issue
             apply_chemistry,               # Chemistry for ozone, methane etc.
             apply_radiation,               # Radiation early for surface fluxes. FIXME: revisit shortwave flux--top of atmosphere is emitting shortwave up while receiving none from below, causing cooling. downward shortwave flux is constant and not heating the atmosphere. Problem seems to be ozone optical depth
@@ -82,7 +84,7 @@ class IconPhysics(Physics):
     def compute_tendencies(
         self,
         state: PhysicsState,
-        boundaries: BoundaryData,
+        forcing: ForcingData,
         geometry: Geometry,
         date: DateData,
     ) -> Tuple[PhysicsTendency, PhysicsData]:
@@ -114,22 +116,6 @@ class IconPhysics(Physics):
         nlev, nlon, nlat = state.temperature.shape  # Note: geometry uses (nlev, nlon, nlat) convention
         ncols = nlat * nlon
         
-        # Update boundaries with time-varying conditions before applying physics
-        from jcm.boundaries import compute_time_varying_boundaries
-        # Convert DateData to day_of_year and time_of_day format
-        day_of_year = date.tyear * 365.25  # Convert fractional year to day of year
-        time_of_day = (day_of_year % 1.0) * 24.0  # Extract time of day from fractional part
-        day_of_year = jnp.floor(day_of_year)  # Get integer day of year
-        year = date.model_year
-        
-        updated_boundaries = compute_time_varying_boundaries(
-            boundaries, 
-            geometry,
-            day_of_year=day_of_year,
-            time_of_day=time_of_day,
-            year=year
-        )
-        
         # OPTIMIZATION: Single reshape operation using tree_map for TPU efficiency
         vectorized_state = self._reshape_state_to_columns(state, nlev, ncols)
         
@@ -144,7 +130,7 @@ class IconPhysics(Physics):
             
             # Apply term to vectorized state (returns column format)
             term_tendency, physics_data = term(
-                vectorized_state, physics_data, self.parameters, updated_boundaries, geometry
+                vectorized_state, physics_data, self.parameters, boundaries, geometry
             )
             
             # OPTIMIZATION: Direct accumulation in column format (no reshape)
@@ -456,7 +442,7 @@ def _prepare_common_physics_state(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """
@@ -552,7 +538,7 @@ def _prepare_common_physics_state(
 def apply_radiation(state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply radiation heating rates"""
@@ -566,7 +552,7 @@ def apply_radiation(state: PhysicsState,
     seconds_since_midnight = date.seconds_since_midnight if hasattr(date, 'seconds_since_midnight') else 43200.0  # Default to noon
     
     # Get lat/lon from geometry - reshape to column format
-    nlon, nlat = boundaries.surface_temperature.shape
+    nlon, nlat = geometry.nodal_shape
     latitudes = jnp.tile(geometry.radang, nlon)  # Repeat lats for each lon
     longitudes_1d = jnp.linspace(-jnp.pi, jnp.pi, nlon, endpoint=False)  # radians
     longitudes = jnp.repeat(longitudes_1d, nlat)  # Repeat lons for each lat
@@ -584,8 +570,8 @@ def apply_radiation(state: PhysicsState,
     # Get ozone from chemistry data (reshape to column format)
     ozone_vmr = physics_data.chemistry.ozone_vmr * 1e-9  # Convert ppbv to VMR
     
-    # Get CO2 from boundaries (reshape to column format)
-    co2_vmr = boundaries.co2_concentration.reshape(ncols) * 1e-6  # Convert ppmv to VMR
+    # Get CO2 from forcing (reshape to column format)
+    co2_vmr = forcing.co2_concentration.reshape(ncols) * 1e-6  # Convert ppmv to VMR
     
     # Prepare aerosol data for vmap - reshape to have column as the mapped dimension
     aerosol_data_for_vmap = physics_data.aerosol.copy(
@@ -602,12 +588,16 @@ def apply_radiation(state: PhysicsState,
         radiation_scheme,
         in_axes=(1, 1, 1, 1,
                  1, 1, 1, 1,
+                 1, 1, 
+                 1, 1,
                  None, None, 0, 0,
                  None, 0, 1, 0),  # day_of_year, seconds_since_midnight, parameters are scalars, aerosol_data is per column
         out_axes=(0, 0)  # Returns (RadiationTendencies, RadiationData) per column
     )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.layer_thickness,
       physics_data.diagnostics.air_density, cloud_water, cloud_ice, cloud_fraction,
-      day_of_year, seconds_since_midnight, latitudes, longitudes,
+      physics_data.surface.surface_temperature, physics_data.radiation.surface_albedo_vis, 
+      physics_data.radiation.surface_albedo_nir, physics_data.radiation.surface_emissivity,
+      day_of_year, seconds_since_midnight, latitudes, longitudes, 
       parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr)
     
     # Unpack structured results directly
@@ -654,7 +644,7 @@ def apply_convection(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply Tiedtke-Nordeng convection scheme with fixed qc/qi transport"""
@@ -704,7 +694,7 @@ def apply_clouds(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply shallow cloud scheme """
@@ -760,7 +750,7 @@ def apply_microphysics(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply cloud microphysics scheme"""
@@ -818,7 +808,7 @@ def apply_vertical_diffusion(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply vertical diffusion and boundary layer physics"""
@@ -853,10 +843,10 @@ def apply_vertical_diffusion(
     surface_fraction = jnp.zeros((ncols, nsfc_type))
     surface_fraction = surface_fraction.at[:, 2].set(1.0)  # All land for now
     
-    # Get surface properties from boundaries (now guaranteed to be present)
+    # Get surface properties from forcing
     # Reshape boundary fields to column format
-    surface_temp = boundaries.surface_temperature.reshape(ncols)
-    roughness_length = boundaries.roughness_length.reshape(ncols)
+    surface_temp = forcing.surface_temperature.reshape(ncols)
+    roughness_length = forcing.roughness_length.reshape(ncols)
 
     surface_temperature = jnp.repeat(surface_temp[:, jnp.newaxis], nsfc_type, axis=1)
     roughness = jnp.repeat(roughness_length[:, jnp.newaxis], nsfc_type, axis=1)
@@ -966,7 +956,7 @@ def apply_surface(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply surface physics and calculate surface fluxes"""
@@ -978,16 +968,13 @@ def apply_surface(
     pressure_levels = physics_data.diagnostics.pressure_full
     # Get surface properties from boundaries (now guaranteed to be present)
     # Reshape boundary fields to column format
-    surface_temp = boundaries.surface_temperature.reshape(ncols)
-    surface_albedo_vis = boundaries.surface_albedo_vis.reshape(ncols)
-    surface_albedo_nir = boundaries.surface_albedo_nir.reshape(ncols)
-    surface_emissivity = boundaries.surface_emissivity.reshape(ncols)
+    surface_temp = physics_data.surface_data.surface_temperature.reshape(ncols)
 
     # Initialize surface state (simplified)
     # In reality, this should come from the model's surface state
     nsfc_type = 3  # Fixed value: water, ice, land
     surface_fractions = jnp.zeros((ncols, nsfc_type))
-    land_fraction = boundaries.fmask.reshape((ncols,))
+    land_fraction = geometry.fmask.reshape((ncols,))
     surface_fractions = surface_fractions.at[:, 0].set(1.0 - land_fraction)
     surface_fractions = surface_fractions.at[:, 2].set(land_fraction)  # FIXME: verify/improve this setup
 
@@ -1106,7 +1093,7 @@ def apply_gravity_waves(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply gravity wave drag"""
@@ -1152,7 +1139,7 @@ def apply_chemistry(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply chemistry tendencies

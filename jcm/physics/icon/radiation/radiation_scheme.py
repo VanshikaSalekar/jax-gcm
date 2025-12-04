@@ -188,10 +188,6 @@ def prepare_radiation_state(
         cloud_fraction=cloud_fraction,
         cloud_water_path=cloud_water_path,
         cloud_ice_path=cloud_ice_path,
-        surface_temperature=temperature[-1:],  # Bottom level temperature
-        surface_albedo_vis=jnp.array([0.15]),  # Visible albedo
-        surface_albedo_nir=jnp.array([0.15]),  # Near-IR albedo
-        surface_emissivity=jnp.array([0.98]),
         aerosol_optical_depth=aerosol_optical_depth,
         aerosol_ssa=aerosol_ssa,
         aerosol_asymmetry=aerosol_asymmetry
@@ -208,6 +204,10 @@ def radiation_scheme(
     cloud_water: jnp.ndarray,
     cloud_ice: jnp.ndarray,
     cloud_fraction: jnp.ndarray,
+    surface_temperature: jnp.ndarray,
+    surface_albedo_vis: jnp.ndarray,
+    surface_albedo_nir: jnp.ndarray,
+    surface_emissivity: jnp.ndarray,
     day_of_year: float,
     seconds_since_midnight: float,
     latitude: float,
@@ -245,6 +245,7 @@ def radiation_scheme(
     
     # For now, assume aerosol properties are spectrally uniform
     # and expand to radiation band structure
+    # FIXME - this isn't used
     n_sw_bands = parameters.n_sw_bands
     n_lw_bands = parameters.n_lw_bands
     
@@ -372,12 +373,12 @@ def radiation_scheme(
     )
     
     # Surface properties
-    surface_planck = planck_bands_lw(temperature[-1:], lw_band_limits)[0]
+    surface_planck = planck_bands_lw(surface_temperature, lw_band_limits)[0]
     
     # Calculate longwave fluxes
     flux_up_lw, flux_down_lw = longwave_fluxes(
         lw_optics, planck_layers, planck_interfaces,
-        rad_state.surface_emissivity[0], surface_planck
+        surface_emissivity[0], surface_planck
     )
     
     # Calculate shortwave fluxes
@@ -388,7 +389,7 @@ def radiation_scheme(
     
     flux_up_sw, flux_down_sw, flux_direct_sw, flux_diffuse_sw = shortwave_fluxes(
         sw_optics, cos_zenith, toa_flux_bands,
-        jnp.array([rad_state.surface_albedo_vis[0], rad_state.surface_albedo_nir[0]]),
+        jnp.array([surface_albedo_vis[0], surface_albedo_nir[0]]),
         default_n_sw_bands
     )
     

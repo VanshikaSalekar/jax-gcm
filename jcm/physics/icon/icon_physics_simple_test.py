@@ -23,7 +23,7 @@ def apply_simple_test_physics(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> Tuple[PhysicsTendency, PhysicsData]:
     """Simple test physics that just returns small tendencies"""
