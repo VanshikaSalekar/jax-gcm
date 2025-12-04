@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 from jax import jit
 from jcm.geometry import Geometry
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.physics.speedy.params import Parameters
 from jcm.physics.speedy.physical_constants import cp, alhc
 from jcm.physics_interface import PhysicsState, PhysicsTendency
@@ -12,10 +12,11 @@ def get_vertical_diffusion_tend(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """
+    """Get vertical diffusion tendencies.
+    
     Inputs:
         se(ix,il,kx)     !! Dry static energy
         rh(ix,il,kx)     !! Relative humidity
@@ -27,8 +28,8 @@ def get_vertical_diffusion_tend(
     Returns:
         ttenvd(ix,il,kx) !! Temperature tendency
         qtenvd(ix,il,kx) !! Specific humidity tendency
-    """
 
+    """
     se = physics_data.convection.se
     rh = physics_data.humidity.rh
     qsat = physics_data.humidity.qsat

@@ -1,5 +1,7 @@
 # JAX-GCM (JCM)
 
+![Logo](logo.png)
+
 A fully differentiable General Circulation Model (GCM) for climate science and machine learning applications, written entirely in JAX.
 
 ## Overview
@@ -54,7 +56,7 @@ predictions = model.run(
 )
 
 # Convert output to xarray Dataset for analysis
-ds = model.predictions_to_xarray(predictions)
+ds = predictions.to_xarray()
 print(ds)
 ```
 

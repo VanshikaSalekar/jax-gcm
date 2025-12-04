@@ -1,5 +1,4 @@
-"""
-Date: 2/7/2024
+"""Date: 2/7/2024
 Physics module that interfaces between the dynamics and the physics of the model. Should be agnostic
 to the specific physics being used.
 """
@@ -14,7 +13,7 @@ from dinosaur.spherical_harmonic import vor_div_to_uv_nodal, uv_nodal_to_vor_div
 from dinosaur.primitive_equations import get_geopotential, compute_diagnostic_state, State, PrimitiveEquations
 from dinosaur.filtering import horizontal_diffusion_filter
 from jax import tree_util
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.date import DateData
 from typing import Tuple, Any, Dict
 from jcm.diffusion import DiffusionFilter
@@ -170,20 +169,22 @@ Attributes:
         Tendency of specific humidity.
 """
 
-class Physics:    
-    def compute_tendencies(self, state: PhysicsState, boundaries: BoundaryData, geometry: Geometry, date: DateData) -> Tuple[PhysicsTendency, Any]:
-        """
-        Compute the physical tendencies given the current state and data structs.
+class Physics:
+    UNITS_TABLE_CSV_PATH = None
+    
+    def compute_tendencies(self, state: PhysicsState, forcing: ForcingData, geometry: Geometry, date: DateData) -> Tuple[PhysicsTendency, Any]:
+        """Compute the physical tendencies given the current state and data structs.
 
         Args:
             state: Current state variables
-            boundaries: Boundary data
+            forcing: Forcing data
             geometry: Geometry data
             date: Date data
 
         Returns:
             Physical tendencies in PhysicsTendency format
             Object containing physics data
+
         """
         raise NotImplementedError("Physics compute_tendencies method not implemented.")
     
@@ -191,8 +192,7 @@ class Physics:
         return None
 
     def data_struct_to_dict(self, struct: Any, geometry: Geometry, sep: str = ".") -> dict[str, Any]:
-        """
-        Flattens a physics data struct into a dictionary.
+        """Flattens a physics data struct into a dictionary.
 
         Args:
             struct: The struct to flatten.
@@ -201,6 +201,7 @@ class Physics:
 
         Returns:
             A dictionary representation of the struct, without nesting.
+
         """
         if struct is None:
             return {}
@@ -230,8 +231,7 @@ class Physics:
         return items
 
 def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) -> PhysicsState:
-    """
-    Convert the state variables from the dynamics to the physics state variables.
+    """Convert the state variables from the dynamics to the physics state variables.
 
     Args:
         state: Dynamic (dinosaur) State variables
@@ -239,6 +239,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
 
     Returns:
         Physics state variables
+
     """
     # Calculate u and v from vorticity and divergence
     u, v = vor_div_to_uv_nodal(dynamics.coords.horizontal, state.vorticity, state.divergence)
@@ -273,10 +274,8 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
 
     return PhysicsState(u, v, t, q, phi, jnp.squeeze(sp), all_tracers)
 
-
 def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: PrimitiveEquations) -> State:
-    """
-    Converts state variables from the physics (nodal space) back to the dynamical core (spectral space).
+    """Convert state variables from the physics (nodal space) back to the dynamical core (spectral space).
     This is the inverse of `dynamics_state_to_physics_state`. It is currently not used in the main
     time-stepping loop but can be useful for diagnostics or model initialization.
     
@@ -286,6 +285,7 @@ def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: Primi
     
     Returns:
         A `State` object for the dynamical core.
+
     """
     # Calculate vorticity and divergence from u and v
     modal_vorticity, modal_divergence = uv_nodal_to_vor_div_modal(dynamics.coords.horizontal, physics_state.u_wind, physics_state.v_wind)
@@ -318,8 +318,7 @@ def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: Primi
     )
 
 def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dynamics: PrimitiveEquations) -> State:
-    """
-    Convert the physics tendencies to the dynamics tendencies.
+    """Convert the physics tendencies to the dynamics tendencies.
 
     Args:
         physics_tendency: Physics tendencies
@@ -327,6 +326,7 @@ def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dyn
 
     Returns:
         Dynamics tendencies
+
     """
     u_tend = physics_tendency.u_wind
     v_tend = physics_tendency.v_wind
@@ -360,14 +360,14 @@ def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dyn
     return dynamics_tendency
 
 def verify_state(state: PhysicsState) -> PhysicsState:
-    """
-    Ensures the physical validity of the state variables.
+    """Ensure the physical validity of the state variables.
     
     Args:
         state: The `PhysicsState` object.
     
     Returns:
         The verified and potentially corrected `PhysicsState` object.
+
     """
     # set specific humidity to 0.0 if it became negative during the dynamics evaluation
     qa = jnp.where(state.specific_humidity < 0.0, 0.0, state.specific_humidity)
@@ -376,8 +376,7 @@ def verify_state(state: PhysicsState) -> PhysicsState:
     return updated_state
 
 def verify_tendencies(state: PhysicsState, tendencies: PhysicsTendency, time_step) -> PhysicsTendency:
-    """
-    Adjusts tendencies to prevent the state from becoming physically invalid in the next time step.
+    """Adjust tendencies to prevent the state from becoming physically invalid in the next time step.
     
     Args:
         state: The current `PhysicsState`.
@@ -386,6 +385,7 @@ def verify_tendencies(state: PhysicsState, tendencies: PhysicsTendency, time_ste
     
     Returns:
         The verified and potentially corrected `PhysicsTendency` object.
+
     """
     # set specific humidity tendency such that the resulting specific humidity is non-negative
     updated_tendencies = tendencies.copy(
@@ -403,32 +403,32 @@ def get_physical_tendencies(
     dynamics: PrimitiveEquations,
     time_step: float,
     physics: Physics,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry,
     diffusion: DiffusionFilter,
     date: DateData,
     diagnostics_collector=None,
 ) -> State:
-    """
-    Computes the physical tendencies given the current state and a list of physics functions.
+    """Compute the physical tendencies given the current state and a list of physics functions.
 
     Args:
         state: Dynamic (dinosaur) State variables
         dynamics: PrimitiveEquations object
         time_step: Time step in seconds
         physics: Physics object (e.g. HeldSuarezPhysics, SpeedyPhysics)
-        boundaries: BoundaryData object
+        forcing: ForcingData object
         geometry: Geometry object
         date: DateData object
         diagnostics_collector: DiagnosticsCollector object
 
     Returns:
         Physical tendencies in dinosaur.primitive_equations.State format
+
     """
     physics_state = dynamics_state_to_physics_state(state, dynamics)
 
     clamped_physics_state = verify_state(physics_state)
-    physics_tendency, physics_data = physics.compute_tendencies(clamped_physics_state, boundaries, geometry, date)
+    physics_tendency, physics_data = physics.compute_tendencies(clamped_physics_state, forcing, geometry, date)
 
     physics_tendency = verify_tendencies(physics_state, physics_tendency, time_step)
     
@@ -436,16 +436,14 @@ def get_physical_tendencies(
             diagnostics_collector.accumulate_if_physical_step(physics_data)
 
     dynamics_tendency = physics_tendency_to_dynamics_tendency(physics_tendency, dynamics)
-    filtered_dynamics_tendency = filter_tendencies(dynamics_tendency, diffusion, time_step, dynamics.coords.horizontal)
 
-    return filtered_dynamics_tendency
+    return dynamics_tendency
 
 def filter_tendencies(dynamics_tendency: State, 
                       diffusion: DiffusionFilter,
                       time_step, 
                       grid) -> State:
-    '''
-    Apply dinsoaur horizontal diffusion filter to the dynamics tendencies
+    """Apply dinsoaur horizontal diffusion filter to the dynamics divergence tendency
 
     Args:
         dynamics_tendency: Dynamics tendencies in dinosaur.primitive_equations.State format
@@ -455,14 +453,20 @@ def filter_tendencies(dynamics_tendency: State,
     
     Returns:
         Filtered dynamics tendencies in dinosaur.primitive_equations.State format
-    '''
 
-    tau = diffusion.tendency_diff_timescale
-    order = diffusion.tendency_diff_order
-
+    """
+    tau = diffusion.div_timescale
+    order = diffusion.div_order
     scale = time_step / (tau * abs(grid.laplacian_eigenvalues[-1]) ** order)
 
     filter_fn = horizontal_diffusion_filter(grid, scale=scale, order=order)
-    filtered_tendency = filter_fn(dynamics_tendency)
-    
-    return filtered_tendency
+    filtered_div = filter_fn(dynamics_tendency)
+
+    return State(
+        vorticity=dynamics_tendency.vorticity,
+        divergence=filtered_div.divergence,
+        temperature_variation=dynamics_tendency.temperature_variation,
+        log_surface_pressure=dynamics_tendency.log_surface_pressure,
+        sim_time=dynamics_tendency.sim_time,
+        tracers={'specific_humidity': dynamics_tendency.tracers['specific_humidity']}
+    )

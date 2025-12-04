@@ -1,153 +1,70 @@
-"""
-Date: 2/1/2024
+"""Date: 2/1/2024
 For storing all variables related to the model's grid space.
 """
 import jax.numpy as jnp
 import tree_math
 from jcm.constants import p0, grav, cp
-from jcm.utils import spectral_truncation
-import dinosaur
+from jcm.utils import SIGMA_LAYER_BOUNDARIES, TRUNCATION_FOR_NODAL_SHAPE, VALID_NODAL_SHAPES, VALID_TRUNCATIONS, get_coords, spectral_truncation, validate_ds
+from jcm.data.bc.interpolate import upsample_terrain_ds
 from dinosaur.coordinate_systems import CoordinateSystem
-from dinosaur.vertical_interpolation import HybridCoordinates
-from typing import Optional
-from jcm.vertical.icon_levels import HybridLevels, ICONLevels
-from dinosaur.primitive_equations import PrimitiveEquationsSpecs
-from dinosaur.scales import SI_SCALE
+from typing import Tuple
 
-sigma_layer_boundaries = {
-    5: jnp.array([0.0, 0.15, 0.35, 0.65, 0.9, 1.0]),
-    7: jnp.array([0.02, 0.14, 0.26, 0.42, 0.6, 0.77, 0.9, 1.0]),
-    8: jnp.array([0.0, 0.05, 0.14, 0.26, 0.42, 0.6, 0.77, 0.9, 1.0]),
-}
+def get_terrain(orography: jnp.ndarray=None, fmask: jnp.ndarray=None, nodal_shape=None,
+                terrain_file=None, target_resolution=None, fmask_threshold=0.1) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Get the orography data for the model grid. If fmask and/or orography are provided, use them directly
+    (defaulting the other to zeros if only one is provided). If terrain_file is provided, load both from file.
+    Otherwise, default both to zeros with shape nodal_shape.
 
-truncation_for_nodal_shape = {
-    (64, 32): 21,
-    (96, 48): 31,
-    (128, 64): 42,
-    (256, 128): 85,
-    (320, 160): 106,
-    (360, 180): 119,
-    (512, 256): 170,
-    (640, 320): 213,
-    (1024, 512): 340,
-    (1280, 640): 425,
-}
-
-
-class HybridCoordinatesWithCenters(HybridCoordinates):
-    """
-    Extension of Dinosaur's HybridCoordinates that adds sigma-like attributes.
-    
-    This enables compatibility with isothermal_rest_atmosphere calculations
-    that expect sigma-like coordinate systems with centers and layer_thickness.
-    """
-    
-    def __init__(self, a_boundaries, b_boundaries):
-        super().__init__(a_boundaries, b_boundaries)
-        # Pre-compute centers and layer_thickness as concrete numpy arrays to avoid tracer issues
-        import numpy as np
-        
-        # For hybrid coordinates, we need to handle pure pressure levels (b=0) and hybrid levels (b>0)
-        # Create a monotonic sigma-like coordinate that avoids zeros
-        n_levels = len(b_boundaries) - 1
-        centers = np.zeros(n_levels)
-        
-        # Find the first hybrid level (where b > 0)
-        first_hybrid_idx = np.where(b_boundaries > 0)[0][0] - 1  # -1 for level index
-        
-        # For pure pressure levels, assign small increasing values
-        if first_hybrid_idx > 0:
-            centers[:first_hybrid_idx] = np.linspace(1e-6, 1e-4, first_hybrid_idx)
-        
-        # For hybrid levels, use b-coordinate centers
-        for i in range(first_hybrid_idx, n_levels):
-            centers[i] = (b_boundaries[i] + b_boundaries[i+1]) / 2
-        
-        self.centers = np.asarray(centers)
-        
-        # For layer thickness, we need to handle pure pressure levels differently
-        # Use a small but non-zero thickness for pure pressure levels
-        layer_thickness = np.diff(b_boundaries)
-        
-        # For pure pressure levels (where diff is 0), assign small thicknesses
-        zero_thickness_mask = layer_thickness == 0
-        if np.any(zero_thickness_mask):
-            # Assign small, uniform thickness for pure pressure levels
-            layer_thickness[zero_thickness_mask] = 1e-6
-        
-        self.layer_thickness = np.asarray(layer_thickness)
-
-    # layer_thickness is now a pre-computed attribute, not a property
-    
-    @property
-    def boundaries(self) -> jnp.ndarray:
-        """
-        Return boundaries for sigma-like interface compatibility.
-        
-        Maps to b_boundaries which represent the sigma component of hybrid coordinates.
-        """
-        return self.b_boundaries
-    
-    @property
-    def center_to_center(self) -> jnp.ndarray:
-        """
-        Return distances between consecutive level centers.
-        
-        This is the difference between consecutive centers, used in some
-        vertical integration calculations.
-        """
-        import numpy as np
-        return np.diff(self.centers)
-
-def get_coords(layers=8, spectral_truncation=None, nodal_shape=None, hybrid: bool = False) -> CoordinateSystem:
-    """
-    Returns a CoordinateSystem object for the given configuration.
-    
     Args:
-        layers: Number of vertical layers
-        horizontal_resolution: Horizontal resolution (21, 31, 42, 85, 106, 119, 170, 213, 340, or 425)
-        hybrid: If True, use hybrid sigma-pressure coordinates; if False, use sigma coordinates
-        
+        orography: Orography height (m) (ix, il). If None but fmask is provided, defaults to zeros (flat).
+        fmask: Fractional land-sea mask (ix, il). If None but orography is provided, defaults to zeros (all ocean).
+        nodal_shape: Shape of the nodal grid (ix, il). Used when neither fmask, orography, nor terrain_file are provided.
+        terrain_file: Path to a file containing a dataset of orog (orography) and lsm (land-sea mask).
+        target_resolution: Spectral truncation to interpolate the terrain data to, default None (no interpolation).
+        fmask_threshold: Threshold for rounding fmask values that are close to 0 or 1.
+
     Returns:
-        CoordinateSystem with specified coordinates
+        Orography height (m) (ix, il)
+        Land-sea mask (ix, il)
+
     """
-    if spectral_truncation is None:
-        if nodal_shape is None:
-            spectral_truncation = 31
-        else:
-            spectral_truncation = truncation_for_nodal_shape.get(nodal_shape, None)
-            if spectral_truncation is None:
-                raise ValueError(f"Invalid nodal shape: {nodal_shape}. Must be one of: {list(truncation_for_nodal_shape.keys())}")
-    try:
-        horizontal_grid = getattr(dinosaur.spherical_harmonic.Grid, f'T{spectral_truncation}')
-    except AttributeError:
-        raise ValueError(f"Invalid horizontal resolution: {spectral_truncation}. Must be one of: 21, 31, 42, 85, 106, 119, 170, 213, 340, or 425.")
-    
-    if hybrid:
-        from jcm.vertical.icon_levels import ICONLevels
-        hybrid_levels = ICONLevels.get_levels(layers)
-        vertical_coords = HybridCoordinatesWithCenters(
-            hybrid_levels.a_boundaries,
-            hybrid_levels.b_boundaries
-        )
-    else:
-        if layers not in sigma_layer_boundaries:
-            raise ValueError(f"Invalid number of layers: {layers}. Must be one of: {list(sigma_layer_boundaries.keys())}")
-        vertical_coords = dinosaur.sigma_coordinates.SigmaCoordinates(sigma_layer_boundaries[layers])
+    if fmask is None and orography is None:
+        if terrain_file is None:
+            if nodal_shape is None:
+                raise ValueError("Must provide at least one of: fmask, orography, terrain_file, or nodal_shape.")
+            return jnp.zeros(nodal_shape), jnp.zeros(nodal_shape)
+        
+        import xarray as xr
+        ds = xr.open_dataset(terrain_file)
+        validate_ds(ds, expected_structure={"lsm": ("lon", "lat"), "orog": ("lon", "lat")})
+        orography, fmask = jnp.asarray(ds['orog']), jnp.asarray(ds['lsm'])
+        if target_resolution is not None:
+            if target_resolution not in VALID_TRUNCATIONS:
+                raise ValueError(f"Invalid target resolution: {target_resolution}. Must be one of: {VALID_TRUNCATIONS}.")
+            ds = upsample_terrain_ds(ds, target_resolution=target_resolution)
+            orography, fmask = jnp.asarray(ds['orog']), jnp.asarray(ds['lsm'])
+        elif orography.shape not in VALID_NODAL_SHAPES:
+            raise ValueError(f"Invalid terrain data shape: {orography.shape}. Must be one of: {VALID_NODAL_SHAPES}.")
 
-    physics_specs = PrimitiveEquationsSpecs.from_si(scale=SI_SCALE)
+    elif fmask is None:
+        # If orography provided but fmask not, default fmask to any orography > 0
+        fmask = (orography > 0.0).astype(jnp.float32)
 
-    return CoordinateSystem(
-        horizontal=horizontal_grid(radius=physics_specs.radius),
-        vertical=vertical_coords
-    )
+    elif orography is None:
+        # If fmask provided but orography not, default orography to zeros (flat)
+        orography = jnp.zeros_like(fmask)
+
+    # Set values close to 0 or 1 to exactly 0 or 1
+    fmask = jnp.where(fmask <= fmask_threshold, 0.0, jnp.where(fmask >= 1.0 - fmask_threshold, 1.0, fmask))
+
+    return orography, fmask
 
 def _initialize_vertical(kx):
     # Definition of model levels
     # Layer thicknesses and full (u,v,T) levels
-    if kx not in sigma_layer_boundaries:
+    if kx not in SIGMA_LAYER_BOUNDARIES:
         raise ValueError(f"Invalid number of vertical levels: {kx}")
-    hsg = sigma_layer_boundaries[kx]
+    hsg = SIGMA_LAYER_BOUNDARIES[kx]
     fsg = (hsg[1:] + hsg[:-1])/2.
     dhs = jnp.diff(hsg)
     sigl = jnp.log(fsg)
@@ -167,143 +84,7 @@ def _initialize_vertical(kx):
 
     return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi
 
-@tree_math.struct
-class Geometry:
-    nodal_shape: tuple[int, int, int] # (kx, ix, il)
-
-    radang: jnp.ndarray # latitude in radians
-    sia: jnp.ndarray # sin of latitude
-    coa: jnp.ndarray # cos of latitude
-
-    orog: Optional[jnp.ndarray] = None # orography height (m)
-    phis0: Optional[jnp.ndarray] = None # spectrally truncated surface geopotential (m^2/s^2)
-
-    hsg: jnp.ndarray # sigma layer boundaries
-    fsg: jnp.ndarray # sigma layer midpoints
-    dhs: jnp.ndarray # sigma layer thicknesses
-    sigl: jnp.ndarray # log of sigma layer midpoints
-
-    grdsig: jnp.ndarray # g/(d_sigma p0): to convert fluxes of u,v,q into d(u,v,q)/dt
-    grdscp: jnp.ndarray # g/(d_sigma p0 c_p): to convert energy fluxes into dT/dt
-    wvi: jnp.ndarray # Weights for vertical interpolation
-    
-    # Coordinate arrays for xarray conversion and physics
-    latitudes: Optional[jnp.ndarray] = None
-    longitudes: Optional[jnp.ndarray] = None
-    
-    # Hybrid coordinate support - store only the essential arrays
-    hybrid_a_boundaries: Optional[jnp.ndarray] = None
-    hybrid_b_boundaries: Optional[jnp.ndarray] = None
-    
-    @property
-    def is_hybrid(self) -> bool:
-        """Check if geometry uses hybrid coordinates."""
-        return self.hybrid_a_boundaries is not None
-    
-    @property
-    def nlevels(self) -> int:
-        """Number of vertical levels."""
-        return self.nodal_shape[0]
-    
-    @property
-    def nlon(self) -> int:
-        """Number of longitude points."""
-        return self.nodal_shape[1]
-    
-    @property
-    def nlat(self) -> int:
-        """Number of latitude points."""
-        return self.nodal_shape[2]
-    
-    def get_pressure_levels(self, surface_pressure: jnp.ndarray) -> jnp.ndarray:
-        """Calculate pressure at level centers.
-        
-        Args:
-            surface_pressure: Surface pressure field (Pa)
-            
-        Returns:
-            Pressure at level centers (nlevels, *surface_pressure.shape)
-        """
-        if self.is_hybrid:
-            # p = a + b * p_surface
-            a_centers = (self.hybrid_a_boundaries[:-1] + self.hybrid_a_boundaries[1:]) / 2
-            b_centers = (self.hybrid_b_boundaries[:-1] + self.hybrid_b_boundaries[1:]) / 2
-            return a_centers[:, None] + b_centers[:, None] * surface_pressure[None, :]
-        else:
-            # Pure sigma coordinates: p = σ * p_surface
-            return self.fsg[:, None] * surface_pressure[None, :] * p0
-    
-    def get_pressure_interfaces(self, surface_pressure: jnp.ndarray) -> jnp.ndarray:
-        """Calculate pressure at level interfaces.
-        
-        Args:
-            surface_pressure: Surface pressure field (Pa)
-            
-        Returns:
-            Pressure at interfaces (nlevels+1, *surface_pressure.shape)
-        """
-        if self.is_hybrid:
-            # p = a + b * p_surface
-            return self.hybrid_a_boundaries[:, None] + self.hybrid_b_boundaries[:, None] * surface_pressure[None, :]
-        else:
-            # Pure sigma coordinates: p = σ * p_surface
-            return self.hsg[:, None] * surface_pressure[None, :] * p0
-    
-    def get_layer_thickness(self, surface_pressure: jnp.ndarray) -> jnp.ndarray:
-        """Calculate layer thickness in pressure coordinates.
-        
-        Args:
-            surface_pressure: Surface pressure field (Pa)
-            
-        Returns:
-            Layer thickness (dp) at each level (nlevels, *surface_pressure.shape)
-        """
-        pressure_interfaces = self.get_pressure_interfaces(surface_pressure)
-        return jnp.diff(pressure_interfaces, axis=0)
-    
-    def get_coordinate_info(self) -> dict:
-        """Get summary of coordinate system information."""
-        info = {
-            'nodal_shape': self.nodal_shape,
-            'coordinate_type': 'hybrid' if self.is_hybrid else 'sigma',
-            'nlevels': self.nlevels,
-            'nlon': self.nlon,
-            'nlat': self.nlat,
-        }
-        
-        # Basic coordinate info without storing full coordinate system
-        info['horizontal_grid'] = f"Grid({self.nlon}x{self.nlat})"
-        info['vertical_grid'] = f"{'Hybrid' if self.is_hybrid else 'Sigma'}Coordinates({self.nlevels})"
-        
-        if self.is_hybrid:
-            info['hybrid_levels'] = self.nlevels
-            info['top_pressure'] = float(self.hybrid_a_boundaries[0])
-            info['surface_sigma'] = float(self.hybrid_b_boundaries[-1])
-        
-        return info
-
-    @classmethod
-    def _get_horizontal_coords(cls, coords: CoordinateSystem):
-        """Extract horizontal coordinate information from CoordinateSystem."""
-        radang = coords.horizontal.latitudes
-        sia, coa = jnp.sin(radang), jnp.cos(radang)
-        return radang, sia, coa
-    
-    @classmethod
-    def _get_horizontal_coords_from_shape(cls, nodal_shape):
-        """Calculate horizontal coordinates from grid shape (legacy)."""
-        il = nodal_shape[1]
-        iy = (il + 1)//2
-        j = jnp.arange(1, iy + 1)
-        sia_half = jnp.cos(jnp.pi * (j - 0.25) / (il + 0.5))
-        coa_half = jnp.sqrt(1.0 - sia_half ** 2.0)
-        sia = jnp.concatenate((-sia_half, sia_half[::-1]), axis=0).ravel()
-        coa = jnp.concatenate((coa_half, coa_half[::-1]), axis=0).ravel()
-        radang = jnp.concatenate((-jnp.arcsin(sia_half), jnp.arcsin(sia_half)[::-1]), axis=0)
-        return radang, sia, coa
-    
-    @classmethod
-    def _get_hybrid_vertical_coords(cls, nlevels: int):
+def _initialize_hybrid_vertical(nlevels: int):
         """Get vertical coordinates for hybrid system."""
         hybrid_levels = ICONLevels.get_levels(nlevels)
         
@@ -323,126 +104,146 @@ class Geometry:
         
         return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels
 
-    def from_coords(cls, coords: CoordinateSystem, orography=None, truncation_number=None, hybrid: bool = False):
-        """
-        Initializes all of the speedy model geometry variables from a dinosaur CoordinateSystem.
+@tree_math.struct
+class Geometry:
+    nodal_shape: tuple[int, int, int] # (kx, ix, il)
+
+    orog: jnp.ndarray # orography height (m), shape (ix, il)
+    phis0: jnp.ndarray # spectrally truncated surface geopotential
+    fmask: jnp.ndarray # fractional land-sea mask (ix, il)
+
+    radang: jnp.ndarray # latitude in radians
+    sia: jnp.ndarray # sin of latitude
+    coa: jnp.ndarray # cos of latitude
+
+    hsg: jnp.ndarray # sigma layer boundaries
+    fsg: jnp.ndarray # sigma layer midpoints
+    dhs: jnp.ndarray # sigma layer thicknesses
+    sigl: jnp.ndarray # log of sigma layer midpoints
+
+    grdsig: jnp.ndarray # g/(d_sigma p0): to convert fluxes of u,v,q into d(u,v,q)/dt
+    grdscp: jnp.ndarray # g/(d_sigma p0 c_p): to convert energy fluxes into dT/dt
+    wvi: jnp.ndarray # Weights for vertical interpolation
+    
+ 
+    @classmethod
+    def from_coords(cls, coords: CoordinateSystem, orography=None, fmask=None, terrain_file=None, interpolate=False, 
+                    hybrid_vertical=False, truncation_number=None):
+        """Initialize all of the speedy model geometry variables from a dinosaur CoordinateSystem.
 
         Args:
             coords: dinosaur.coordinate_systems.CoordinateSystem object.
             orography (optional): Orography height (m), shape (ix, il). If None, defaults to zeros.
+            fmask (optional): Fractional land-sea mask, shape (ix, il). If None, defaults to zeros (all ocean).
+            terrain_file (optional): Path to a file containing a dataset of orog (orography) and lsm (land-sea mask).
+            interpolate (optional): Whether to interpolate the terrain data (default False).
+            hybrid_vertical (optional): Whether to use hybrid vertical coordinates (default False).
             truncation_number (optional): Spectral truncation number for surface geopotential. If None, inferred from coords.
 
         Returns:
             Geometry object
+
         """
         # Orography and surface geopotential
-        orog = jnp.zeros(coords.horizontal.nodal_shape) if orography is None else orography
+        orog, fmask = get_terrain(fmask=fmask, orography=orography, nodal_shape=coords.horizontal.nodal_shape,
+                                  terrain_file=terrain_file, target_resolution=coords.horizontal.total_wavenumbers-2 if interpolate else None)
         phi0 = grav * orog
         phis0 = spectral_truncation(coords.horizontal, phi0, truncation_number=truncation_number)
 
         # Horizontal coordinates
         radang, sia, coa = cls._get_horizontal_coords(coords)
-        
+
         # Vertical coordinates
         #TODO: This should all be dealt with by the coordinates object so we don't have to pass in the hybrid flag
         kx = coords.nodal_shape[0]
-        if hybrid:
+        if hybrid_vertical:
             hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels = cls._get_hybrid_vertical_coords(kx)
-            hybrid_a_boundaries = hybrid_levels.a_boundaries
-            hybrid_b_boundaries = hybrid_levels.b_boundaries
         else:
             hsg, fsg, dhs, sigl, grdsig, grdscp, wvi = _initialize_vertical(kx)
-            hybrid_a_boundaries = None
-            hybrid_b_boundaries = None
 
-        return cls(
-            nodal_shape=coords.nodal_shape,
-            radang=radang, sia=sia, coa=coa,
-            hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
-            grdsig=grdsig, grdscp=grdscp, wvi=wvi,
-            latitudes=coords.horizontal.latitudes,
-            longitudes=coords.horizontal.longitudes,
-            hybrid_a_boundaries=hybrid_a_boundaries,
-            hybrid_b_boundaries=hybrid_b_boundaries,
-            orog=orog, phis0=phis0
-        )
-
+        return cls(nodal_shape=coords.nodal_shape,
+                   orog=orog, phis0=phis0, fmask=fmask,
+                   radang=radang, sia=sia, coa=coa,
+                   hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
+                   grdsig=grdsig, grdscp=grdscp, wvi=wvi)
+    
     @classmethod
-    def from_grid_shape(cls, nodal_shape=None, node_levels=None, hybrid: bool = False):
-        """
-        Initialize geometry from grid dimensions (legacy code from speedy.f90).
+    def from_spectral_truncation(cls, spectral_truncation, num_levels=8, **kwargs):
+        """Initialize all of the speedy model geometry variables from spectral truncation (legacy code from speedy.f90).
 
         Args:
-            nodal_shape: Shape of the nodal grid `(ix,il)`
-            node_levels: Number of vertical levels `kx`
-            hybrid: If True, use hybrid coordinates; if False, use sigma
+            spectral_truncation: Spectral truncation number for horizontal resolution.
+            num_levels (optional): Number of vertical levels `kx` (default 8).
+            orography (optional): Orography height (m), shape (ix, il). If None, defaults to zeros.
+            fmask (optional): Fractional land-sea mask, shape (ix, il). If None, defaults to zeros (all ocean).
+            terrain_file (optional): Path to a file containing a dataset of orog (orography) and lsm (land-sea mask).
+            interpolate (optional): Whether to interpolate the terrain data (default False).
+            truncation_number (optional): Spectral truncation number for surface geopotential. If None, inferred from spectral_truncation.
 
         Returns:
             Geometry object
-        """
-        # Horizontal coordinates
-        radang, sia, coa = cls._get_horizontal_coords_from_shape(nodal_shape)
 
-        # Vertical coordinates
-        if hybrid:
-            hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels = cls._get_hybrid_vertical_coords(node_levels)
-            hybrid_a_boundaries = hybrid_levels.a_boundaries
-            hybrid_b_boundaries = hybrid_levels.b_boundaries
-        else:
-            hsg, fsg, dhs, sigl, grdsig, grdscp, wvi = _initialize_vertical(node_levels)
-            hybrid_a_boundaries = None
-            hybrid_b_boundaries = None
-        
-        # For from_grid_shape, we need to calculate longitude array
-        ix = nodal_shape[0]
-        longitudes = jnp.linspace(0, 2 * jnp.pi * (ix - 1) / ix, ix)
-        
-        return cls(
-            nodal_shape=(node_levels,) + nodal_shape,
-            radang=radang, sia=sia, coa=coa,
-            hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
-            grdsig=grdsig, grdscp=grdscp, wvi=wvi,
-            latitudes=radang,
-            longitudes=longitudes,
-            hybrid_a_boundaries=hybrid_a_boundaries,
-            hybrid_b_boundaries=hybrid_b_boundaries
-        )
+        """
+        return cls.from_coords(coords=get_coords(layers=num_levels, spectral_truncation=spectral_truncation), **kwargs)
+
+    @classmethod
+    def from_grid_shape(cls, nodal_shape, **kwargs):
+        """Initialize all of the speedy model geometry variables from grid dimensions (legacy code from speedy.f90).
+
+        Args:
+            nodal_shape: Shape of the nodal grid `(ix,il)`.
+            num_levels (optional): Number of vertical levels `kx` (default 8).
+            orography (optional): Orography height (m), shape (ix, il). If None, defaults to zeros.
+            fmask (optional): Fractional land-sea mask, shape (ix, il). If None, defaults to zeros (all ocean).
+            terrain_file (optional): Path to a file containing a dataset of orog (orography) and lsm (land-sea mask).
+            interpolate (optional): Whether to interpolate the terrain data (default False).
+            truncation_number (optional): Spectral truncation number for surface geopotential. If None, inferred from nodal_shape.
+
+        Returns:
+            Geometry object
+
+        """
+        if nodal_shape not in VALID_NODAL_SHAPES:
+            raise ValueError(f"Invalid nodal shape: {nodal_shape}. Must be one of: {VALID_NODAL_SHAPES}.")
+        return cls.from_spectral_truncation(TRUNCATION_FOR_NODAL_SHAPE[nodal_shape], **kwargs)
     
     @classmethod
-    def for_icon_physics(cls, orography, horizontal_resolution: int = 85, nlevels: int = 47):
-        """
-        Create geometry optimized for ICON physics with hybrid coordinates.
+    def from_file(cls, terrain_file, target_resolution=None, num_levels=8, truncation_number=None):
+        """Initialize all of the speedy model geometry variables from a given terrain file containing orog and lsm.
         
         Args:
-            horizontal_resolution: T-resolution (21, 31, 42, 85, 106, 119, 170, 213, 340, 425)
-            nlevels: Number of vertical levels (must be available in ICON tables)
-            
+            terrain_file: Path to a file containing a dataset of orog (orography) and lsm (land-sea mask).
+            target_resolution (optional): Spectral truncation to interpolate the terrain data to, default None (no interpolation).
+            num_levels (optional): Number of vertical levels `kx` (default 8).
+            truncation_number (optional): Spectral truncation number for surface geopotential. If None, inferred from nodal_shape.
+        
         Returns:
-            Geometry object with ICON hybrid coordinates and appropriate horizontal grid
+            Geometry object
+
         """
-        # Import here to avoid circular imports
-        from jcm.model import get_coords_hybrid
-        
-        # Create coordinate system with hybrid coordinates
-        coords = get_coords_hybrid(nlevels, horizontal_resolution)
-        
-        return cls.from_coords(
-            coords=coords, orography=orography, truncation_number=horizontal_resolution
+        orography, fmask = get_terrain(terrain_file=terrain_file, target_resolution=target_resolution)
+        return cls.from_grid_shape(
+            nodal_shape=orography.shape,
+            num_levels=num_levels,
+            orography=orography,
+            fmask=fmask,
+            truncation_number=truncation_number
         )
 
     @classmethod
-    def single_column_geometry(cls, radang=0., orog=0., phis0=None, num_levels=8):
-        """
-        Initializes a Geometry instance for a single column model.
+    def single_column_geometry(cls, radang=0., orog=0., fmask=0., phis0=None, num_levels=8):
+        """Initialize a Geometry instance for a single column model.
 
         Args:
             radang (optional): Latitude of the single column in radians (default 0).
             orog (optional): Orography height in meters (default 0).
+            fmask (optional): Fractional land-sea mask (default 0, all ocean).
             phis0 (optional): Spectrally truncated surface geopotential (default grav * orog).
             num_levels (optional): Number of vertical levels (default 8).
-        
+
         Returns:
             Geometry object
+
         """
         sia, coa = jnp.sin(radang), jnp.cos(radang)
 
@@ -455,7 +256,24 @@ class Geometry:
         hsg, fsg, dhs, sigl, grdsig, grdscp, wvi = _initialize_vertical(num_levels)
 
         return cls(nodal_shape=(num_levels, 1, 1),
-                   orog=jnp.array([[orog]]), phis0=jnp.array([[phis0]]),
+                   orog=jnp.array([[orog]]), phis0=jnp.array([[phis0]]), fmask=jnp.array([[fmask]]),
                    radang=jnp.array([[radang]]), sia=jnp.array([[sia]]), coa=jnp.array([[coa]]),
                    hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
                    grdsig=grdsig, grdscp=grdscp, wvi=wvi)
+
+def coords_from_geometry(geometry: Geometry, spmd_mesh=None) -> CoordinateSystem:
+    """Extract a dinosaur CoordinateSystem from a Geometry object.
+
+    Args:
+        geometry: Geometry object.
+        spmd_mesh: Optional tuple describing the SPMD mesh for parallelization.
+
+    Returns:
+        Compatible CoordinateSystem object.
+
+    """
+    return get_coords(
+        layers=geometry.nodal_shape[0],
+        spectral_truncation=TRUNCATION_FOR_NODAL_SHAPE[geometry.nodal_shape[1:]],
+        spmd_mesh=spmd_mesh
+    )

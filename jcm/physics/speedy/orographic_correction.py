@@ -1,5 +1,4 @@
-"""
-Orographic correction parameterization for SPEEDY physics.
+"""Orographic correction parameterization for SPEEDY physics.
 
 This module implements the orographic corrections applied to temperature and specific humidity
 in SPEEDY.f90, specifically replicating the corrections from time_stepping.f90 lines 69 and 91.
@@ -8,7 +7,7 @@ The corrections are applied in grid space as a physics parameterization.
 
 import jax.numpy as jnp
 from jcm.physics_interface import PhysicsState, PhysicsTendency
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.geometry import Geometry
 from jcm.physics.speedy.params import Parameters
 from jcm.physics.speedy.physical_constants import rgas, grav, gamma, hscale, hshum, refrh1
@@ -16,8 +15,7 @@ from jcm.physics.speedy.physics_data import PhysicsData
 
 
 def compute_temperature_correction_vertical_profile(geometry: Geometry, parameters: Parameters) -> jnp.ndarray:
-    """
-    Compute vertical profile for temperature orographic correction (tcorv).
+    """Compute vertical profile for temperature orographic correction (tcorv).
     
     From SPEEDY horizontal_diffusion.f90:
     tcorv(1) = 0
@@ -30,6 +28,7 @@ def compute_temperature_correction_vertical_profile(geometry: Geometry, paramete
         
     Returns:
         Vertical profile array of shape (layers,)
+
     """
     # SPEEDY constants from physical_constants.py
     rgam = rgas * gamma / (1000.0 * grav)
@@ -54,8 +53,7 @@ def compute_temperature_correction_vertical_profile(geometry: Geometry, paramete
 
 
 def compute_humidity_correction_vertical_profile(geometry: Geometry, parameters: Parameters) -> jnp.ndarray:
-    """
-    Compute vertical profile for humidity orographic correction (qcorv).
+    """Compute vertical profile for humidity orographic correction (qcorv).
     
     From SPEEDY horizontal_diffusion.f90:
     qcorv(1) = qcorv(2) = 0
@@ -68,6 +66,7 @@ def compute_humidity_correction_vertical_profile(geometry: Geometry, parameters:
         
     Returns:
         Vertical profile array of shape (layers,)
+
     """
     qexp = hscale / hshum
     
@@ -91,19 +90,18 @@ def compute_humidity_correction_vertical_profile(geometry: Geometry, parameters:
 
 
 def compute_temperature_correction_horizontal(geometry: Geometry) -> jnp.ndarray:
-    """
-    Compute horizontal temperature correction in grid space.
+    """Compute horizontal temperature correction in grid space.
     
     From SPEEDY forcing.f90:
     corh(i,j) = gamlat(j) * phis0(i,j)
     where gamlat = gamma / (1000 * grav) (constant)
     
     Args:
-        boundaries: Boundary data containing orography
         geometry: Model geometry
         
     Returns:
         Horizontal correction array of shape (lon, lat)
+
     """
     gamlat = gamma / (1000.0 * grav)  # Reference lapse rate (constant in SPEEDY)
     
@@ -114,13 +112,12 @@ def compute_temperature_correction_horizontal(geometry: Geometry) -> jnp.ndarray
 
 
 def compute_humidity_correction_horizontal(
-    boundaries: BoundaryData, 
+    forcing: ForcingData, 
+    fmask: jnp.ndarray,
     temperature_correction: jnp.ndarray,
     land_temperature: jnp.ndarray,
-    day: int = 0
 ) -> jnp.ndarray:
-    """
-    Compute horizontal humidity correction in grid space.
+    """Compute horizontal humidity correction in grid space.
     
     This replicates the full SPEEDY humidity correction from forcing.f90:
     1. Calculate surface temperature (land/sea mixture)
@@ -130,20 +127,19 @@ def compute_humidity_correction_horizontal(
     5. Apply humidity correction: corh = refrh1 * (qref - qsfc)
     
     Args:
-        boundaries: Boundary data containing orography and masks
-        geometry: Model geometry
+        forcing: Forcing data containing SST
+        fmask: Land-sea mask 
         temperature_correction: Horizontal temperature correction (tcorh)
         land_temperature: Land surface temperature from land model
-        day: day of year (for SST)
         
     Returns:
         Horizontal correction array of shape (lon, lat)
+
     """
     from jcm.physics.speedy.humidity import get_qsat
     
     # 1. Calculate surface temperature (land/sea mixture)
-    # tsfc = fmask * stl_am + (1 - fmask) * sst_am
-    tsfc = boundaries.fmask * land_temperature + (1.0 - boundaries.fmask) * boundaries.tsea[:,:,day]
+    tsfc = fmask * land_temperature + (1.0 - fmask) * forcing.sea_surface_temperature
     
     # 2. Calculate reference temperature with orographic correction
     # tref = tsfc + corh (where corh is the temperature correction)
@@ -181,11 +177,10 @@ def get_orographic_correction_tendencies(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData = None,
+    forcing: ForcingData = None,
     geometry: Geometry = None
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """
-    Compute orographic correction tendencies for temperature and specific humidity.
+    """Compute orographic correction tendencies for temperature and specific humidity.
     
     This function applies the orographic corrections in grid space, replicating
     the corrections from SPEEDY time_stepping.f90 lines 69 and 91:
@@ -197,13 +192,14 @@ def get_orographic_correction_tendencies(
         state: Current physics state
         physics_data: Physics data structure (passed through unchanged)
         parameters: SPEEDY parameters
-        boundaries: Boundary data containing orography
+        forcing: Forcing data containing orography
         geometry: Model geometry
         
     Returns:
         tuple: (PhysicsTendency, updated PhysicsData)
             - PhysicsTendency: Physics tendencies representing the orographic corrections
             - PhysicsData: Updated physics data (unchanged in this implementation)
+
     """
     # Compute vertical profiles
     tcorv = compute_temperature_correction_vertical_profile(geometry, parameters)
@@ -214,8 +210,8 @@ def get_orographic_correction_tendencies(
     
     # For humidity correction, we need the temperature correction and land temperature
     # Get land temperature from physics data (land model)
-    land_temperature = physics_data.land_model.stl_am
-    qcorh = compute_humidity_correction_horizontal(boundaries, tcorh, land_temperature, physics_data.date.model_day())
+    land_temperature = forcing.stl_am
+    qcorh = compute_humidity_correction_horizontal(forcing, geometry.fmask, tcorh, land_temperature)
     
     # Apply corrections: field_corrected = field + horizontal * vertical
     temp_correction = tcorh * tcorv[:, None, None]
@@ -247,21 +243,20 @@ def get_orographic_correction_tendencies(
 
 def apply_orographic_corrections_to_state(
     state: PhysicsState,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry,
     parameters: Parameters,
     land_temperature: jnp.ndarray = None,
     day: int = 0
 ) -> PhysicsState:
-    """
-    Apply orographic corrections directly to a physics state (for testing).
+    """Apply orographic corrections directly to a physics state (for testing).
     
     This function applies the corrections directly to the state fields,
     which is equivalent to how they're applied in SPEEDY before diffusion.
     
     Args:
         state: Physics state to correct
-        boundaries: Boundary data containing orography
+        forcing: Forcing data containing orography
         geometry: Model geometry
         parameters: SPEEDY parameters
         land_temperature: Land surface temperature (if None, uses a default value)
@@ -269,6 +264,7 @@ def apply_orographic_corrections_to_state(
         
     Returns:
         Corrected physics state
+
     """
     # Compute vertical profiles
     tcorv = compute_temperature_correction_vertical_profile(geometry, parameters)
@@ -282,7 +278,7 @@ def apply_orographic_corrections_to_state(
         # Use a default land temperature (288K) for testing
         land_temperature = jnp.full(geometry.orog.shape, 288.0)
     
-    qcorh = compute_humidity_correction_horizontal(boundaries, tcorh, land_temperature, day)
+    qcorh = compute_humidity_correction_horizontal(forcing, geometry.fmask, tcorh, land_temperature)
     
     # Apply corrections
     temp_correction = tcorh * tcorv[:, None, None]

@@ -1,12 +1,11 @@
-"""
-Date: 2/11/2024
+"""Date: 2/11/2024
 Parametrization of convection. Convection is modelled using a simplified 
-version of the Tiedke (1993) mass-flux convection scheme.
+version of the Tiedtke (1993) mass-flux convection scheme.
 """
 from jax import jit
 import jax.numpy as jnp
 from jcm.geometry import Geometry
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.physics.speedy.params import Parameters
 from jcm.physics_interface import PhysicsTendency, PhysicsState
 from jcm.physics.speedy.physics_data import PhysicsData
@@ -16,11 +15,10 @@ from jcm.physics.speedy.physical_constants import p0, alhc, grav, cp
 def diagnose_convection(
     psa, se, qa, qsat,
     parameters: Parameters,
-    boundaries: BoundaryData=None,
+    forcing: ForcingData=None,
     geometry: Geometry=None
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """
-    Diagnose convectively unstable gridboxes
+    """Diagnose convectively unstable gridboxes
 
     Convection is activated in gridboxes with conditional instability. This
     is diagnosed by checking for any tropopsheric half level where the
@@ -40,6 +38,7 @@ def diagnose_convection(
     Returns:
     iptop: Top of convection (layer index)
     qdif: Excess humidity in convective gridboxes
+
     """
     kx, ix, il = se.shape
     iptop = jnp.full((ix, il), kx + 1)  # Initialize iptop with nlp
@@ -101,11 +100,10 @@ def get_convection_tendencies(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData=None,
+    forcing: ForcingData=None,
     geometry: Geometry=None
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """
-    Compute convective fluxes of dry static energy and moisture using a simplified mass-flux scheme.
+    """Compute convective fluxes of dry static energy and moisture using a simplified mass-flux scheme.
 
     Args:
     psa: Normalised surface pressure [p/p0]
@@ -119,6 +117,7 @@ def get_convection_tendencies(
     precnv: Convective precipitation [g/(m^2 s)]
     dfse:  Net flux of dry static energy into each atmospheric layer
     dfqa: Net flux of specific humidity into each atmospheric layer
+
     """
     se = cp * state.temperature + state.geopotential
     qa = state.specific_humidity
@@ -141,7 +140,7 @@ def get_convection_tendencies(
     rdps=2.0/(1.0 - parameters.convection.psmin)
 
     # 2. Check of conditions for convection
-    iptop, qdif = diagnose_convection(psa, se, qa, qsat, parameters, boundaries, geometry)
+    iptop, qdif = diagnose_convection(psa, se, qa, qsat, parameters, forcing, geometry)
 
     # 3. Convection over selected grid-points
     mask = iptop < kx
@@ -226,7 +225,7 @@ def get_convection_tendencies(
     ttend = dfse.at[1:].set(dfse[1:] * rps * geometry.grdscp[1:, jnp.newaxis, jnp.newaxis])
     qtend = dfqa.at[1:].set(dfqa[1:] * rps * geometry.grdsig[1:, jnp.newaxis, jnp.newaxis])
 
-    convection_out = physics_data.convection.copy(se=se, iptop=iptop, cbmf=cbmf, precnv=precnv)
+    convection_out = physics_data.convection.copy(se=se, iptop=iptop, cbmf=cbmf, qdif=qdif, precnv=precnv)
     physics_data = physics_data.copy(convection=convection_out)
     physics_tendencies = PhysicsTendency.zeros(
         shape=state.temperature.shape,
