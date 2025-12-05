@@ -14,7 +14,6 @@ from dinosaur.scales import SI_SCALE, units
 from dinosaur.time_integration import ExplicitODE
 from dinosaur import primitive_equations, primitive_equations_states
 from dinosaur.coordinate_systems import CoordinateSystem
-from dinosaur.vertical_interpolation import HybridCoordinates
 from jcm.constants import p0
 from jcm.geometry import Geometry, coords_from_geometry
 from jcm.date import DateData
@@ -247,7 +246,12 @@ class Model:
         # TODO: make the truncation number a parameter consistent with the grid shape
         self.truncated_orography = primitive_equations.truncated_modal_orography(self.geometry.orog, self.coords, wavenumbers_to_clip=2)
 
-        self.primitive = primitive_equations.PrimitiveEquations(
+        if use_hybrid_coords:
+            _primitive_equations = dinosaur.primitive_equations.PrimitiveEquationsHybrid
+        else:
+            _primitive_equations = dinosaur.primitive_equations.PrimitiveEquations
+
+        self.primitive = _primitive_equations(
             reference_temperature=aux_features[dinosaur.xarray_utils.REF_TEMP_KEY],
             orography=self.truncated_orography,
             coords=self.coords,

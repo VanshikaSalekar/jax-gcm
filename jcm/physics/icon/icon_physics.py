@@ -20,7 +20,7 @@ from jcm.date import DateData
 from jcm.physics.icon.constants import physical_constants
 
 # Import physics modules (will be implemented progressively)
-from jcm.physics.icon.radiation import radiation_scheme
+from jcm.physics.icon.radiation.radiation_scheme import radiation_scheme
 from jcm.physics.icon.icon_physics_data import RadiationData
 from jcm.physics.icon.convection import tiedtke_nordeng_convection
 from jcm.physics.icon.clouds import shallow_cloud_scheme, cloud_microphysics
@@ -103,7 +103,7 @@ class IconPhysics(Physics):
             Object containing physics data (PhysicsData format)
         """
         physics_data = PhysicsData.zeros(
-            geometry.nodal_shape[1:],
+            (geometry.nodal_shape[1]*geometry.nodal_shape[2], ),
             geometry.nodal_shape[0],
             date=date
         )
@@ -130,7 +130,7 @@ class IconPhysics(Physics):
             
             # Apply term to vectorized state (returns column format)
             term_tendency, physics_data = term(
-                vectorized_state, physics_data, self.parameters, boundaries, geometry
+                vectorized_state, physics_data, self.parameters, forcing, geometry
             )
             
             # OPTIMIZATION: Direct accumulation in column format (no reshape)
@@ -546,32 +546,20 @@ def apply_radiation(state: PhysicsState,
     # Note: state is already in 2D format [nlev, ncols] from compute_tendencies
     nlev, ncols = state.temperature.shape
     
+    # Get lat/lon from geometry
+    latitudes, longitudes = geometry.lat, geometry.lon
+
     # Get date information for solar calculations
-    date = physics_data.date
-    day_of_year = date.day_of_year if hasattr(date, 'day_of_year') else 172.0  # Default to summer
-    seconds_since_midnight = date.seconds_since_midnight if hasattr(date, 'seconds_since_midnight') else 43200.0  # Default to noon
-    
-    # Get lat/lon from geometry - reshape to column format
-    nlon, nlat = geometry.nodal_shape
-    latitudes = jnp.tile(geometry.radang, nlon)  # Repeat lats for each lon
-    longitudes_1d = jnp.linspace(-jnp.pi, jnp.pi, nlon, endpoint=False)  # radians
-    longitudes = jnp.repeat(longitudes_1d, nlat)  # Repeat lons for each lat
+    date = physics_data.date.dt
     
     # Get cloud properties from tracers and previous physics
     cloud_water = state.tracers.get('qc', jnp.zeros_like(state.temperature))
     cloud_ice = state.tracers.get('qi', jnp.zeros_like(state.temperature))
-    
-    # Cloud fraction needs to be reshaped to 2D if it's 3D
     cloud_fraction = physics_data.clouds.cloud_fraction
-    if cloud_fraction.ndim == 3:
-        nlev_cf, nlat, nlon = cloud_fraction.shape
-        cloud_fraction = cloud_fraction.reshape(nlev_cf, nlat * nlon)
 
-    # Get ozone from chemistry data (reshape to column format)
-    ozone_vmr = physics_data.chemistry.ozone_vmr * 1e-9  # Convert ppbv to VMR
-    
-    # Get CO2 from forcing (reshape to column format)
-    co2_vmr = forcing.co2_concentration.reshape(ncols) * 1e-6  # Convert ppmv to VMR
+    # Get ozone from chemistry data 
+    ozone_vmr = physics_data.chemistry.ozone_vmr * 1e-6  # Convert ppmv to VMR
+    co2_vmr = physics_data.chemistry.co2_vmr * 1e-6  # Convert ppmv to VMR
     
     # Prepare aerosol data for vmap - reshape to have column as the mapped dimension
     aerosol_data_for_vmap = physics_data.aerosol.copy(
@@ -590,14 +578,15 @@ def apply_radiation(state: PhysicsState,
                  1, 1, 1, 1,
                  1, 1, 
                  1, 1,
-                 None, None, 0, 0,
-                 None, 0, 1, 0),  # day_of_year, seconds_since_midnight, parameters are scalars, aerosol_data is per column
-        out_axes=(0, 0)  # Returns (RadiationTendencies, RadiationData) per column
+                 None, 0, 0,
+                 None, 0, None, None),  # day_of_year, seconds_since_midnight, parameters are scalars, aerosol_data is per column
+        out_axes=(0, 0),  # Returns (RadiationTendencies, RadiationData) per column
+        axis_size=ncols
     )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.layer_thickness,
       physics_data.diagnostics.air_density, cloud_water, cloud_ice, cloud_fraction,
       physics_data.surface.surface_temperature, physics_data.radiation.surface_albedo_vis, 
       physics_data.radiation.surface_albedo_nir, physics_data.radiation.surface_emissivity,
-      day_of_year, seconds_since_midnight, latitudes, longitudes, 
+      date, latitudes, longitudes, 
       parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr)
     
     # Unpack structured results directly
@@ -620,6 +609,9 @@ def apply_radiation(state: PhysicsState,
     # Most fields need to be transposed from [ncols, ...] to [..., ncols]
     rad_out = RadiationData(
         cos_zenith=diagnostics_vmapped.cos_zenith.squeeze(),  # [ncols, 1] -> [ncols]
+        surface_albedo_vis=diagnostics_vmapped.surface_albedo_vis,
+        surface_albedo_nir=diagnostics_vmapped.surface_albedo_nir,
+        surface_emissivity=diagnostics_vmapped.surface_emissivity,
         sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2),  # [ncols, nlev+1, nbands] -> [nlev+1, ncols, nbands]
         sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2),
         sw_heating_rate=tendencies_vmapped.shortwave_heating.T,  # [ncols, nlev] -> [nlev, ncols]
@@ -845,8 +837,8 @@ def apply_vertical_diffusion(
     
     # Get surface properties from forcing
     # Reshape boundary fields to column format
-    surface_temp = forcing.surface_temperature.reshape(ncols)
-    roughness_length = forcing.roughness_length.reshape(ncols)
+    surface_temp = physics_data.surface.surface_temperature.reshape(ncols)
+    roughness_length = physics_data.surface.roughness_length.reshape(ncols)
 
     surface_temperature = jnp.repeat(surface_temp[:, jnp.newaxis], nsfc_type, axis=1)
     roughness = jnp.repeat(roughness_length[:, jnp.newaxis], nsfc_type, axis=1)
@@ -968,7 +960,7 @@ def apply_surface(
     pressure_levels = physics_data.diagnostics.pressure_full
     # Get surface properties from boundaries (now guaranteed to be present)
     # Reshape boundary fields to column format
-    surface_temp = physics_data.surface_data.surface_temperature.reshape(ncols)
+    surface_temp = physics_data.surface.surface_temperature.reshape(ncols)
 
     # Initialize surface state (simplified)
     # In reality, this should come from the model's surface state

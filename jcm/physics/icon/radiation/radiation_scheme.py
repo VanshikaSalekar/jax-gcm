@@ -20,16 +20,14 @@ from .radiation_types import (
 )
 from ..icon_physics_data import RadiationData
 
-from . import (
-    calculate_solar_radiation_gcm,
-    gas_optical_depth_lw,
-    gas_optical_depth_sw,
-    cloud_optics,
-    planck_bands_lw,
-    longwave_fluxes,
-    shortwave_fluxes,
-    flux_to_heating_rate,
-)
+from jax_solar import radiation_flux, get_solar_sin_altitude, OrbitalTime
+from jax_datetime import Datetime
+
+from .gas_optics import gas_optical_depth_lw, gas_optical_depth_sw
+from .cloud_optics import cloud_optics
+from .planck import planck_bands_lw
+from .two_stream import longwave_fluxes, shortwave_fluxes, flux_to_heating_rate
+
 from ..unit_conversions import (
     convert_surface_pressure,
     calculate_pressure_levels,
@@ -208,8 +206,7 @@ def radiation_scheme(
     surface_albedo_vis: jnp.ndarray,
     surface_albedo_nir: jnp.ndarray,
     surface_emissivity: jnp.ndarray,
-    day_of_year: float,
-    seconds_since_midnight: float,
+    date: Datetime,
     latitude: float,
     longitude: float,
     parameters: RadiationParameters,
@@ -293,14 +290,11 @@ def radiation_scheme(
     # Now perform the actual radiation calculation
     
     # Solar radiation calculations
-    toa_flux, cos_zenith = calculate_solar_radiation_gcm(
-        day_of_year=day_of_year,
-        seconds_since_midnight=seconds_since_midnight,
-        longitude=longitude,
-        latitude=latitude,
-        solar_constant=parameters.solar_constant
-    )
-    
+
+    toa_flux = radiation_flux(date, longitude, latitude, parameters.solar_constant)
+    sin_altitude = get_solar_sin_altitude(OrbitalTime.from_datetime(date), longitude, latitude)
+    cos_zenith = jnp.sqrt(1.0 - sin_altitude**2)
+
     # Prepare radiation state
     rad_state = prepare_radiation_state(
         temperature=temperature,
@@ -432,6 +426,9 @@ def radiation_scheme(
     
     diagnostics = RadiationData(
         cos_zenith=cos_zenith[jnp.newaxis],
+        surface_albedo_vis=surface_albedo_vis,
+        surface_albedo_nir=surface_albedo_nir,
+        surface_emissivity=surface_emissivity,
         sw_flux_up=flux_up_sw,
         sw_flux_down=flux_down_sw,
         lw_flux_up=flux_up_lw,

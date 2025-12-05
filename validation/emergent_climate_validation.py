@@ -129,7 +129,7 @@ class EmergentClimateValidator:
         # For now, let's create a simplified version using the grid structure
         
         # Get coordinate information
-        lat_deg = jnp.rad2deg(model.geometry.radang)
+        lat_deg = jnp.rad2deg(model.geometry.lat)
         nlon = model.geometry.nlon
         lon_deg = jnp.linspace(0, 360, nlon, endpoint=False)
         

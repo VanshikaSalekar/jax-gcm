@@ -10,8 +10,9 @@ from jcm.geometry import Geometry
 from dinosaur import scales
 from dinosaur.scales import units
 from dinosaur.spherical_harmonic import vor_div_to_uv_nodal, uv_nodal_to_vor_div_modal
-from dinosaur.primitive_equations import get_geopotential, compute_diagnostic_state, State, PrimitiveEquations
+from dinosaur.primitive_equations import compute_diagnostic_state_sigma, compute_diagnostic_state_hybrid, State, PrimitiveEquations
 from dinosaur.filtering import horizontal_diffusion_filter
+from dinosaur.hybrid_coordinates import HybridCoordinates
 from jax import tree_util
 from jcm.forcing import ForcingData
 from jcm.date import DateData
@@ -245,18 +246,16 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
     u, v = vor_div_to_uv_nodal(dynamics.coords.horizontal, state.vorticity, state.divergence)
 
     # Z, X, Y
+    compute_diagnostic_state = compute_diagnostic_state_hybrid if isinstance(dynamics.coords.vertical, HybridCoordinates) else compute_diagnostic_state_sigma
     nodal_state = compute_diagnostic_state(state, dynamics.coords)
     t = nodal_state.temperature_variation
     q = nodal_state.tracers['specific_humidity']
 
-    phi_spectral = get_geopotential(
-        state.temperature_variation,
-        dynamics.reference_temperature,
-        dynamics.orography,
-        dynamics.coords.vertical,
-        dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION),
-        dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
-    )
+    # Compute geopotential on sigma levels
+    # TODO: We might also want to account for the contribution of tracers to the geopotential
+    # TODO: Look into optimizing this computation using sharding
+    phi_spectral_diff = dynamics._get_geopotential_diff(state.temperature_variation, 'dense', sharding=None)
+    phi_spectral = phi_spectral_diff + dynamics.orography[jnp.newaxis, :, :] * dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION)
 
     phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
     log_sp = dynamics.coords.horizontal.to_nodal(state.log_surface_pressure)

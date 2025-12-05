@@ -32,48 +32,54 @@ def apply_forcing_data(
     
     # Compute surface properties based on existing masks
     surface_albedo_vis, surface_albedo_nir, surface_emissivity = _compute_surface_properties(
-        forcing.fmask,  # Land fraction
+        geometry.fmask,  # Land fraction
         forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am,  # Sea ice
     )
     
     # Surface temperature (use existing SST for ocean, land temperature for land)
     surface_temperature = jnp.where(
-        forcing.fmask > 0.5,  # Land
-        forcing.stlcl_ob[..., 0] if forcing.stlcl_ob.ndim == 3 else forcing.stlcl_ob,  # Land temp
-        forcing.tsea  # SST
+        geometry.fmask > 0.5,  # Land
+        forcing.stl_am[..., 0] if forcing.stl_am.ndim == 3 else forcing.stl_am,  # Land temp
+        forcing.sea_surface_temperature  # SST
     )
     
     # Roughness length (higher over land)
     roughness_length = jnp.where(
-        forcing.fmask > 0.5,  # Land
+        geometry.fmask > 0.5,  # Land
         0.01,  # 1 cm over land
         0.0001  # 0.1 mm over ocean
     )
     
-    # FIXME: These aren't being used yet
     # Greenhouse gas concentrations (uniform for now)
     co2_concentration = 420.0  # ppmv
     ch4_concentration = 1900.0  # ppbv
-    n2o_concentration = 335.0  # ppbv
+    o3_concentration = 300.0  # ppbv
     
     # Sea ice fraction (from existing data)
+    #TODO: use these somewhere
     sea_ice_fraction = forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am
     sea_ice_thickness = jnp.where(sea_ice_fraction > 0.1, 1.0, 0.0)  # 1m where ice exists
     
     tendencies = PhysicsTendency.zeros(state.temperature.shape)
 
-    radiation_data = physics_data.radiation_data.copy(
+    radiation_data = physics_data.radiation.copy(
         surface_albedo_vis=surface_albedo_vis,
         surface_albedo_nir=surface_albedo_nir,
         surface_emissivity=surface_emissivity,
     )
-    surface_data = physics_data.surface_data.copy(
+    chemistry_data = physics_data.chemistry.copy(
+        co2_vmr=co2_concentration,
+        methane_vmr=ch4_concentration * 1e-3,  # Convert ppbv to ppmv
+        ozone_vmr=o3_concentration * 1e-3,    # Convert ppbv to ppmv
+    )
+    surface_data = physics_data.surface.copy(
         surface_temperature=surface_temperature,
         roughness_length=roughness_length,
     )
     updated_physics_data = physics_data.copy(
-        radiation_data=radiation_data,
-        surface_data=surface_data,
+        radiation=radiation_data,
+        surface=surface_data,
+        chemistry=chemistry_data
     )
     return tendencies, updated_physics_data
 

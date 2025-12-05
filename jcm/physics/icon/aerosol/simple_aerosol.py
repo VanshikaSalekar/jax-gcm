@@ -30,15 +30,20 @@ def get_simple_aerosol(
     - Column-integrated properties
     - Twomey effect on cloud droplet number concentration
     """
+    import jax
         
     nlev, ncols = state.temperature.shape
     aerosol_params = parameters.aerosol
     
     # Get grid coordinates from geometry
-    nlon, nlat = geometry.nodal_shape[1], geometry.nodal_shape[2]
-    lat = jnp.tile(geometry.radang, nlon) * 180.0 / jnp.pi  # Convert to degrees
-    longitudes = jnp.linspace(-180.0, 180.0, nlon, endpoint=False)  # degrees
-    lon = jnp.repeat(longitudes, nlat)  # degrees East
+    nlon = geometry.nodal_shape[1]
+    lat, lon = jax.numpy.meshgrid(
+        geometry.lat * 180.0 / jnp.pi,  # Convert to degrees
+        geometry.lon * 180.0 / jnp.pi,  # degrees
+    )
+    # Then reshape to (ncols,) to match column format
+    lats = lat.reshape(ncols)
+    lons = lon.reshape(ncols)
     
     # Get height coordinate for vertical distribution
     height_full = physics_data.diagnostics.height_full
@@ -52,14 +57,14 @@ def get_simple_aerosol(
     asy_profile = jnp.zeros((nlev, ncols))
     
     # Calculate anthropogenic and background AOD using vectorized operations
-    aod_anthropogenic = get_anthropogenic_aod(lat, lon, aerosol_params)
-    aod_background = get_background_aod(lat, lon, aerosol_params)
+    aod_anthropogenic = get_anthropogenic_aod(lats, lons, aerosol_params)
+    aod_background = get_background_aod(lats, lons, aerosol_params)
     
     # Calculate vertical profiles for each plume using vectorized operations
     plume_profiles = get_vertical_profiles(height_full, aerosol_params)
     
     # Calculate spatial distribution for all plumes
-    spatial_dist = get_plume_spatial_distribution(lat, lon, aerosol_params)
+    spatial_dist = get_plume_spatial_distribution(lats, lons, aerosol_params)
     
     # Combine plume contributions using vectorized operations
     # plume_profiles: (nplumes, nlev, ncols)

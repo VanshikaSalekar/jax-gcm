@@ -137,8 +137,8 @@ def _fixed_ssts(grid: HorizontalGridTypes) -> jnp.ndarray:
     "A standard test for AGCMs including their physical parametrizations: I: the proposal."
     Atmosph. Sci. Lett., 1: 101-107. https://doi.org/10.1006/asle.2000.0022
     """
-    radang = grid.latitudes
-    sst_profile = jnp.where(jnp.abs(radang) < jnp.pi/3, 27*jnp.cos(3*radang/2)**2, 0) + 273.15
+    lat = grid.latitudes
+    sst_profile = jnp.where(jnp.abs(lat) < jnp.pi/3, 27*jnp.cos(3*lat/2)**2, 0) + 273.15
     return jnp.tile(sst_profile, (grid.nodal_shape[0], 1))
 
 def default_forcing(

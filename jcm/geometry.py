@@ -105,7 +105,7 @@ def _initialize_hybrid_vertical(nlevels: int):
     grdscp = grdsig / cp
     wvi = jnp.zeros((nlevels, 2))
     
-    return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi, hybrid_levels
+    return hsg, fsg, dhs, sigl, grdsig, grdscp, wvi
 
 @tree_math.struct
 class Geometry:
@@ -115,7 +115,8 @@ class Geometry:
     phis0: jnp.ndarray # spectrally truncated surface geopotential
     fmask: jnp.ndarray # fractional land-sea mask (ix, il)
 
-    radang: jnp.ndarray # latitude in radians
+    lat: jnp.ndarray # latitude in radians
+    lon: jnp.ndarray # longitude in radians
     sia: jnp.ndarray # sin of latitude
     coa: jnp.ndarray # cos of latitude
 
@@ -155,8 +156,9 @@ class Geometry:
 
         # Horizontal coordinates
         # Horizontal functions of latitude (from south to north)
-        radang = coords.horizontal.latitudes
-        sia, coa = jnp.sin(radang), jnp.cos(radang)
+        lat = coords.horizontal.latitudes
+        lon = coords.horizontal.longitudes
+        sia, coa = jnp.sin(lat), jnp.cos(lat)
         
         # Vertical coordinates
         #TODO: This should all be dealt with by the coordinates object so we don't have to pass in the hybrid flag
@@ -169,7 +171,7 @@ class Geometry:
 
         return cls(nodal_shape=coords.nodal_shape,
                    orog=orog, phis0=phis0, fmask=fmask,
-                   radang=radang, sia=sia, coa=coa,
+                   lat=lat, lon=lon, sia=sia, coa=coa,
                    hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
                    grdsig=grdsig, grdscp=grdscp, wvi=wvi)
     
@@ -237,11 +239,11 @@ class Geometry:
         )
 
     @classmethod
-    def single_column_geometry(cls, radang=0., orog=0., fmask=0., phis0=None, num_levels=8):
+    def single_column_geometry(cls, lat=0., orog=0., fmask=0., phis0=None, num_levels=8):
         """Initialize a Geometry instance for a single column model.
 
         Args:
-            radang (optional): Latitude of the single column in radians (default 0).
+            lat (optional): Latitude of the single column in radians (default 0).
             orog (optional): Orography height in meters (default 0).
             fmask (optional): Fractional land-sea mask (default 0, all ocean).
             phis0 (optional): Spectrally truncated surface geopotential (default grav * orog).
@@ -251,7 +253,7 @@ class Geometry:
             Geometry object
 
         """
-        sia, coa = jnp.sin(radang), jnp.cos(radang)
+        sia, coa = jnp.sin(lat), jnp.cos(lat)
 
         # Letting user specify phis0 allows for the case of pulling one column from a full geometry,
         # where phis0 =/= grav * orog due to spectral truncation.
@@ -263,7 +265,7 @@ class Geometry:
 
         return cls(nodal_shape=(num_levels, 1, 1),
                    orog=jnp.array([[orog]]), phis0=jnp.array([[phis0]]), fmask=jnp.array([[fmask]]),
-                   radang=jnp.array([[radang]]), sia=jnp.array([[sia]]), coa=jnp.array([[coa]]),
+                   lat=jnp.array([[lat]]), sia=jnp.array([[sia]]), coa=jnp.array([[coa]]),
                    hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
                    grdsig=grdsig, grdscp=grdscp, wvi=wvi)
 

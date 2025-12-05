@@ -28,7 +28,7 @@ TRUNCATION_FOR_NODAL_SHAPE = {
 VALID_NODAL_SHAPES = tuple(TRUNCATION_FOR_NODAL_SHAPE.keys())
 VALID_TRUNCATIONS = tuple(TRUNCATION_FOR_NODAL_SHAPE.values())
 
-def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=None, hybrid_vertical=False) -> CoordinateSystem:
+def get_coords(layers=None, spectral_truncation=31, nodal_shape=None, spmd_mesh=None, hybrid_vertical=False) -> CoordinateSystem:
     f"""
     Returns a CoordinateSystem object for the given number of layers and one of the following horizontal resolutions: {VALID_TRUNCATIONS}.
     """
@@ -52,9 +52,10 @@ def get_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_mesh=Non
 
     if hybrid_vertical:
         vertical = dinosaur.hybrid_coordinates.HybridCoordinates.analytic_ecmwf_like(
-            nlevels=layers
+            n_levels=layers or 40
         )
     else:
+        layers = layers or 8
         if layers not in SIGMA_LAYER_BOUNDARIES:
             raise ValueError(f"Invalid number of layers: {layers}. Must be one of: {tuple(SIGMA_LAYER_BOUNDARIES.keys())}")
 

@@ -27,7 +27,6 @@ from . import (
     cosine_solar_zenith_angle,
     top_of_atmosphere_flux, 
     daylight_fraction,
-    calculate_solar_radiation_gcm,
     get_solar_implementation
 )
 # Import solar calculations from solar_interface
