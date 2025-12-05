@@ -27,7 +27,7 @@ jcm/                      # Main package (JAX Climate Model)
 ├── physics_interface.py # Physics abstraction layer
 ├── geometry.py          # Grid and coordinate handling
 ├── date.py              # Time/date management
-└── boundaries.py        # Surface boundary conditions
+└── forcing.py           # Surface boundary conditions
 ```
 
 ## Development Commands
@@ -50,6 +50,9 @@ pytest --cov=jcm --cov-fail-under=90
 
 # Skip slow tests
 pytest -m "not slow"
+
+# Run single test
+pytest path/to/test_file.py::test_function_name -v
 ```
 
 ### Linting
@@ -81,10 +84,12 @@ cd docs && make html
    tendency_fn = jax.vmap(compute_tendency, in_axes=(0, None))
    ```
 
-### Common Conversions (from JAX_CONVERSION_PATTERNS.md)
+### Common Conversions
+See `JAX_CONVERSION_PATTERNS.md` and `JAX_gotchas.md` for detailed patterns:
 - Replace `np.maximum(0, x)` with `jax.nn.relu(x)`
 - Replace boolean indexing with `jnp.where`
 - Use `lax.scan` for accumulation over sequences
+- Use `lax.cond` with lambda functions to avoid eager evaluation
 - Implement custom gradients with `jax.custom_vjp`
 
 ## Testing Best Practices
@@ -107,25 +112,24 @@ cd docs && make html
 All physics modules implement this protocol:
 ```python
 class ExamplePhysics(Physics):
-
     def compute_tendencies(
         self,
         state: PhysicsState,
-        boundaries: BoundaryData,
+        forcing: ForcingData,
         geometry: Geometry,
         date: DateData,
     ) -> Tuple[PhysicsTendency, PhysicsData]:
        ...
 ```
 
-Each term in the physics scheme has a top-level method that the physics interface can call, e.g.:
+Each major physics term typically has a method like:
 ```python
-
 @jit
-def apply_radiation(state: PhysicsState,
+def _apply_radiation(
+    state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
-    boundaries: BoundaryData,
+    forcing: ForcingData,
     geometry: Geometry
 ) -> tuple[PhysicsTendency, PhysicsData]:
    ...
@@ -134,57 +138,39 @@ def apply_radiation(state: PhysicsState,
 ### ICON Physics Structure
 The ICON physics package (`jcm/physics/icon/`) includes:
 - **Radiation**: Shortwave and longwave schemes
-- **Convection**: Deep and shallow convection
+- **Convection**: Deep and shallow convection (Tiedtke-Nordeng scheme)
 - **Clouds**: Cloud microphysics and cover
 - **Vertical Diffusion**: Turbulent mixing
 - **Surface**: Land-atmosphere interactions
 - **Gravity Waves**: Orographic and non-orographic
+- **Chemistry**: Chemical tracers (if enabled)
+- **Aerosol**: Aerosol interactions (if enabled)
 
 Each module follows:
 1. Modular design with clear interfaces
 2. Full JAX compatibility (autodiff, JIT, vmap)
-3. Comprehensive test coverage
+3. Comprehensive test coverage (33+ test files in physics)
 4. Detailed documentation
+
+### Unit Conversions
+See `jcm/physics/icon/UNIT_CONVERSIONS.md` for details on converting between:
+- Physics interface units (normalized surface pressure, geopotential)
+- ICON expected units (Pa, meters, kg/m³)
+
+Key conversions handled automatically:
+- Surface pressure: `normalized * p0` (p0 = 100000 Pa)
+- Pressure levels: `sigma * surface_pressure_pa`
+- Height: `geopotential / g`
+- Air density: `pressure / (Rd * temperature)`
 
 ### State Management
 - `PhysicsState`: Immutable atmospheric state (u, v, T, q, φ, ps)
 - `PhysicsTendency`: Time derivatives of state variables
 - Tree-structured data using `tree_math` for arithmetic operations
 
-## Dependencies and Requirements
-
-- **Python**: 3.11+ (required for jax-solar)
-- **Core**: JAX, Dinosaur, tree-math
-- **Configuration**: hydra-core
-- **I/O**: xarray, netCDF4
-- **Testing**: pytest, pytest-cov
-- **Documentation**: Sphinx with Furo theme
-
-## Common Development Tasks
-
-### Adding New Physics
-1. Create module in appropriate physics package directory
-2. Implement `Physics` calls
-3. Ensure JAX compatibility (no Python control flow)
-4. Add comprehensive tests
-5. Document with docstrings and update integration guide
-
-### Running Single Tests
-```bash
-pytest path/to/test_file.py::test_function_name -v
-```
-
-### Debugging JAX Issues
-- Check for Python control flow on JAX arrays
-- Verify static shapes
-- Use `jax.debug.print` for debugging inside JIT
-- Consult JAX_gotchas.md for common pitfalls
-
 ## Model Interface
 
-The `jcm.model.Model` class provides the main interface for running JAX-GCM simulations. 
-
-### Constructor vs Run Method (New Interface)
+### Constructor vs Run Method
 
 **Model Configuration (Constructor)**: Physics and geometry settings are specified when creating the model:
 ```python
@@ -196,7 +182,7 @@ from jcm.physics.icon import IconPhysics
 model = Model(
     time_step=30.0,              # Model timestep in minutes
     layers=8,                    # Vertical layers
-    horizontal_resolution=31,    # Spectral resolution 
+    horizontal_resolution=31,    # Spectral resolution
     physics=SpeedyPhysics(),     # Physics package
     use_hybrid_coords=False      # Coordinate system (auto-detected from physics)
 )
@@ -207,40 +193,56 @@ model = Model(
 # Run simulation with specific parameters
 predictions = model.run(
     initial_state=None,                    # Optional initial state
-    boundaries=None,                       # Boundary conditions (default aquaplanet)
+    forcing=None,                          # Boundary conditions (default aquaplanet)
     save_interval=10.0,                    # Save interval in days
     total_time=120.0,                      # Total simulation time in days
     start_date=Timestamp.from_datetime(datetime(2000, 1, 1))
 )
 ```
 
-### Key Interface Changes
-
-1. **Method Renamed**: `unroll()` → `run()`
-2. **Parameter Migration**: Simulation parameters moved from constructor to `run()` method:
-   - `save_interval`, `total_time`, `start_date` → now in `run()`
-   - `initial_state`, `boundaries` → now in `run()` 
-   - `time_step`, `physics`, `geometry` → remain in constructor
-
-3. **Resume Capability**: Use `model.resume()` to continue from where `run()` left off:
-   ```python
-   # Continue simulation
-   more_predictions = model.resume(
-       save_interval=10.0,
-       total_time=60.0  # Additional 60 days
-   )
-   ```
-
 ### Coordinate System Auto-Detection
-
 The model automatically detects coordinate systems:
 - **ICON Physics** → Hybrid sigma-pressure coordinates
-- **SPEEDY Physics** → Pure sigma coordinates  
+- **SPEEDY Physics** → Pure sigma coordinates
 - Override with `use_hybrid_coords=True/False`
 
-### Physics Package Integration
+### Resume Capability
+Use `model.resume()` to continue from where `run()` left off:
+```python
+# Continue simulation
+more_predictions = model.resume(
+    save_interval=10.0,
+    total_time=60.0  # Additional 60 days
+)
+```
 
-Physics packages must implement the `Physics` protocol:
-- `compute_tendencies()` method
-- `parameters` attribute for boundary condition setup
-- `write_output` flag for diagnostic data collection
+## Dependencies and Requirements
+
+- **Python**: 3.11+ (required for jax-solar)
+- **Core**: JAX, Dinosaur, tree-math
+- **Configuration**: hydra-core
+- **I/O**: xarray, netCDF4
+- **Testing**: pytest, pytest-cov
+- **Documentation**: Sphinx with Furo theme
+
+## Validation Framework
+
+The `validation/` directory contains comprehensive validation tests:
+
+### Emergent Properties Validation
+Tests fundamental atmospheric phenomena (ITCZ, Hadley cells, energy balance):
+```bash
+# Run comprehensive validation
+python validation/emergent_climate_validation.py --duration 30 --output results/emergent_validation.json
+
+# Quick test
+python validation/test_emergent_climate.py --quick
+```
+
+### Test Cases
+- Tropical convection (0°N, 180°E)
+- Mid-latitude winter (50°N, 0°E)
+- Arctic polar (85°N, 0°E)
+- Subtropical clear (30°N, 30°W)
+
+See `validation/README.md` for detailed validation framework documentation.

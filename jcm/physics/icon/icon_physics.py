@@ -547,7 +547,12 @@ def apply_radiation(state: PhysicsState,
     nlev, ncols = state.temperature.shape
     
     # Get lat/lon from geometry
-    latitudes, longitudes = geometry.lat, geometry.lon
+    lat, lon = jax.numpy.meshgrid(
+        geometry.lat * 180.0 / jnp.pi,  # Convert to degrees
+        geometry.lon * 180.0 / jnp.pi,  # degrees
+    )
+    # Then reshape to (ncols,) to match column format
+    latitudes, longitudes = lat.reshape(ncols), lon.reshape(ncols)
 
     # Get date information for solar calculations
     date = physics_data.date.dt
@@ -561,6 +566,12 @@ def apply_radiation(state: PhysicsState,
     ozone_vmr = physics_data.chemistry.ozone_vmr * 1e-6  # Convert ppmv to VMR
     co2_vmr = physics_data.chemistry.co2_vmr * 1e-6  # Convert ppmv to VMR
     
+    # Reshape surface properties to (ncols,) for vmap
+    surface_temperature_col = physics_data.surface.surface_temperature.reshape(ncols)  # (ncols,)
+    surface_albedo_vis_col = physics_data.radiation.surface_albedo_vis.reshape(ncols)  # (ncols,)
+    surface_albedo_nir_col = physics_data.radiation.surface_albedo_nir.reshape(ncols)  # (ncols,)
+    surface_emissivity_col = physics_data.radiation.surface_emissivity.reshape(ncols)  # (ncols,)
+
     # Prepare aerosol data for vmap - reshape to have column as the mapped dimension
     aerosol_data_for_vmap = physics_data.aerosol.copy(
         aod_profile=physics_data.aerosol.aod_profile.reshape(nlev, ncols).T,  # (ncols, nlev)
@@ -574,19 +585,18 @@ def apply_radiation(state: PhysicsState,
     
     radiation_results = jax.vmap(
         radiation_scheme,
-        in_axes=(1, 1, 1, 1,
-                 1, 1, 1, 1,
-                 1, 1, 
-                 1, 1,
-                 None, 0, 0,
-                 None, 0, None, None),  # day_of_year, seconds_since_midnight, parameters are scalars, aerosol_data is per column
+        in_axes=(1, 1, 1, 1,       # temperature, specific_humidity, pressure_full, layer_thickness (nlev, ncols)
+                 1, 1, 1, 1,       # air_density, cloud_water, cloud_ice, cloud_fraction (nlev, ncols)
+                 0, 0, 0, 0,       # surface_temperature, surface_albedo_vis, surface_albedo_nir, surface_emissivity (ncols,)
+                 None, 0, 0,       # date (scalar), latitudes (ncols,), longitudes (ncols,)
+                 None, 0, None, None),  # parameters (scalar), aerosol_data (per column), ozone_vmr, co2_vmr
         out_axes=(0, 0),  # Returns (RadiationTendencies, RadiationData) per column
         axis_size=ncols
     )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.layer_thickness,
       physics_data.diagnostics.air_density, cloud_water, cloud_ice, cloud_fraction,
-      physics_data.surface.surface_temperature, physics_data.radiation.surface_albedo_vis, 
-      physics_data.radiation.surface_albedo_nir, physics_data.radiation.surface_emissivity,
-      date, latitudes, longitudes, 
+      surface_temperature_col, surface_albedo_vis_col,
+      surface_albedo_nir_col, surface_emissivity_col,
+      date, latitudes, longitudes,
       parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr)
     
     # Unpack structured results directly

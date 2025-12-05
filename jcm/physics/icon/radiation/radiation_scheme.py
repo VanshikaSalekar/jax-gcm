@@ -368,23 +368,32 @@ def radiation_scheme(
     )
     
     # Surface properties
-    surface_planck = planck_bands_lw(surface_temperature, lw_band_limits)[0]
-    
+    # Note: When vmapped, surface_temperature is a scalar; otherwise it's an array
+    surface_temp_for_planck = surface_temperature if surface_temperature.ndim == 0 else surface_temperature
+    surface_planck = planck_bands_lw(surface_temp_for_planck, lw_band_limits)
+    if surface_planck.ndim > 1:
+        surface_planck = surface_planck[0]
+
     # Calculate longwave fluxes
+    # Note: When vmapped, surface properties are scalars; otherwise extract first element
+    emissivity_val = surface_emissivity if surface_emissivity.ndim == 0 else surface_emissivity[0]
     flux_up_lw, flux_down_lw = longwave_fluxes(
         lw_optics, planck_layers, planck_interfaces,
-        surface_emissivity[0], surface_planck
+        emissivity_val, surface_planck
     )
-    
+
     # Calculate shortwave fluxes
     max_sw_bands = 10
     toa_flux_bands_all = jnp.ones(max_sw_bands) * toa_flux / jnp.maximum(default_n_sw_bands, 1.0)
     sw_band_mask = jnp.arange(max_sw_bands) < default_n_sw_bands
     toa_flux_bands = jnp.where(sw_band_mask, toa_flux_bands_all, 0.0)
-    
+
+    # Note: When vmapped, albedos are scalars; otherwise extract first element
+    albedo_vis_val = surface_albedo_vis if surface_albedo_vis.ndim == 0 else surface_albedo_vis[0]
+    albedo_nir_val = surface_albedo_nir if surface_albedo_nir.ndim == 0 else surface_albedo_nir[0]
     flux_up_sw, flux_down_sw, flux_direct_sw, flux_diffuse_sw = shortwave_fluxes(
         sw_optics, cos_zenith, toa_flux_bands,
-        jnp.array([surface_albedo_vis[0], surface_albedo_nir[0]]),
+        jnp.array([albedo_vis_val, albedo_nir_val]),
         default_n_sw_bands
     )
     

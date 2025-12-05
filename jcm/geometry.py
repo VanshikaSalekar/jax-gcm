@@ -239,11 +239,12 @@ class Geometry:
         )
 
     @classmethod
-    def single_column_geometry(cls, lat=0., orog=0., fmask=0., phis0=None, num_levels=8):
+    def single_column_geometry(cls, lat=0., lon=0., orog=0., fmask=0., phis0=None, num_levels=8):
         """Initialize a Geometry instance for a single column model.
 
         Args:
             lat (optional): Latitude of the single column in radians (default 0).
+            lon (optional): Longitude of the single column in radians (default 0).
             orog (optional): Orography height in meters (default 0).
             fmask (optional): Fractional land-sea mask (default 0, all ocean).
             phis0 (optional): Spectrally truncated surface geopotential (default grav * orog).
@@ -265,7 +266,7 @@ class Geometry:
 
         return cls(nodal_shape=(num_levels, 1, 1),
                    orog=jnp.array([[orog]]), phis0=jnp.array([[phis0]]), fmask=jnp.array([[fmask]]),
-                   lat=jnp.array([[lat]]), sia=jnp.array([[sia]]), coa=jnp.array([[coa]]),
+                   lat=jnp.array([[lat]]), lon=jnp.array([[lon]]), sia=jnp.array([[sia]]), coa=jnp.array([[coa]]),
                    hsg=hsg, fsg=fsg, dhs=dhs, sigl=sigl,
                    grdsig=grdsig, grdscp=grdscp, wvi=wvi)
 
