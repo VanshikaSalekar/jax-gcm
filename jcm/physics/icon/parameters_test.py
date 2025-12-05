@@ -67,10 +67,12 @@ def test_physics_terms_use_parameters():
     """Test that physics terms can access parameters"""
     from jcm.physics_interface import PhysicsState
     from jcm.date import DateData
-    from jcm.boundaries import BoundaryData
+    from jcm.forcing import ForcingData
+    import jax_datetime as jdt
+    from datetime import datetime
     
     # Create simple test state
-    nlev, nlat, nlon = 8, 4, 4
+    nlev, nlat, nlon = 8, 64, 32
     state = PhysicsState(
         u_wind=jnp.zeros((nlev, nlat, nlon)),
         v_wind=jnp.zeros((nlev, nlat, nlon)),
@@ -91,16 +93,16 @@ def test_physics_terms_use_parameters():
     # The physics should be able to compute tendencies
     # (This is a basic smoke test)
     import jcm.geometry as geo
-    geometry = geo.Geometry.from_grid_shape((nlat, nlon), nlev)
-    boundaries = BoundaryData.zeros((nlat, nlon),
-                                    tsea=jnp.ones((nlat, nlon)) * 288.0,
+    geometry = geo.Geometry.from_grid_shape((nlat, nlon), num_levels=nlev)
+    forcing = ForcingData.zeros((nlat, nlon),
+                                    sea_surface_temperature=jnp.ones((nlat, nlon)) * 288.0,
                                     sice_am=jnp.zeros((nlat, nlon, 365)))
     
     tendencies, physics_data = physics.compute_tendencies(
         state, 
-        boundaries=boundaries,
+        forcing=forcing,
         geometry=geometry,
-        date=DateData.zeros()
+        date=DateData.set_date(jdt.Datetime.from_pydatetime(datetime(2020, 6, 21)))
     )
     
     # Check that tendencies have the right shape

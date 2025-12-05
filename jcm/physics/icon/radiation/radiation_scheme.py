@@ -291,6 +291,7 @@ def radiation_scheme(
     
     # Solar radiation calculations
 
+    #FIXME: I think this is causing an issue because the I'm not sure what the shape that comes out is.
     toa_flux = radiation_flux(date, longitude, latitude, parameters.solar_constant)
     sin_altitude = get_solar_sin_altitude(OrbitalTime.from_datetime(date), longitude, latitude)
     cos_zenith = jnp.sqrt(1.0 - sin_altitude**2)

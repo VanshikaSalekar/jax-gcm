@@ -16,7 +16,8 @@ from jcm.physics.icon.radiation.radiation_scheme import (
 from jcm.physics.icon.radiation.radiation_types import RadiationParameters
 from jcm.physics.icon.unit_conversions import calculate_air_density, calculate_layer_thickness
 from jcm.physics.icon.icon_physics_data import AerosolData
-
+import jax_datetime as jdt
+from datetime import datetime
 
 def create_default_aerosol_data(nlev=10, parameters=None, ncols=1):
     """Create default aerosol data for testing as AerosolData object"""
@@ -117,9 +118,6 @@ def test_prepare_radiation_state():
     
     # Check scalar fields
     assert rad_state.cos_zenith.shape == (1,)
-    assert rad_state.surface_temperature.shape == (1,)
-    assert rad_state.surface_albedo_vis.shape == (1,)
-    assert rad_state.surface_emissivity.shape == (1,)
     
     # Check physical constraints
     assert jnp.all(rad_state.h2o_vmr >= 0)
@@ -153,8 +151,7 @@ def test_radiation_scheme_basic():
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
     
     # Solar geometry for noon, summer
-    day_of_year = 172.0
-    seconds_since_midnight = 43200.0
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
     latitude = 0.0
     longitude = 0.0
     
@@ -173,12 +170,15 @@ def test_radiation_scheme_basic():
         cloud_water=atm['cloud_water'],
         cloud_ice=atm['cloud_ice'],
         cloud_fraction=atm['cloud_fraction'],
-        day_of_year=day_of_year,
-        seconds_since_midnight=seconds_since_midnight,
+        date=date,
         latitude=latitude,
         longitude=longitude,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Check output shapes
@@ -223,8 +223,7 @@ def test_radiation_scheme_nighttime():
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
     
     # Nighttime conditions
-    day_of_year = 172.0
-    seconds_since_midnight = 0.0  # Midnight
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 0, 0, 0))  # June 21, midnight
     latitude = 0.0
     longitude = 0.0
     
@@ -243,12 +242,15 @@ def test_radiation_scheme_nighttime():
         cloud_water=atm['cloud_water'],
         cloud_ice=atm['cloud_ice'],
         cloud_fraction=atm['cloud_fraction'],
-        day_of_year=day_of_year,
-        seconds_since_midnight=seconds_since_midnight,
+        date=date,
         latitude=latitude,
         longitude=longitude,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Should have minimal shortwave at night and valid longwave
@@ -275,6 +277,8 @@ def test_radiation_scheme_custom_parameters():
     air_density = calculate_air_density(atm['pressure_levels'], atm['temperature'])
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
     
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 3, 21, 12, 0, 0))  # March 21, noon
+
     # Custom parameters with appropriate band limits
     custom_params = RadiationParameters.default(
         solar_constant=1400.0,  # Higher than default
@@ -297,12 +301,15 @@ def test_radiation_scheme_custom_parameters():
         cloud_water=atm['cloud_water'],
         cloud_ice=atm['cloud_ice'],
         cloud_fraction=atm['cloud_fraction'],
-        day_of_year=172.0,
-        seconds_since_midnight=43200.0,
+        date=date,
         latitude=0.0,
         longitude=0.0,
         parameters=custom_params,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Check output shapes - hardcoded to max_bands=10
@@ -325,6 +332,8 @@ def test_radiation_scheme_extreme_conditions():
     cloud_water = jnp.zeros(nlev)
     cloud_ice = jnp.zeros(nlev) 
     cloud_fraction = jnp.zeros(nlev)
+
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 12, 21, 12, 0, 0))  # December 21, noon
     
     # Calculate layer thickness and air density as required by radiation_scheme
     air_density = calculate_air_density(pressure_levels, temperature)
@@ -345,12 +354,15 @@ def test_radiation_scheme_extreme_conditions():
         cloud_water=cloud_water,
         cloud_ice=cloud_ice,
         cloud_fraction=cloud_fraction,
-        day_of_year=172.0,
-        seconds_since_midnight=43200.0,
+        date=date,
         latitude=0.0,
         longitude=0.0,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Should handle extreme conditions without NaN
@@ -368,6 +380,8 @@ def test_radiation_scheme_very_cloudy():
     cloud_ice = jnp.ones(8) * 5e-4    # Heavy ice clouds
     cloud_fraction = jnp.ones(8) * 0.9  # 90% cloud cover
     
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
+
     # Calculate layer thickness and air density as required by radiation_scheme
     air_density = calculate_air_density(atm['pressure_levels'], atm['temperature'])
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
@@ -387,12 +401,15 @@ def test_radiation_scheme_very_cloudy():
         cloud_water=cloud_water,
         cloud_ice=cloud_ice,
         cloud_fraction=cloud_fraction,
-        day_of_year=172.0,
-        seconds_since_midnight=43200.0,
+        date=date,
         latitude=0.0,
         longitude=0.0,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Should handle heavy clouds without NaN
@@ -418,6 +435,7 @@ def test_radiation_scheme_energy_conservation():
     
     # Create default radiation parameters
     parameters = RadiationParameters.default()
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
     
     # Create default aerosol data
     aerosol_data = create_default_aerosol_data(nlev=len(atm['temperature']), parameters=parameters, ncols=1)
@@ -431,12 +449,15 @@ def test_radiation_scheme_energy_conservation():
         cloud_water=atm['cloud_water'],
         cloud_ice=atm['cloud_ice'],
         cloud_fraction=atm['cloud_fraction'],
-        day_of_year=172.0,
-        seconds_since_midnight=43200.0,
+        date=date,
         latitude=0.0,
         longitude=0.0,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Energy conservation checks
@@ -464,6 +485,8 @@ def test_radiation_scheme_realistic_values():
     
     # Create default radiation parameters
     parameters = RadiationParameters.default()
+
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
     
     # Create default aerosol data
     aerosol_data = create_default_aerosol_data(nlev=len(atm['temperature']), parameters=parameters, ncols=1)
@@ -477,12 +500,15 @@ def test_radiation_scheme_realistic_values():
         cloud_water=atm['cloud_water'],
         cloud_ice=atm['cloud_ice'],
         cloud_fraction=atm['cloud_fraction'],
-        day_of_year=172.0,
-        seconds_since_midnight=43200.0,
+        date=date,
         latitude=30.0,  # Mid-latitude
         longitude=0.0,
         parameters=parameters,
-        aerosol_data=aerosol_data
+        aerosol_data=aerosol_data,
+        surface_albedo_nir=jnp.array([0.2]),
+        surface_albedo_vis=jnp.array([0.2]),
+        surface_emissivity=jnp.array([0.95]),
+        surface_temperature=jnp.array([288.0])
     )
     
     # Check that computation completed and produced expected output shapes
@@ -519,6 +545,8 @@ def test_radiation_scheme_reproducibility():
     
     # Create default radiation parameters
     parameters = RadiationParameters.default()
+
+    date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
     
     # Create default aerosol data
     aerosol_data = create_default_aerosol_data(nlev=len(atm['temperature']), parameters=parameters, ncols=1)
@@ -534,12 +562,15 @@ def test_radiation_scheme_reproducibility():
             cloud_water=atm['cloud_water'],
             cloud_ice=atm['cloud_ice'],
             cloud_fraction=atm['cloud_fraction'],
-            day_of_year=172.0,
-            seconds_since_midnight=43200.0,
+            date=date,
             latitude=0.0,
             longitude=0.0,
             parameters=parameters,
-            aerosol_data=aerosol_data
+            aerosol_data=aerosol_data,
+            surface_albedo_nir=jnp.array([0.2]),
+            surface_albedo_vis=jnp.array([0.2]),
+            surface_emissivity=jnp.array([0.95]),
+            surface_temperature=jnp.array([288.0])
         )
         
         if i == 0:
