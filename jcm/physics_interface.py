@@ -10,7 +10,11 @@ from jcm.geometry import Geometry
 from dinosaur import scales
 from dinosaur.scales import units
 from dinosaur.spherical_harmonic import vor_div_to_uv_nodal, uv_nodal_to_vor_div_modal
-from dinosaur.primitive_equations import compute_diagnostic_state_sigma, compute_diagnostic_state_hybrid, State, PrimitiveEquations
+from dinosaur.primitive_equations import (
+    compute_diagnostic_state_sigma, compute_diagnostic_state_hybrid,
+    State, PrimitiveEquations,
+    get_geopotential_on_sigma, get_geopotential_diff_hybrid, get_geopotential_diff_sigma
+)
 from dinosaur.filtering import horizontal_diffusion_filter
 from dinosaur.hybrid_coordinates import HybridCoordinates
 from jax import tree_util
@@ -251,13 +255,36 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
     t = nodal_state.temperature_variation
     q = nodal_state.tracers['specific_humidity']
 
-    # Compute geopotential on sigma levels
-    # TODO: We might also want to account for the contribution of tracers to the geopotential
-    # TODO: Look into optimizing this computation using sharding
-    phi_spectral_diff = dynamics._get_geopotential_diff(state.temperature_variation, 'dense', sharding=None)
-    phi_spectral = phi_spectral_diff + dynamics.orography[jnp.newaxis, :, :] * dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION)
+    # Compute geopotential - different approaches for sigma vs hybrid coordinates
+    # Need full temperature (reference + variation)
+    full_temperature = nodal_state.temperature_variation + dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
+    nodal_orography = dynamics.coords.horizontal.to_nodal(dynamics.orography)
 
-    phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
+    if isinstance(dynamics.coords.vertical, HybridCoordinates):
+        # For hybrid coordinates, compute geopotential difference then add orography
+        # Convert to spectral space for the diff calculation
+        spectral_temperature = dynamics.coords.horizontal.to_modal(full_temperature)
+        phi_spectral_diff = get_geopotential_diff_hybrid(
+            temperature=nodal_state.temperature_variation,
+            coordinates=dynamics.coords.vertical,
+            ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
+            p_s_ref=100000.0,  # Reference surface pressure in Pa
+            method='dense',
+            sharding=None
+        )
+        phi_spectral = phi_spectral_diff + dynamics.orography[jnp.newaxis, :, :] * dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION)
+        phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
+    else:
+        # For sigma coordinates, use the full geopotential calculation in nodal space
+        phi = get_geopotential_on_sigma(
+            temperature=nodal_state.temperature_variation,
+            specific_humidity=None,  # For now, compute dry geopotential (TODO: include moisture)
+            nodal_orography=dynamics.orography,
+            sigma=dynamics.coords.vertical,
+            gravity_acceleration=dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION),
+            ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
+            sharding=None
+        )
     log_sp = dynamics.coords.horizontal.to_nodal(state.log_surface_pressure)
     sp = jnp.exp(log_sp)
 
