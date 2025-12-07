@@ -45,7 +45,7 @@ class Predictions:
     physics: Any
     times: Any
 
-    def to_xarray(self, physics_module: Physics=None):
+    def to_xarray(self, physics_module: Physics=None, coords=None):
         """Convert the full prediction trajectory to a final xarray.Dataset.
         This function unpacks the nested dictionary structure from the simulation
         output, formats the data, and converts the time coordinate to a
@@ -53,12 +53,13 @@ class Predictions:
 
         Args:
             physics_module (optional): instance of the Physics module used to generate the predictions, used to parse physics fields (default SpeedyPhysics).
-
+            hybrid_vertical (bool, optional): whether to use hybrid vertical coordinates (default False).
         Returns:
-            A final `xarray.Dataset` ready for analysis and plotting.
+            A final `xarray.Dataset` ready for analysis and plotting.   
 
         """
         from dinosaur.xarray_utils import data_to_xarray
+        from jcm.physics.icon.icon_physics import IconPhysics
         
         # float0s are placeholders representing the lack of tangent space for non-differentiable variables
         # jax.numpy arrays cannot have float0 dtype, so jcm handles them with numpy arrays
@@ -72,12 +73,13 @@ class Predictions:
         physics_predictions = float0s_to_nans(self.physics)
 
         nodal_shape = dynamics_predictions.u_wind.shape[1:]
-        coords = get_coords(layers=nodal_shape[0], nodal_shape=nodal_shape[1:])
+        coords = coords or get_coords(layers=nodal_shape[0], nodal_shape=nodal_shape[1:])
 
         # prepare physics predictions for xarray conversion
         # (e.g. separate multi-channel fields so they are compatible with data_to_xarray)
         physics_module = physics_module or SpeedyPhysics()
-        physics_preds_dict = physics_module.data_struct_to_dict(physics_predictions, geometry=Geometry.from_coords(coords))
+        physics_preds_dict = physics_module.data_struct_to_dict(physics_predictions, 
+                                                                geometry=Geometry.from_coords(coords,hybrid_vertical=isinstance(physics_module, IconPhysics)))
 
         times = jax.device_get(self.times)
         coords = jax.device_get(coords)
@@ -390,17 +392,18 @@ class Model:
 
     def _post_process(self, state: primitive_equations.State, forcing: ForcingData, output_averages: bool) -> Predictions:
         """Post-process a single state from the simulation trajectory. This function is called by the integrator at each save point. It converts the dynamical state to a physical state and, if enabled, runs the physics package to compute diagnostic variables.
-        
+
         Args:
-            state: 
+            state:
                 A `primitive_equations.State` object from the simulation.
-        
+
         Returns:
             A dictionary containing the `PhysicsState` ('dynamics') and the
             diagnostic physics variables (data structure determined by model.physics).
 
         """
         from jcm.physics_interface import verify_state
+        from jcm.physics.icon import IconPhysics
 
         predictions = Predictions(
             dynamics=dynamics_state_to_physics_state(state, self.primitive),
@@ -412,6 +415,11 @@ class Model:
             date = self._date_from_sim_time(state.sim_time)
             clamped_physics_state = verify_state(predictions.dynamics)
             _, physics_data = self.physics.compute_tendencies(clamped_physics_state, forcing, self.geometry, date)
+
+            # Reshape ICON physics data from column format to 3D nodal format
+            if isinstance(self.physics, IconPhysics):
+                physics_data = self.physics.reshape_physics_data_to_3d(physics_data, self.geometry)
+
             predictions = predictions.replace(physics=physics_data)
 
         return predictions
@@ -478,8 +486,21 @@ class Model:
             post_process_fn=lambda state: self._post_process(state, forcing, output_averages),
             output_averages=output_averages
         )
-        
+
         final_modal_state, predictions = integrate(initial_state)
+
+        # Reshape physics data when using IconPhysics with output_averages
+        # (non-averaged case is handled in _post_process)
+        if output_averages:
+            from jcm.physics.icon import IconPhysics
+            if isinstance(self.physics, IconPhysics) and predictions.physics is not None:
+                # Reshape each timestep's physics data
+                reshaped_physics = tree_map(
+                    lambda x: self.physics.reshape_physics_data_to_3d(x, self.geometry) if hasattr(x, '__dict__') else x,
+                    predictions.physics
+                )
+                predictions = predictions.replace(physics=reshaped_physics)
+
         return final_modal_state, predictions.replace(times=times)
 
     def resume(self,

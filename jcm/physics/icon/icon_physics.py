@@ -301,9 +301,7 @@ class IconPhysics(Physics):
         """Reshape arrays to add time dimension and handle column format."""
         import numpy as np
         
-        nlev = geometry.nlevels
-        nlon = geometry.nlon
-        nlat = geometry.nlat
+        nlev, nlon, nlat = geometry.nodal_shape
         ncols = nlon * nlat
         
         for key, value in list(result.items()):
@@ -397,10 +395,8 @@ class IconPhysics(Physics):
     
     def _process_multi_channel_arrays(self, result, geometry):
         """Handle multi-channel arrays and filter problematic fields."""
-        nlev = geometry.nlevels
-        nlon = geometry.nlon
-        nlat = geometry.nlat
-        
+        nlev, nlon, nlat = geometry.nodal_shape
+                
         _original_keys = list(result.keys())
         for k in _original_keys:
             val = result[k]
@@ -420,6 +416,14 @@ class IconPhysics(Physics):
                 # Skip interface-level data
                 print(f"Skipping interface-level data: {k} with shape {s}")
                 del result[k]
+            elif len(s) == 2 and s[0] == 1:
+                # [1, ncols] -> skip single time dimension arrays
+                print(f"Skipping single time dimension array: {k} with shape {s}")
+                del result[k]
+            elif len(s) == 3 and s[1] == nlat*nlon:
+                # [time, ncols, channels] -> skip for now
+                print(f"Skipping [time, ncols, channels] array: {k} with shape {s}")
+                del result[k]
         
         return result
     
@@ -436,6 +440,49 @@ class IconPhysics(Physics):
             filtered_result[key] = value
         
         return filtered_result
+
+    def reshape_physics_data_to_3d(self, physics_data: PhysicsData, geometry: Geometry) -> PhysicsData:
+        """
+        Reshape PhysicsData from column format to 3D nodal format for output.
+
+        This converts arrays from (ncols,) or (nlev, ncols) to (nlon, nlat) or (nlev, nlon, nlat)
+        respectively, making them suitable for plotting and analysis.
+
+        Args:
+            physics_data: PhysicsData in column format (ncols,) or (nlev, ncols)
+            geometry: Geometry object containing nodal_shape information
+
+        Returns:
+            PhysicsData with arrays reshaped to 3D nodal format
+        """
+        nlev, nlon, nlat = geometry.nodal_shape
+        ncols = nlon * nlat
+
+        def reshape_array(arr):
+            """Reshape a single array based on its dimensions."""
+            if not isinstance(arr, jnp.ndarray):
+                return arr  # Return non-arrays unchanged
+
+            if arr.ndim == 1 and arr.shape[0] == ncols:
+                # (ncols,) -> (nlon, nlat)
+                return arr.reshape(nlon, nlat)
+            elif arr.ndim == 2 and arr.shape[1] == ncols:
+                # (nlev, ncols) -> (nlev, nlon, nlat)
+                return arr.reshape(arr.shape[0], nlon, nlat)
+            elif arr.ndim == 2 and arr.shape[0] == nlev and arr.shape[1] == ncols:
+                # Explicitly handle (nlev, ncols) -> (nlev, nlon, nlat)
+                return arr.reshape(nlev, nlon, nlat)
+            elif arr.ndim == 2 and arr.shape[0] == nlev + 1 and arr.shape[1] == ncols:
+                # Handle interface levels (nlev+1, ncols) -> (nlev+1, nlon, nlat)
+                return arr.reshape(nlev + 1, nlon, nlat)
+            else:
+                # Return unchanged if shape doesn't match expected patterns
+                return arr
+
+        # Use tree_map to reshape all arrays in the nested PhysicsData structure
+        reshaped_data = jax.tree_util.tree_map(reshape_array, physics_data)
+
+        return reshaped_data
 
 @jit
 def _prepare_common_physics_state(
