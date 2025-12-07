@@ -14,7 +14,7 @@ from unittest import TestCase
 
 from jcm.physics.icon import IconPhysics
 from jcm.physics_interface import PhysicsState
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.geometry import Geometry
 from jcm.date import DateData
 
