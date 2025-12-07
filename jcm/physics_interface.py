@@ -265,7 +265,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
         # Convert to spectral space for the diff calculation
         spectral_temperature = dynamics.coords.horizontal.to_modal(full_temperature)
         phi_spectral_diff = get_geopotential_diff_hybrid(
-            temperature=nodal_state.temperature_variation,
+            temperature=spectral_temperature,
             coordinates=dynamics.coords.vertical,
             ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
             p_s_ref=100000.0,  # Reference surface pressure in Pa
@@ -279,7 +279,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
         phi = get_geopotential_on_sigma(
             temperature=nodal_state.temperature_variation,
             specific_humidity=None,  # For now, compute dry geopotential (TODO: include moisture)
-            nodal_orography=dynamics.orography,
+            nodal_orography=nodal_orography,
             sigma=dynamics.coords.vertical,
             gravity_acceleration=dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION),
             ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
