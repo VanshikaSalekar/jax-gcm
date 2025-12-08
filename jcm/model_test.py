@@ -167,7 +167,6 @@ class TestModelUnit(unittest.TestCase):
             time_step=30,  # 30 minutes - ICON physics needs smaller timesteps
             physics=IconPhysics(),
             use_hybrid_coords=False
-
         )
 
         save_interval, total_time = 1, 2
@@ -214,7 +213,6 @@ class TestModelUnit(unittest.TestCase):
         from jcm.physics.icon.icon_physics import IconPhysics
 
         model = Model(
-            time_step=720,
             physics=IconPhysics(),
         )
 
