@@ -116,6 +116,7 @@ def calculate_tendencies(
     v_wind: jnp.ndarray,
     pressure: jnp.ndarray,
     rho: jnp.ndarray,
+    layer_thickness: jnp.ndarray,
     updraft_state: UpdatedraftState,
     downdraft_state: DowndraftState,
     kbase: int,
@@ -125,7 +126,7 @@ def calculate_tendencies(
 ) -> ConvectionTendencies:
     """
     Calculate final tendencies from convective fluxes
-    
+
     Args:
         temperature: Environmental temperature (K) [nlev]
         humidity: Environmental humidity (kg/kg) [nlev]
@@ -133,36 +134,76 @@ def calculate_tendencies(
         v_wind: Meridional wind (m/s) [nlev]
         pressure: Pressure (Pa) [nlev]
         rho: Air density (kg/m³) [nlev]
+        layer_thickness: Layer thickness (m) [nlev]
         updraft_state: Computed updraft state
         downdraft_state: Computed downdraft state
         kbase: Cloud base level
         ktop: Cloud top level
         dt: Time step (s)
         config: Convection configuration
-        
+
     Returns:
         ConvectionTendencies with all tendency terms
     """
     nlev = len(temperature)
-    
-    # Calculate mass flux divergence at each level using JAX-compatible operations
-    
-    # Layer thickness (pressure)
-    dp = jnp.diff(pressure, axis=0)
-    
-    diff_updraft = jnp.diff(updraft_state.mfu, axis=0)
-    diff_downdraft = jnp.diff(downdraft_state.mfd, axis=0)
 
-    # FIXME: check signs (downdraft)
-    mass_flux_div = - diff_updraft - diff_downdraft
-    factor = mass_flux_div / (rho[:-1] * dp) * grav # Factor for tendency calculation
-    
-    temp_flux_div = - jnp.diff(updraft_state.tu * updraft_state.mfu + downdraft_state.td * downdraft_state.mfd, axis=0) # FIXME this is blowing up level 1
+    # Calculate mass flux divergence at each level using JAX-compatible operations
+
+    # CRITICAL FIX: Use DRY STATIC ENERGY flux, not temperature flux!
+    # ICON Fortran: pmfus = pmfu * (cp*T + geopotential)
+    # This prevents the temperature blowup that was occurring
+
+    # Compute geopotential at each level from layer thickness
+    # Starting from surface (highest index), integrate upward
+    # geopotential[k] = sum of layer_thickness[k:] * g
+    heights_from_surface = jnp.cumsum(layer_thickness[::-1])[::-1]  # Reverse, cumsum, reverse back
+    geopotential = grav * heights_from_surface
+
+    # Dry static energy = cp*T + geopotential
+    # The latent heat is handled separately through lh_source
+    dse_up = cp * updraft_state.tu + geopotential
+    dse_down = cp * downdraft_state.td + geopotential
+
+    # Fluxes of dry static energy (W/m² equivalent)
+    # pmfus = mfu * (cp*T + phi) in ICON
+    dse_flux_up = dse_up * updraft_state.mfu
+    dse_flux_down = dse_down * downdraft_state.mfd
+
+    # Flux divergences (matching ICON exactly: pmfus(k+1) - pmfus(k))
+    # Note: In ICON k=1 is TOA, k=klev is surface
+    # In our arrays, index 0 is TOA, index -1 is surface
+    # So pmfus(k+1) - pmfus(k) is flux_up[k+1] - flux_up[k] in Python
+    # This gives shape (nlev-1,)
+    dse_flux_div = - jnp.diff(dse_flux_up + dse_flux_down, axis=0)
     q_flux_div = - jnp.diff(updraft_state.qu * updraft_state.mfu + downdraft_state.qd * downdraft_state.mfd, axis=0)
     lh_source = - alhc * jnp.diff(updraft_state.lu * updraft_state.mfu, axis=0) # Include latent heat from condensation/evaporation
 
-    dtedt_k_levels = (temp_flux_div + lh_source/cp) * factor
-    dqdt_k_levels = q_flux_div * factor
+    # Layer mass per unit area (kg/m²) - ICON's pmref
+    # For the tendency calculation, we need mass at the levels where tendency is applied (nlev-1)
+    # ICON uses pressure differences at layer interfaces
+    # Approximate: use pressure at current level for normalization
+    # Actually in ICON, pmref is passed in and is the layer mass
+    # For simplicity, use a constant approximation or estimate from pressure
+    # Better: compute from pressure differences
+    dp = jnp.diff(pressure, axis=0)  # Pressure difference  between levels, shape (nlev-1)
+    layer_mass_per_area = jnp.abs(dp) / grav  # kg/m², shape (nlev-1)
+
+    # Convert to tendencies by dividing by layer mass (ICON: zrmref = 1/pmref)
+    # Temperature tendency: (DSE_flux_div + LH_source) / (cp * layer_mass_per_area)
+    # ICON: pq_cnv includes both DSE and LH, but we need to convert DSE flux to temp flux
+    # DSE = cp*T + phi, so dDSE/dt = cp*dT/dt + d(phi)/dt
+    # For a fixed level, d(phi)/dt = 0, so dT/dt = dDSE/dt / cp
+    # All arrays now have shape (nlev-1,)
+    dtedt_k_levels = (dse_flux_div + lh_source) / (cp * layer_mass_per_area)
+    dqdt_k_levels = q_flux_div / layer_mass_per_area
+
+    # Mass flux divergences needed for momentum transport
+    diff_updraft = jnp.diff(updraft_state.mfu, axis=0)
+    diff_downdraft = jnp.diff(downdraft_state.mfd, axis=0)
+    mass_flux_div = diff_updraft + diff_downdraft
+
+    # Normalization factor for tendencies (1 / layer_mass)
+    factor = 1.0 / layer_mass_per_area
 
     # Downdraft momentum transport (assumes downdraft winds ~ environmental winds)
     u_downdraft_flux = - jnp.diff(u_wind * downdraft_state.mfd, axis=0)
@@ -206,6 +247,23 @@ def calculate_tendencies(
     dqdt = jnp.zeros(nlev).at[:-1].set(dqdt_k_levels)
     dudt = jnp.zeros(nlev).at[:-1].set(dudt_k_levels)
     dvdt = jnp.zeros(nlev).at[:-1].set(dvdt_k_levels)
+
+    # CRITICAL: Mask tendencies to only apply where convection is active (between ktop and kbase)
+    # ICON does: IF(ldcum(jl).AND.jk.GE.kctop(jl)-1)
+    # This prevents tendencies from leaking into stratosphere or below cloud base
+    k_indices = jnp.arange(nlev)
+    # Cloud extends from kbase (cloud base, lower altitude, higher pressure, higher index in pressure-increasing arrays)
+    # to ktop (cloud top, higher altitude, lower pressure, lower index)
+    # But we need to account for flexible ordering - use min/max to be safe
+    cloud_bottom = jnp.maximum(ktop, kbase)  # Higher index (could be surface or TOA depending on ordering)
+    cloud_top = jnp.minimum(ktop, kbase)     # Lower index
+    # Include one level above cloud top for flux divergence calculation (ktop-1 in ICON)
+    conv_mask = (k_indices >= cloud_top - 1) & (k_indices <= cloud_bottom)
+
+    dtedt = jnp.where(conv_mask, dtedt, 0.0)
+    dqdt = jnp.where(conv_mask, dqdt, 0.0)
+    dudt = jnp.where(conv_mask, dudt, 0.0)
+    dvdt = jnp.where(conv_mask, dvdt, 0.0)
 
     # Calculate precipitation rate
     precip_rate = calculate_precipitation_rate(

@@ -510,8 +510,8 @@ def tiedtke_nordeng_convection(
         
         # Calculate final tendencies for basic variables
         tendencies = calculate_tendencies(
-            temperature, humidity, u_wind, v_wind, pressure, rho,
-            updraft_state, downdraft_state, 
+            temperature, humidity, u_wind, v_wind, pressure, rho, layer_thickness,
+            updraft_state, downdraft_state,
             cloud_base, ktop, dt, config
         )
         
