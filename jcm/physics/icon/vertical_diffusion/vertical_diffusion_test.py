@@ -321,12 +321,19 @@ class TestVerticalDiffusionScheme:
         assert jnp.all(jnp.isfinite(tendencies.temperature_tendency))
         assert jnp.all(jnp.isfinite(diagnostics.exchange_coeff_momentum))
         assert jnp.all(jnp.isfinite(diagnostics.boundary_layer_height))
-        
+
         # Check physical bounds
         assert jnp.all(jnp.abs(tendencies.u_tendency) <= 1.0)  # Reasonable wind tendency
         assert jnp.all(jnp.abs(tendencies.v_tendency) <= 1.0)
         assert jnp.all(jnp.abs(tendencies.temperature_tendency) <= 10.0)  # K/s
         assert jnp.all(diagnostics.boundary_layer_height >= 50.0)
+
+        # BUG CHECK: Vertical diffusion should not produce T=0K
+        # Apply tendency for one timestep to check resulting temperature
+        t_new = temperature + tendencies.temperature_tendency * dt
+        assert jnp.all(t_new > 100.0), f"Vertical diffusion producing T={jnp.min(t_new):.1f} K - matrix solver bug?"
+        # Temperature shouldn't change drastically
+        assert jnp.all(jnp.abs(temperature - t_new) < 50.0), f"Temperature change {jnp.max(jnp.abs(temperature - t_new)):.1f} K too large"
     
     def test_vertical_diffusion_energy_conservation(self):
         """Test energy conservation in vertical diffusion."""

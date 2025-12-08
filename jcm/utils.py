@@ -57,9 +57,10 @@ def get_coords(layers=None, spectral_truncation=31, nodal_shape=None, spmd_mesh=
     else:
         layers = layers or 8
         if layers not in SIGMA_LAYER_BOUNDARIES:
-            raise ValueError(f"Invalid number of layers: {layers}. Must be one of: {tuple(SIGMA_LAYER_BOUNDARIES.keys())}")
-
-        vertical = dinosaur.sigma_coordinates.SigmaCoordinates(SIGMA_LAYER_BOUNDARIES[layers])
+            print("WARNING: No built-in sigma levels for the specified number of layers. Using equidistant levels instead.")
+            vertical = dinosaur.sigma_coordinates.SigmaCoordinates.equidistant(layers)
+        else:
+            vertical = dinosaur.sigma_coordinates.SigmaCoordinates(SIGMA_LAYER_BOUNDARIES[layers])
 
     return CoordinateSystem(
         horizontal=horizontal_grid(radius=physics_specs.radius, 

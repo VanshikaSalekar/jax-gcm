@@ -376,19 +376,34 @@ def calculate_updraft(
             mfu_new = jnp.maximum(carry.mfu[next_level] + dmf_entr - dmf_detr, 0.0)
             
             # Proper mixing with entrainment
-            # Avoid division by zero
-            if_mfu = 1.0 / jnp.maximum(mfu_new, 1e-10)
-            
-            # Total water and energy after mixing
-            total_water = (carry.qu[next_level] + carry.lu[next_level]) * carry.mfu[next_level] + env_q * dmf_entr
-            total_water = total_water * if_mfu
-            
-            # Temperature after mixing (dry static energy conservation)
-            temp_mix = carry.tu[next_level] * carry.mfu[next_level] + env_temp * dmf_entr
-            temp_mix = temp_mix * if_mfu
-            
-            # Saturation adjustment
-            tu_new, qu_new, lu_new = saturation_adjustment(temp_mix, total_water, pressure)
+            # When mass flux is negligible, use environmental values instead of dividing by tiny numbers
+            mfu_threshold = 1e-6  # kg/m²/s - below this, updraft is negligible
+
+            def compute_updraft_properties():
+                # Avoid division by zero
+                if_mfu = 1.0 / jnp.maximum(mfu_new, 1e-10)
+
+                # Total water and energy after mixing
+                total_water = (carry.qu[next_level] + carry.lu[next_level]) * carry.mfu[next_level] + env_q * dmf_entr
+                total_water = total_water * if_mfu
+
+                # Temperature after mixing (dry static energy conservation)
+                temp_mix = carry.tu[next_level] * carry.mfu[next_level] + env_temp * dmf_entr
+                temp_mix = temp_mix * if_mfu
+
+                # Saturation adjustment
+                return saturation_adjustment(temp_mix, total_water, pressure)
+
+            def use_environmental_values():
+                # When updraft mass flux is negligible, use environmental values
+                return env_temp, env_q, jnp.array(0.0)
+
+            # Use environmental values when mass flux is too small
+            tu_new, qu_new, lu_new = lax.cond(
+                mfu_new > mfu_threshold,
+                compute_updraft_properties,
+                use_environmental_values
+            )
             
             # Calculate buoyancy
             virtual_temp_u = tu_new * (1.0 + 0.608 * qu_new - lu_new)

@@ -274,8 +274,10 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
         phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
     else:
         # For sigma coordinates, use the full geopotential calculation in nodal space
+        # Need to add reference temperature to get full temperature
+        full_temperature = nodal_state.temperature_variation + dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
         phi = get_geopotential_on_sigma(
-            temperature=nodal_state.temperature_variation,
+            temperature=full_temperature,
             specific_humidity=None,  # For now, compute dry geopotential (TODO: include moisture)
             nodal_orography=nodal_orography,
             sigma=dynamics.coords.vertical,

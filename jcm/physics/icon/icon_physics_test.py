@@ -20,26 +20,32 @@ class TestIconPhysicsIntegration(unittest.TestCase):
     def test_icon_physics_integration_3_timesteps(self):
         """
         Test that ICON physics runs for 3 timesteps and produces sensible output.
-        
-        This is a simple integration test based on the run-icon.ipynb notebook.
-        It verifies that the model can run without errors and produces reasonable results.
+
+        This test should catch known bugs:
+        - Radiation causing excessive cooling (-143 K/day)
+        - Convection causing temperature blowup (to 1300 K in 4-6 hours)
+        - Vertical diffusion producing T=0K
         """
-        # Skip this test for now due to incompatibility between ICON and SPEEDY boundary conditions
-        # The boundaries.py module expects SPEEDY-style parameters with surface_flux attribute
-        # but ICON has its own parameter structure
-        pytest.skip("ICON physics integration test temporarily disabled due to boundary condition incompatibility")
-        
-        # Create model with ICON physics
-        # ICON requires 40 or 47 levels for hybrid coordinates
+        from jcm.utils import get_coords
+        from jcm.geometry import Geometry
+
+        # Create model with ICON physics using sigma coordinates
+        coords = get_coords(hybrid_vertical=False, layers=40, spectral_truncation=31)
+        geometry = Geometry.from_coords(coords)
+
         model = Model(
+            geometry=geometry,
+            time_step=30,  # 30 minutes - reasonable for atmospheric physics
             physics=IconPhysics(),
-            layers=40  # Use 40 levels for ICON
+            use_hybrid_coords=False
         )
         
-        # Run the model
+        # Run the model for 6 hours (with radiation/convection bugs should crash)
+        save_interval = 0.25  # Save every 6 hours
+        total_time = 0.25     # Run for 6 hours
         predictions = model.run(
-            save_interval=3/48,  # Save every 3 time steps (1.5 hours)
-            total_time=3/48     # Three 30 minute time steps (1.5 hours)
+            save_interval=save_interval,
+            total_time=total_time
         )
         
         # Check that we have predictions
@@ -105,8 +111,8 @@ class TestIconPhysicsIntegration(unittest.TestCase):
         # Temperature should be in a reasonable range (200K - 350K)
         temp_min = jnp.min(dynamics_predictions.temperature)
         temp_max = jnp.max(dynamics_predictions.temperature)
-        self.assertGreater(temp_min, 150.0, f"Minimum temperature {temp_min} K seems too cold")
-        self.assertLess(temp_max, 400.0, f"Maximum temperature {temp_max} K seems too hot")
+        self.assertGreater(temp_min, 150.0, f"Minimum temperature {temp_min} K seems too cold - radiation bug?")
+        self.assertLess(temp_max, 350.0, f"Maximum temperature {temp_max} K seems too hot - convection blowup bug?")
         
         # Surface pressure should be positive and in reasonable range (normalized units)
         sp_min = jnp.min(dynamics_predictions.normalized_surface_pressure)
@@ -120,12 +126,10 @@ class TestIconPhysicsIntegration(unittest.TestCase):
         self.assertGreaterEqual(q_min, 0.0, "Specific humidity should be non-negative")
         
         # Check that the time dimension exists and matches expected save intervals
-        save_interval = 3/48
-        total_time = 3/48
-        expected_time_steps = int(total_time / save_interval) + 1  # +1 for initial state  
+        expected_time_steps = int(total_time / save_interval) + 1  # +1 for initial state
         actual_time_steps = dynamics_predictions.temperature.shape[0]
         self.assertEqual(actual_time_steps, expected_time_steps,
-                        f"Expected {expected_time_steps} time steps, got {actual_time_steps}")
+                        f"Expected {expected_time_steps} time steps, got {actual_time_steps} - model may have crashed")
         
         print(f"✓ ICON physics integration test passed!")
         print(f"  - Ran for {actual_time_steps} time steps")

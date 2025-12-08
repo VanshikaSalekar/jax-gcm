@@ -60,11 +60,16 @@ def get_terrain(orography: jnp.ndarray=None, fmask: jnp.ndarray=None, nodal_shap
     return orography, fmask
 
 def _initialize_vertical(kx):
+    from dinosaur.sigma_coordinates import SigmaCoordinates
+    # FIXME - this should really just take a vertical coordinate system 
+
     # Definition of model levels
     # Layer thicknesses and full (u,v,T) levels
     if kx not in SIGMA_LAYER_BOUNDARIES:
-        raise ValueError(f"Invalid number of vertical levels: {kx}")
-    hsg = SIGMA_LAYER_BOUNDARIES[kx]
+        print("WARNING: No built-in sigma levels for the specified number of layers. Using equidistant levels instead.")
+        hsg = SigmaCoordinates.equidistant(kx).boundaries
+    else:
+        hsg = SIGMA_LAYER_BOUNDARIES[kx]
     fsg = (hsg[1:] + hsg[:-1])/2.
     dhs = jnp.diff(hsg)
     sigl = jnp.log(fsg)

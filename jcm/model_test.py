@@ -6,6 +6,9 @@ import pytest
 from jax.test_util import check_vjp, check_jvp
 import functools
 
+from jcm.geometry import Geometry
+from jcm.utils import get_coords
+
 class TestModelUnit(unittest.TestCase):
     def setUp(self):
         global SpeedyPhysics, Parameters
@@ -153,6 +156,60 @@ class TestModelUnit(unittest.TestCase):
         self.assertTupleEqual(dynamics_predictions.normalized_surface_pressure.shape, (nodal_tzxy[0],) + nodal_tzxy[2:])
 
     def test_icon_model(self):
+        from jcm.model import Model
+        from jcm.physics.icon.icon_physics import IconPhysics
+
+        coords = get_coords(hybrid_vertical=False, layers=40, spectral_truncation=31)
+        geometry = Geometry.from_coords(coords)
+
+        model = Model(
+            geometry=geometry,
+            time_step=30,  # 30 minutes - ICON physics needs smaller timesteps
+            physics=IconPhysics(),
+            use_hybrid_coords=False
+
+        )
+
+        save_interval, total_time = 1, 2
+        predictions = model.run(
+            save_interval=save_interval,
+            total_time=total_time,
+        )
+        final_state, dynamics_predictions = model._final_modal_state, predictions.dynamics
+
+        modal_zxy, nodal_zxy = model.coords.modal_shape, model.coords.nodal_shape
+        nodal_tzxy = (int(total_time / save_interval),) + nodal_zxy
+
+        self.assertIsNotNone(final_state)
+        self.assertIsNotNone(dynamics_predictions)
+
+        self.assertFalse(jnp.any(jnp.isnan(final_state.divergence)))
+        self.assertFalse(jnp.any(jnp.isnan(final_state.vorticity)))
+        self.assertFalse(jnp.any(jnp.isnan(final_state.temperature_variation)))
+        self.assertFalse(jnp.any(jnp.isnan(final_state.log_surface_pressure)))
+        self.assertFalse(jnp.any(jnp.isnan(final_state.tracers['specific_humidity'])))
+
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.u_wind)))
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.v_wind)))
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.temperature)))
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.specific_humidity)))
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.geopotential)))
+        self.assertFalse(jnp.any(jnp.isnan(dynamics_predictions.normalized_surface_pressure)))
+
+        self.assertTupleEqual(final_state.divergence.shape, modal_zxy)
+        self.assertTupleEqual(final_state.vorticity.shape, modal_zxy)
+        self.assertTupleEqual(final_state.temperature_variation.shape, modal_zxy)
+        self.assertTupleEqual(final_state.log_surface_pressure.shape, (1,) + modal_zxy[1:])
+        self.assertTupleEqual(final_state.tracers['specific_humidity'].shape, modal_zxy)
+
+        self.assertTupleEqual(dynamics_predictions.u_wind.shape, nodal_tzxy)
+        self.assertTupleEqual(dynamics_predictions.v_wind.shape, nodal_tzxy)
+        self.assertTupleEqual(dynamics_predictions.temperature.shape, nodal_tzxy)
+        self.assertTupleEqual(dynamics_predictions.specific_humidity.shape, nodal_tzxy)
+        self.assertTupleEqual(dynamics_predictions.geopotential.shape, nodal_tzxy)
+        self.assertTupleEqual(dynamics_predictions.normalized_surface_pressure.shape, (nodal_tzxy[0],) + nodal_tzxy[2:])
+
+    def test_icon_model_hybrid(self):
         from jcm.model import Model
         from jcm.physics.icon.icon_physics import IconPhysics
 

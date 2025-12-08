@@ -265,9 +265,18 @@ def test_unstable_atmosphere():
             print("✓ Temperature tendencies non-zero")
         if jnp.any(tendencies.dqdt != 0):
             print("✓ Moisture tendencies non-zero")
+
+        # BUG CHECK: Convection should not cause temperature blowup
+        # Apply tendency for dt to see resulting temperature
+        dt = 3600.0
+        t_new = atm['temperature'] + tendencies.dtedt * dt
+        max_temp = jnp.max(t_new)
+        assert max_temp < 350.0, f"Convection causing temperature blowup to {max_temp:.1f} K - surface evaporation bug?"
+        assert jnp.max(jnp.abs(tendencies.dtedt)) < 0.1, f"Convection heating rate {jnp.max(jnp.abs(tendencies.dtedt))*86400:.1f} K/day too large"
+
     else:
         print("! No convection triggered (may be due to simplified scheme)")
-    
+
     print("✓ Unstable atmosphere test completed")
 
 

@@ -470,17 +470,21 @@ def tiedtke_nordeng_convection(
     
     # Apply full convection scheme if active (with tracer transport)
     def apply_full_convection():
-        # Determine cloud top based on CAPE profile  
+        # Determine cloud top based on CAPE profile
         # Simplified - full version would search for equilibrium level
         cloud_depth = lax.cond(conv_type == 2, lambda: 3, lambda: 6)  # Shallow vs deep
-        
+
         # Handle level ordering properly
         pressure_increasing = pressure[0] < pressure[-1]
-        
+
+        # Ensure cloud depth is at least 2 levels and doesn't extend to TOA
+        # Cloud base must be at least 2 levels from the top to allow for updraft development
+        min_top_level = 2  # Don't allow clouds to extend above this level
+
         ktop = lax.cond(
             pressure_increasing,
-            lambda: jnp.maximum(cloud_base - cloud_depth, 0),      # Standard: top = lower index
-            lambda: jnp.minimum(cloud_base + cloud_depth, nlev-1)  # Reverse: top = higher index
+            lambda: jnp.maximum(cloud_base - cloud_depth, min_top_level),      # Standard: top = lower index, but not TOA
+            lambda: jnp.minimum(cloud_base + cloud_depth, nlev-1-min_top_level)  # Reverse: top = higher index
         )
         
         # Calculate mass flux using appropriate closure

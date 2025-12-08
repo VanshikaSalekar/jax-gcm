@@ -72,12 +72,12 @@ class IconPhysics(Physics):
             apply_forcing_data,             # Time-varying boundary conditions
             get_simple_aerosol,            # Aerosol before radiation FIXME: get_CDNC issue
             apply_chemistry,               # Chemistry for ozone, methane etc.
-            apply_radiation,               # Radiation early for surface fluxes. FIXME: revisit shortwave flux--top of atmosphere is emitting shortwave up while receiving none from below, causing cooling. downward shortwave flux is constant and not heating the atmosphere. Problem seems to be ozone optical depth
+            # apply_radiation,             # DISABLED: SW flux constant (no atm heating), LW flux near-zero (0.01 W/m² OLR vs 240 expected), causing -143 K/day cooling. SW heating negative everywhere. Needs debug of flux calculation and ozone optical depth.
             apply_convection,              # FIXME: surface evaporation drives strong updraft causing temperature blowup in layer 1 in 4-5 hours of model time (or in 1 step if vertical_diffusion is on)
             apply_clouds,
             apply_microphysics,
             apply_surface,                 # Surface after radiation
-            apply_vertical_diffusion,      # FIXME: With convection off, causes all layer temperatures to exponentially decay to 0. With convection on, blows up in one step. Also, it seems to be doing a bunch of redundant calculations and possibly double counting surface fluxes?
+            # apply_vertical_diffusion,    # DISABLED: Matrix solver produces T=0K, causing immediate model crash. Needs complete rewrite.
             apply_gravity_waves
         ]
     

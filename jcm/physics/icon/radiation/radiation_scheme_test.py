@@ -478,19 +478,19 @@ def test_radiation_scheme_energy_conservation():
 def test_radiation_scheme_realistic_values():
     """Test that radiation scheme produces realistic atmospheric values"""
     atm = create_test_atmosphere(nlev=15)
-    
+
     # Calculate layer thickness and air density as required by radiation_scheme
     air_density = calculate_air_density(atm['pressure_levels'], atm['temperature'])
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
-    
+
     # Create default radiation parameters
     parameters = RadiationParameters.default()
 
     date = jdt.Datetime.from_pydatetime(datetime(2025, 6, 21, 12, 0, 0))  # June 21, noon
-    
+
     # Create default aerosol data
     aerosol_data = create_default_aerosol_data(nlev=len(atm['temperature']), parameters=parameters, ncols=1)
-    
+
     tendencies, diagnostics = radiation_scheme(
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
@@ -510,29 +510,45 @@ def test_radiation_scheme_realistic_values():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Check that computation completed and produced expected output shapes
     heating_rate_K_day = tendencies.temperature_tendency * 86400
-    
+
     # The important thing is that the computation completed and has correct shapes
     assert heating_rate_K_day.shape == (15,)
     assert tendencies.longwave_heating.shape == (15,)
     assert tendencies.shortwave_heating.shape == (15,)
-    
+
+    # BUG CHECK: Radiation should not produce excessive cooling
+    # Typical tropospheric radiative cooling: 1-2 K/day = 1-2e-5 K/s
+    # Current bug produces -143 K/day = -1.66e-3 K/s (100x too large)
+    max_cooling_K_day = jnp.abs(jnp.min(heating_rate_K_day))
+    assert max_cooling_K_day < 50.0, f"Radiation cooling {max_cooling_K_day:.1f} K/day too large - likely radiation bug"
+
+    # Check LW flux is realistic
+    # Earth's OLR is ~240 W/m²
+    assert diagnostics.toa_lw_up > 100.0, f"OLR {diagnostics.toa_lw_up:.1f} W/m² too small - current bug shows ~0.01 W/m²"
+    assert diagnostics.toa_lw_up < 400.0, f"OLR {diagnostics.toa_lw_up:.1f} W/m² too large"
+
     # Check that diagnostics have reasonable structure
-    assert jnp.isfinite(diagnostics.toa_lw_up) or jnp.isnan(diagnostics.toa_lw_up)  # Either finite or NaN due to numerical issues
-    
+    assert jnp.isfinite(diagnostics.toa_lw_up), "OLR should be finite, not NaN"
+
     # TOA SW should be reasonable for solar input
     assert 0.0 <= diagnostics.toa_sw_down <= 1500.0
     assert diagnostics.toa_sw_up <= diagnostics.toa_sw_down
-    
+
     # Surface fluxes should be reasonable for this model's units/scaling
     assert 0.0 <= diagnostics.surface_sw_down <= diagnostics.toa_sw_down
-    
+
+    # BUG CHECK: SW flux should NOT be constant through atmosphere
+    # Current bug: SW flux down is constant (no divergence = no heating)
+    sw_flux_down_variation = jnp.std(diagnostics.sw_flux_down[:, 0])  # Check band 0
+    assert sw_flux_down_variation > 1.0, "SW flux should vary through atmosphere, not be constant"
+
     # Check LW surface flux is positive and physically reasonable for the model scaling
     # Note: The actual values depend on the specific model units and parameterizations
-    assert diagnostics.surface_lw_down > 0.0
-    assert diagnostics.surface_lw_down < 10.0  # Reasonable for model's scaling
+    assert diagnostics.surface_lw_down > 200.0, "Surface LW down should be substantial (~300 W/m² for Earth)"
+    assert diagnostics.surface_lw_down < 500.0
 
 
 def test_radiation_scheme_reproducibility():
