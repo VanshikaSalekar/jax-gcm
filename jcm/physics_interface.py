@@ -256,19 +256,17 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
     q = nodal_state.tracers['specific_humidity']
 
     # Compute geopotential - different approaches for sigma vs hybrid coordinates
-    # Need full temperature (reference + variation)
-    full_temperature = nodal_state.temperature_variation + dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
     nodal_orography = dynamics.coords.horizontal.to_nodal(dynamics.orography)
 
     if isinstance(dynamics.coords.vertical, HybridCoordinates):
         # For hybrid coordinates, compute geopotential difference then add orography
-        # Convert to spectral space for the diff calculation
-        spectral_temperature = dynamics.coords.horizontal.to_modal(full_temperature)
+        # Note: get_geopotential_diff_hybrid expects temperature VARIATION, not full temperature
+        spectral_temperature_variation = dynamics.coords.horizontal.to_modal(nodal_state.temperature_variation)
         phi_spectral_diff = get_geopotential_diff_hybrid(
-            temperature=spectral_temperature,
+            temperature=spectral_temperature_variation,
             coordinates=dynamics.coords.vertical,
             ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
-            p_s_ref=100000.0,  # Reference surface pressure in Pa
+            p_s_ref=dynamics.p_s_ref,  # Use same reference pressure as dynamics core
             method='dense',
             sharding=None
         )

@@ -229,7 +229,7 @@ class Model:
         # Store coords separately - it's used by dynamics but not physics (and can't easily be jitted)
         if geometry is not None: # user-specified geometry takes precedence
             self.geometry = geometry
-            self.coords = coords_from_geometry(geometry, spmd_mesh=spmd_mesh)
+            self.coords = coords_from_geometry(geometry, spmd_mesh=spmd_mesh, hybrid_vertical=use_hybrid_coords)
         else:
             self.coords = coords if coords is not None else get_coords(spmd_mesh=spmd_mesh, hybrid_vertical=use_hybrid_coords)
             self.geometry = Geometry.from_coords(coords=self.coords, hybrid_vertical=use_hybrid_coords)
@@ -346,8 +346,10 @@ class Model:
             state = self.default_state_fn(jax.random.PRNGKey(random_seed))
             # default state returns log surface pressure, we want it to be log(normalized_surface_pressure)
             # there are several ways to do this operation (in modal vs nodal space, with log vs absolute pressure), this one has the least error
+            # For hybrid coordinates, use p_s_ref instead of p0 for consistency
+            ref_pressure = self.primitive.p_s_ref if hasattr(self.primitive, 'p_s_ref') else p0
             state.log_surface_pressure = self.coords.horizontal.to_modal(
-                self.coords.horizontal.to_nodal(state.log_surface_pressure) - jnp.log(self.physics_specs.nondimensionalize(p0 * units.pascal)) # Makes this robust to different physics_specs, which will change default_state_fn behavior
+                self.coords.horizontal.to_nodal(state.log_surface_pressure) - jnp.log(self.physics_specs.nondimensionalize(ref_pressure * units.pascal)) # Makes this robust to different physics_specs, which will change default_state_fn behavior
             )
 
             # need to add specific humidity as a tracer
@@ -359,7 +361,7 @@ class Model:
     def _date_from_sim_time(self, sim_time) -> DateData:
         return DateData.set_date(
             model_time=self.start_date + jdt.Timedelta(seconds=jnp.round(sim_time).astype(jnp.int32)),
-            model_step=(sim_time / self.dt_si.m).astype(jnp.int32),
+            model_step=jnp.asarray(sim_time / self.dt_si.m).astype(jnp.int32),
             dt_seconds=self.dt_si.m
         )
 
