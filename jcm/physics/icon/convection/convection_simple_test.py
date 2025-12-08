@@ -19,32 +19,45 @@ from jcm.physics.icon.convection.tiedtke_nordeng import (
 
 def create_simple_atmosphere(nlev=20):
     """Create a simple test atmospheric profile"""
+    # Physical constants
+    Rd = 287.05  # J/(kg*K) - gas constant for dry air
+    g = 9.80665  # m/s² - gravitational acceleration
+
     # Pressure levels (Pa) - from surface (1000 hPa) to top (~200 hPa)
     pressure = jnp.linspace(1e5, 2e4, nlev)
-    
+
     # Height (m) - increases with decreasing pressure
     height = jnp.linspace(0, 12000, nlev)
-    
+
     # Temperature - linear lapse rate, warm at surface
     temperature = 300.0 - 6.5e-3 * height
-    
+
     # Humidity - high at surface, decreasing with height, but limited by saturation
     surface_humidity = 0.012  # 12 g/kg at surface
     humidity_profile = surface_humidity * jnp.exp(-height / 2000.0)
-    
+
     # Limit humidity to 90% of saturation to avoid super-saturation
     qs_profile = jax.vmap(saturation_mixing_ratio)(pressure, temperature)
     humidity = jnp.minimum(humidity_profile, 0.9 * qs_profile)
-    
+
     # Simple wind profile
     u_wind = jnp.full(nlev, 10.0)
     v_wind = jnp.zeros(nlev)
-    
+
+    # Calculate air density (kg/m³)
+    rho = pressure / (Rd * temperature)
+
+    # Calculate layer thickness (m) - uniform spacing in this simple case
+    dz = height[1] - height[0]
+    layer_thickness = jnp.full(nlev, dz)
+
     return {
         'temperature': temperature,
-        'humidity': humidity, 
+        'humidity': humidity,
         'pressure': pressure,
         'height': height,
+        'layer_thickness': layer_thickness,
+        'rho': rho,
         'u_wind': u_wind,
         'v_wind': v_wind
     }
@@ -105,7 +118,7 @@ def test_cape():
     if has_cloud_base:
         cape, cin = calculate_cape_cin(
             atm['temperature'], atm['humidity'], atm['pressure'],
-            atm['height'], cloud_base, config
+            atm['layer_thickness'], cloud_base, config
         )
         
         print(f"CAPE: {cape:.0f} J/kg")

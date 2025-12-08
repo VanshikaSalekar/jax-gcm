@@ -20,30 +20,34 @@ from jcm.physics.icon.convection.tiedtke_nordeng import (
 
 def create_test_atmosphere(nlev=40, unstable=True):
     """Create a test atmospheric profile"""
+    # Physical constants
+    Rd = 287.05  # J/(kg*K) - gas constant for dry air
+    g = 9.80665  # m/s² - gravitational acceleration
+
     # Pressure levels (Pa) - from surface to top
     pressure = jnp.logspace(5, 3, nlev)[::-1]  # 1000 hPa to 10 hPa
-    
+
     # Height (m) - hydrostatic approximation
     height = -7000 * jnp.log(pressure / 1e5)
-    
+
     if unstable:
         # Convectively unstable profile - warm and moist at surface
         # Use a steeper lapse rate to ensure instability
         surface_temp = 305.0  # K - warmer surface
         lapse_rate = 9.0e-3   # K/m - closer to moist adiabatic
         temperature = surface_temp - lapse_rate * height
-        
+
         # Add inversion at tropopause (for realism)
         trop_idx = jnp.argmin(jnp.abs(pressure - 200e2))  # ~200 hPa
         temperature = temperature.at[:trop_idx].set(
             temperature[trop_idx]
         )
-        
+
         # Enhanced humidity profile for stronger instability
         surface_rh = 0.9  # Higher surface humidity
         humidity_scale = 3000.0  # m - more moisture in boundary layer
         rel_humidity = surface_rh * jnp.exp(-height / humidity_scale)
-        
+
         # Convert to specific humidity
         qs = jax.vmap(saturation_mixing_ratio)(pressure, temperature)
         humidity = rel_humidity * qs
@@ -52,16 +56,28 @@ def create_test_atmosphere(nlev=40, unstable=True):
         surface_temp = 285.0
         temperature = surface_temp - 5e-3 * height
         humidity = jnp.ones_like(temperature) * 1e-3  # Very dry
-    
+
     # Wind profile - simple shear
     u_wind = 10.0 + 20.0 * (1.0 - pressure / 1e5)
     v_wind = jnp.zeros_like(u_wind)
-    
+
+    # Calculate air density (kg/m³)
+    rho = pressure / (Rd * temperature)
+
+    # Calculate layer thickness (m) from height differences
+    # For layer i, thickness = height[i] - height[i+1] (assuming height decreases with index)
+    layer_thickness = jnp.zeros_like(height)
+    layer_thickness = layer_thickness.at[:-1].set(jnp.abs(height[1:] - height[:-1]))
+    # For top layer, use same thickness as second-to-top
+    layer_thickness = layer_thickness.at[-1].set(layer_thickness[-2])
+
     return {
         'temperature': temperature,
         'humidity': humidity,
         'pressure': pressure,
         'height': height,
+        'layer_thickness': layer_thickness,
+        'rho': rho,
         'u_wind': u_wind,
         'v_wind': v_wind
     }
@@ -84,7 +100,8 @@ class TestConvectionScheme:
             atm['temperature'],
             atm['humidity'],
             atm['pressure'],
-            atm['height'],
+            atm['layer_thickness'],
+            atm['rho'],
             atm['u_wind'],
             atm['v_wind'],
             qc,
@@ -113,7 +130,8 @@ class TestConvectionScheme:
             atm['temperature'],
             atm['humidity'],
             atm['pressure'],
-            atm['height'],
+            atm['layer_thickness'],
+            atm['rho'],
             atm['u_wind'],
             atm['v_wind'],
             qc,
@@ -164,7 +182,8 @@ class TestConvectionScheme:
             atm['temperature'],
             atm['humidity'],
             atm['pressure'],
-            atm['height'],
+            atm['layer_thickness'],
+            atm['rho'],
             atm['u_wind'],
             atm['v_wind'],
             qc,
@@ -196,7 +215,8 @@ class TestConvectionScheme:
             atm['temperature'],
             atm['humidity'],
             atm['pressure'],
-            atm['height'],
+            atm['layer_thickness'],
+            atm['rho'],
             atm['u_wind'],
             atm['v_wind'],
             qc,
@@ -252,6 +272,7 @@ class TestConvectionScheme:
                 temperature,
                 atm['humidity'],
                 atm['pressure'],
+                atm['layer_thickness'],
                 atm['height'],
                 atm['u_wind'],
                 atm['v_wind'],

@@ -28,31 +28,35 @@ from jcm.physics.icon.convection.downdraft import calculate_downdraft
 
 def create_test_atmosphere(nlev=20, unstable=True):
     """Create a test atmospheric profile"""
+    # Physical constants
+    Rd = 287.05  # J/(kg*K) - gas constant for dry air
+    g = 9.80665  # m/s² - gravitational acceleration
+
     # Pressure levels (Pa) - from surface to top
     # Use a more realistic atmosphere (surface to ~200 hPa)
     pressure = jnp.logspace(jnp.log10(1e5), jnp.log10(2e4), nlev)[::-1]
-    
+
     # Height (m) - hydrostatic approximation
     height = -7000 * jnp.log(pressure / 1e5)
-    
+
     if unstable:
         # Unstable profile - warm and moist at surface
         # Temperature profile with lapse rate
         surface_temp = 300.0  # K
         lapse_rate = 6.5e-3   # K/m
         temperature = surface_temp - lapse_rate * height
-        
+
         # Add inversion at tropopause
         trop_idx = jnp.argmin(jnp.abs(pressure - 200e2))  # ~200 hPa
         temperature = temperature.at[:trop_idx].set(
             temperature[trop_idx]
         )
-        
+
         # Humidity profile - exponential decrease
         surface_rh = 0.8
         humidity_scale = 2000.0  # m
         rel_humidity = surface_rh * jnp.exp(-height / humidity_scale)
-        
+
         # Convert to specific humidity using vectorized function
         qs = jax.vmap(saturation_mixing_ratio)(pressure, temperature)
         humidity = rel_humidity * qs
@@ -61,16 +65,26 @@ def create_test_atmosphere(nlev=20, unstable=True):
         surface_temp = 285.0
         temperature = surface_temp - 5e-3 * height
         humidity = jnp.ones_like(temperature) * 1e-3  # Very dry
-    
+
     # Wind profile - simple shear
     u_wind = 10.0 + 20.0 * (1.0 - pressure / 1e5)
     v_wind = jnp.zeros_like(u_wind)
-    
+
+    # Calculate air density (kg/m³)
+    rho = pressure / (Rd * temperature)
+
+    # Calculate layer thickness (m) from height differences
+    layer_thickness = jnp.zeros_like(height)
+    layer_thickness = layer_thickness.at[:-1].set(jnp.abs(height[1:] - height[:-1]))
+    layer_thickness = layer_thickness.at[-1].set(layer_thickness[-2])
+
     return {
         'temperature': temperature,
         'humidity': humidity,
         'pressure': pressure,
         'height': height,
+        'layer_thickness': layer_thickness,
+        'rho': rho,
         'u_wind': u_wind,
         'v_wind': v_wind
     }
@@ -145,8 +159,8 @@ def test_cape_calculation():
     
     if has_cloud_base:
         cape, cin = calculate_cape_cin(
-            atm['temperature'], atm['humidity'], atm['pressure'], 
-            atm['height'], cloud_base, config
+            atm['temperature'], atm['humidity'], atm['pressure'],
+            atm['layer_thickness'], cloud_base, config
         )
         
         print(f"CAPE: {cape:.0f} J/kg")
@@ -178,7 +192,8 @@ def test_stable_atmosphere():
         atm['temperature'],
         atm['humidity'],
         atm['pressure'],
-        atm['height'],
+        atm['layer_thickness'],
+        atm['rho'],
         atm['u_wind'],
         atm['v_wind'],
         qc,
@@ -217,7 +232,8 @@ def test_unstable_atmosphere():
         atm['temperature'],
         atm['humidity'],
         atm['pressure'],
-        atm['height'],
+        atm['layer_thickness'],
+        atm['rho'],
         atm['u_wind'],
         atm['v_wind'],
         qc,
@@ -275,7 +291,8 @@ def test_jax_compatibility():
         atm['temperature'],
         atm['humidity'],
         atm['pressure'],
-        atm['height'],
+        atm['layer_thickness'],
+        atm['rho'],
         atm['u_wind'],
         atm['v_wind'],
         qc,
@@ -293,6 +310,7 @@ def test_jax_compatibility():
             temperature,
             atm['humidity'],
             atm['pressure'],
+            atm['layer_thickness'],
             atm['height'],
             atm['u_wind'],
             atm['v_wind'],
@@ -330,7 +348,8 @@ def test_fixed_qc_qi_transport():
         atm['temperature'],
         atm['humidity'],
         atm['pressure'],
-        atm['height'],
+        atm['layer_thickness'],
+        atm['rho'],
         atm['u_wind'],
         atm['v_wind'],
         qc,
@@ -382,6 +401,7 @@ def test_configuration_parameters():
             atm['temperature'],
             atm['humidity'],
             atm['pressure'],
+            atm['layer_thickness'],
             atm['height'],
             atm['u_wind'],
             atm['v_wind'],

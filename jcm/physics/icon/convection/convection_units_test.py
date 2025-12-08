@@ -26,12 +26,16 @@ from jcm.physics.icon.convection.tracer_transport import (
 
 def create_realistic_atmosphere(nlev=20, unstable=True):
     """Create a realistic atmospheric profile for testing"""
+    # Physical constants
+    Rd = 287.05  # J/(kg*K) - gas constant for dry air
+    g = 9.80665  # m/s² - gravitational acceleration
+
     # Pressure levels (Pa) - from surface (1000 hPa) to top (~200 hPa)
     pressure = jnp.linspace(1e5, 2e4, nlev)
-    
+
     # Height (m) - increases with decreasing pressure
     height = jnp.linspace(0, 12000, nlev)
-    
+
     if unstable:
         # Unstable profile - warm at surface with normal lapse rate
         temperature = 300.0 - 6.5e-3 * height
@@ -40,21 +44,30 @@ def create_realistic_atmosphere(nlev=20, unstable=True):
         # Stable profile - cooler surface, weaker lapse rate
         temperature = 285.0 - 5.0e-3 * height
         surface_humidity = 0.003  # 3 g/kg (dry)
-    
+
     # Humidity profile limited by saturation
     humidity_profile = surface_humidity * jnp.exp(-height / 2000.0)
     qs_profile = jax.vmap(saturation_mixing_ratio)(pressure, temperature)
     humidity = jnp.minimum(humidity_profile, 0.9 * qs_profile)
-    
+
     # Simple wind profile
     u_wind = jnp.full(nlev, 10.0)
     v_wind = jnp.zeros(nlev)
-    
+
+    # Calculate air density (kg/m³)
+    rho = pressure / (Rd * temperature)
+
+    # Calculate layer thickness (m) - uniform spacing in this case
+    dz = height[1] - height[0]
+    layer_thickness = jnp.full(nlev, dz)
+
     return {
         'temperature': temperature,
         'humidity': humidity,
         'pressure': pressure,
         'height': height,
+        'layer_thickness': layer_thickness,
+        'rho': rho,
         'u_wind': u_wind,
         'v_wind': v_wind
     }
@@ -174,7 +187,7 @@ class TestCAPE:
         if has_cloud_base:
             cape, cin = calculate_cape_cin(
                 atm['temperature'], atm['humidity'], atm['pressure'],
-                atm['height'], cloud_base, config
+                atm['layer_thickness'], cloud_base, config
             )
             
             # CAPE should be non-negative
@@ -206,13 +219,13 @@ class TestCAPE:
         if has_cb_unstable and has_cb_stable:
             cape_unstable, _ = calculate_cape_cin(
                 atm_unstable['temperature'], atm_unstable['humidity'],
-                atm_unstable['pressure'], atm_unstable['height'],
+                atm_unstable['pressure'], atm_unstable['layer_thickness'],
                 cb_unstable, config
             )
             
             cape_stable, _ = calculate_cape_cin(
                 atm_stable['temperature'], atm_stable['humidity'],
-                atm_stable['pressure'], atm_stable['height'],
+                atm_stable['pressure'], atm_stable['layer_thickness'],
                 cb_stable, config
             )
             
