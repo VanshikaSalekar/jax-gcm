@@ -251,17 +251,23 @@ def setup_rhs_vectors(
     ncol, nlev = state.u.shape
     # Fixed number of variables: u, v, T, qv, qc, qi, TKE, thv_var
     rhs = jnp.zeros((ncol, nlev, 8))
-    
-    # Current values as initial guess (implicit time stepping)
-    rhs = rhs.at[:, :, 0].set(state.u * params.tpfac2)  # u
-    rhs = rhs.at[:, :, 1].set(state.v * params.tpfac2)  # v
-    rhs = rhs.at[:, :, 2].set(state.temperature * params.tpfac2)  # T
-    rhs = rhs.at[:, :, 3].set(state.qv * params.tpfac2)  # qv
-    rhs = rhs.at[:, :, 4].set(state.qc * params.tpfac2)  # qc
-    rhs = rhs.at[:, :, 5].set(state.qi * params.tpfac2)  # qi
-    rhs = rhs.at[:, :, 6].set(state.tke * params.tpfac2)  # TKE
-    rhs = rhs.at[:, :, 7].set(state.thv_variance * params.tpfac2)  # thv_var
-    
+
+    # CRITICAL FIX: RHS should contain old values for implicit scheme
+    # For implicit diffusion: (I - dt*L) * X_new = X_old
+    # The tpfac2 factor was incorrectly set to 0.0, causing RHS = 0
+    # This led to X_new = 0 (temperature going to 0K!)
+    #
+    # Correct implicit scheme uses RHS = X_old regardless of tpfac2
+    # tpfac2 is for explicit forcing terms, not the baseline values
+    rhs = rhs.at[:, :, 0].set(state.u)  # u
+    rhs = rhs.at[:, :, 1].set(state.v)  # v
+    rhs = rhs.at[:, :, 2].set(state.temperature)  # T
+    rhs = rhs.at[:, :, 3].set(state.qv)  # qv
+    rhs = rhs.at[:, :, 4].set(state.qc)  # qc
+    rhs = rhs.at[:, :, 5].set(state.qi)  # qi
+    rhs = rhs.at[:, :, 6].set(state.tke)  # TKE
+    rhs = rhs.at[:, :, 7].set(state.thv_variance)  # thv_var
+
     return rhs
 
 
