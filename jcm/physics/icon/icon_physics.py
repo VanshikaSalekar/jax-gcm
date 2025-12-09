@@ -519,12 +519,26 @@ def _prepare_common_physics_state(
     
     # Convert geopotential to height
     height_levels = state.geopotential / physical_constants.grav
-    
-    # Calculate height at interfaces (approximate using hydrostatic)
+
+    # Calculate height at interfaces (half levels)
+    # Internal interfaces are midpoints between full levels
+    height_half_internal = (height_levels[1:] + height_levels[:-1]) / 2
+
+    # Top interface: extrapolate using the same spacing as the top layer
+    # This maintains consistent layer thickness at the top
+    top_layer_thickness = height_levels[0] - height_half_internal[0]
+    height_top = height_levels[0] + top_layer_thickness
+
+    # Surface interface: use actual surface height (from geopotential at lowest level)
+    # For sigma coordinates, assume surface is at orography height
+    # A reasonable approximation is half the lowest layer below the lowest full level
+    bottom_layer_thickness = height_half_internal[-1] - height_levels[-1]
+    height_surface = height_levels[-1] - bottom_layer_thickness
+
     height_half = jnp.concatenate((
-        height_levels[:1] + 1000.0, # FIXME: validate choice of offset
-        (height_levels[1:] + height_levels[:-1]) / 2,
-        0 * height_levels[-1:]), axis=0)
+        height_top[jnp.newaxis],
+        height_half_internal,
+        height_surface[jnp.newaxis]), axis=0)
 
     # Calculate air density
     rho = pressure_levels / (physical_constants.rd * state.temperature)
@@ -633,14 +647,14 @@ def apply_radiation(state: PhysicsState,
     
     radiation_results = jax.vmap(
         radiation_scheme,
-        in_axes=(1, 1, 1, 1,       # temperature, specific_humidity, pressure_full, layer_thickness (nlev, ncols)
+        in_axes=(1, 1, 1, 1, 1,    # temperature, specific_humidity, pressure_full, pressure_half, layer_thickness (nlev/nlev+1, ncols)
                  1, 1, 1, 1,       # air_density, cloud_water, cloud_ice, cloud_fraction (nlev, ncols)
                  0, 0, 0, 0,       # surface_temperature, surface_albedo_vis, surface_albedo_nir, surface_emissivity (ncols,)
                  None, 0, 0,       # date (scalar), latitudes (ncols,), longitudes (ncols,)
                  None, 0, 1, None),  # parameters (scalar), aerosol_data (per column), ozone_vmr (nlev, ncols), co2_vmr (scalar)
         out_axes=(0, 0),  # Returns (RadiationTendencies, RadiationData) per column
         axis_size=ncols
-    )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.layer_thickness,
+    )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.pressure_half, physics_data.diagnostics.layer_thickness,
       physics_data.diagnostics.air_density, cloud_water, cloud_ice, cloud_fraction,
       surface_temperature_col, surface_albedo_vis_col,
       surface_albedo_nir_col, surface_emissivity_col,

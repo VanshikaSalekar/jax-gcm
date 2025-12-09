@@ -86,21 +86,46 @@ from jcm.physics.icon.vertical_diffusion import vertical_diffusion_scheme
 **Recommendation:** Refactor to use the proper scheme function.
 **Priority:** LOW (code quality)
 
-### Issue VD-4: Height Level Offset
-**Location:** `icon_physics.py:525`
-**FIXME:** `# FIXME: validate choice of offset`
+### ~~Issue VD-4: Height Level Offset~~ **FIXED**
+**Status:** RESOLVED
+**Location:** `icon_physics.py:523-541`
 
+**Previous:**
 ```python
-height_levels[:1] + 1000.0
+height_half = jnp.concatenate((
+    height_levels[:1] + 1000.0, # FIXME: validate choice of offset
+    ...
 ```
 
-**Issue:** Arbitrary 1000m offset added to top height level.
+**Now Fixed:** Height interfaces are computed by extrapolating using consistent layer thicknesses:
+```python
+# Top interface: extrapolate using the same spacing as the top layer
+top_layer_thickness = height_levels[0] - height_half_internal[0]
+height_top = height_levels[0] + top_layer_thickness
+```
 
-**Priority:** LOW
+**Priority:** ~~LOW~~ N/A
 
 ---
 
 ## Radiation
+
+### ~~Issue RAD-0: Incorrect Pressure Interfaces~~ **FIXED**
+**Status:** RESOLVED
+**Location:** `radiation/radiation_scheme.py:168-176`
+
+**Previous:**
+```python
+# Interface pressures computed locally with arbitrary scaling
+pressure_interfaces = pressure_interfaces.at[0].set(pressure_levels[0] * 0.1)  # Much lower for TOA
+pressure_interfaces = pressure_interfaces.at[-1].set(pressure_levels[-1] * 1.1)  # Slight increase for surface
+```
+
+**Issue:** Radiation scheme was computing its own pressure interfaces with arbitrary factors (0.1x at TOA, 1.1x at surface) instead of using the model's half-level pressures. This caused incorrect heating rate calculations because the dp used in `dT/dt = -(g/cp) * dF/dp` was wrong.
+
+**Fix Applied:** The `radiation_scheme` and `prepare_radiation_state` functions now accept `pressure_interfaces` as a parameter, which is passed from the model's `pressure_half` computed from sigma/hybrid coordinates.
+
+**Impact:** Should improve radiation heating rate profiles, especially in top layers where the arbitrary 0.1x factor created very small dp values leading to extreme heating rates.
 
 ### Issue RAD-1: Unused Band Variables
 **Location:** `radiation/radiation_scheme.py:245-247`
@@ -359,23 +384,24 @@ sea_ice_thickness = jnp.where(sea_ice_fraction > 0.1, 1.0, 0.0)
 ### RESOLVED Issues
 - ~~VD-1: tpfac parameters~~ - Fixed with correct defaults (1.5, 0.667, 0.333)
 - ~~Vertical diffusion temperature instability~~ - Fixed with proper prefactor and time-stepping
+- ~~VD-4: Height level offset~~ - Fixed with proper extrapolation instead of arbitrary 1000m
+- ~~RAD-0: Incorrect pressure interfaces~~ - Fixed by passing model's pressure_half to radiation
 
-### HIGH Priority (4 issues)
+### HIGH Priority (3 issues)
 - Hybrid coordinate NaNs
 - Surface fraction setup (SFC-1)
 - Exchange coefficient coupling (SFC-2)
 
-### MEDIUM Priority (6 issues)
+### MEDIUM Priority (5 issues)
 - Convection timestep (CONV-1)
 - Updraft states (CONV-2)
 - Downdraft LFS criteria (CONV-3)
 - Sea ice integration (FORC-1)
 - Tile-aware turbulence (SFC-3)
 
-### LOW Priority (8 issues)
+### LOW Priority (6 issues)
 - TKE source terms (VD-2)
 - Unused imports (VD-3)
-- Height offset (VD-4)
 - Radiation cleanup (RAD-1, RAD-2, RAD-3)
 - Roughness lengths (SFC-4)
 - Hardcoded parameters (CHEM-1, FORC-2)

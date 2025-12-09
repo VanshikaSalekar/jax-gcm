@@ -112,6 +112,7 @@ def prepare_radiation_state(
     temperature: jnp.ndarray,
     specific_humidity: jnp.ndarray,
     pressure_levels: jnp.ndarray,
+    pressure_interfaces: jnp.ndarray,
     layer_thickness: jnp.ndarray,
     air_density: jnp.ndarray,
     cloud_water: jnp.ndarray,
@@ -125,11 +126,12 @@ def prepare_radiation_state(
 ) -> RadiationState:
     """
     Prepare radiation state from physics state variables.
-    
+
     Args:
         temperature: Temperature (K) [nlev]
         specific_humidity: Specific humidity (kg/kg) [nlev]
-        pressure_levels: Pressure (Pa) [nlev]
+        pressure_levels: Pressure at full levels (Pa) [nlev]
+        pressure_interfaces: Pressure at half levels (Pa) [nlev+1]
         layer_thickness: Layer thickness (m) [nlev]
         air_density: Air density (kg/m³) [nlev]
         cloud_water: Cloud water content (kg/kg) [nlev]
@@ -138,18 +140,18 @@ def prepare_radiation_state(
         cos_zenith: Cosine of solar zenith angle
         ozone_vmr: Ozone volume mixing ratio [nlev]
         aerosol_optical_depth: Aerosol optical depth [nlev, nbands]
-        aerosol_ssa: Aerosol single scatter albedo [nlev, nbands] 
+        aerosol_ssa: Aerosol single scatter albedo [nlev, nbands]
         aerosol_asymmetry: Aerosol asymmetry factor [nlev, nbands]
-        
+
     Returns:
         RadiationState ready for radiation calculations
     """
     nlev = temperature.shape[0]
-    
+
     # Convert specific humidity to volume mixing ratio
     # q/(1-q) * Md/Mv where Md/Mv = 29/18 = 1.608
     h2o_vmr = specific_humidity / (1 - specific_humidity) * 1.608
-    
+
     # Default ozone profile if not provided (simplified)
     if ozone_vmr is None:
         # Simple ozone profile peaking in stratosphere
@@ -159,22 +161,15 @@ def prepare_radiation_state(
             5e-6 * jnp.exp(-((jnp.log(p_mb) - jnp.log(30)) ** 2) / 2),
             1e-6  # Troposphere
         )
-    
+
     # Convert cloud water/ice from kg/kg to kg/m²
     # cloud_path = mixing_ratio * air_density * layer_thickness
     cloud_water_path = cloud_water * air_density * layer_thickness
     cloud_ice_path = cloud_ice * air_density * layer_thickness
-    
-    # Interface pressures
-    pressure_interfaces = jnp.zeros(nlev + 1)
-    pressure_interfaces = pressure_interfaces.at[1:-1].set(
-        0.5 * (pressure_levels[:-1] + pressure_levels[1:])
-    )
-    # TOA should be lower pressure than first layer
-    pressure_interfaces = pressure_interfaces.at[0].set(pressure_levels[0] * 0.1)  # Much lower for TOA
-    # Surface should be higher pressure than last layer  
-    pressure_interfaces = pressure_interfaces.at[-1].set(pressure_levels[-1] * 1.1)  # Slight increase for surface
-    
+
+    # Use the model's pressure interfaces directly (already computed from sigma/hybrid levels)
+    # pressure_interfaces should be [nlev+1] with TOA at index 0 and surface at index -1
+
     return RadiationState(
         cos_zenith=cos_zenith[jnp.newaxis],
         daylight_fraction=jnp.where(cos_zenith > 0, 1.0, 0.0)[jnp.newaxis],
@@ -197,6 +192,7 @@ def radiation_scheme(
     temperature: jnp.ndarray,
     specific_humidity: jnp.ndarray,
     pressure_levels: jnp.ndarray,
+    pressure_interfaces: jnp.ndarray,
     layer_thickness: jnp.ndarray,
     air_density: jnp.ndarray,
     cloud_water: jnp.ndarray,
@@ -216,25 +212,29 @@ def radiation_scheme(
 ) -> Tuple[RadiationTendencies, RadiationData]:
     """
     Radiation scheme wrapper that extracts aerosol data and includes aerosol effects.
-    
+
     Args:
         temperature: Temperature (K) [nlev]
         specific_humidity: Specific humidity (kg/kg) [nlev]
-        pressure_levels: Pressure (Pa) [nlev]
+        pressure_levels: Pressure at full levels (Pa) [nlev]
+        pressure_interfaces: Pressure at half levels (Pa) [nlev+1]
         layer_thickness: Layer thickness (m) [nlev]
         air_density: Air density (kg/m³) [nlev]
         cloud_water: Cloud water content (kg/kg) [nlev]
         cloud_ice: Cloud ice content (kg/kg) [nlev]
         cloud_fraction: Cloud fraction (0-1) [nlev]
-        day_of_year: Day of year (1-365)
-        seconds_since_midnight: Seconds since midnight UTC
+        surface_temperature: Surface temperature (K)
+        surface_albedo_vis: Surface visible albedo
+        surface_albedo_nir: Surface near-infrared albedo
+        surface_emissivity: Surface emissivity
+        date: Date/time for solar calculations
         latitude: Latitude (degrees)
         longitude: Longitude (degrees)
         parameters: Radiation parameters
         aerosol_data: AerosolData containing optical properties
         ozone_vmr: Ozone volume mixing ratio [nlev]
         co2_vmr: CO2 volume mixing ratio
-        
+
     Returns:
         Tuple of (radiation tendencies, radiation diagnostics)
     """
@@ -301,6 +301,7 @@ def radiation_scheme(
         temperature=temperature,
         specific_humidity=specific_humidity,
         pressure_levels=pressure_levels,
+        pressure_interfaces=pressure_interfaces,
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=cloud_water,

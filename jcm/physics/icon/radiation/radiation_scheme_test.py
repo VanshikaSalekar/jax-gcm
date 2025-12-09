@@ -52,31 +52,46 @@ def create_test_atmosphere(nlev=10):
     # Realistic atmospheric profile - pressure increases with index (TOA to surface)
     pressure_levels = jnp.logspace(jnp.log10(100.0), jnp.log10(101325.0), nlev)
     height_levels = jnp.linspace(20000.0, 0.0, nlev)  # m (~20km to surface)
-    
+
+    # Pressure interfaces at half levels (nlev+1)
+    # Midpoints between full levels, with extrapolation at TOA and surface
+    pressure_interfaces_internal = 0.5 * (pressure_levels[:-1] + pressure_levels[1:])
+    # TOA: extrapolate to lower pressure
+    p_top = pressure_levels[0] - (pressure_interfaces_internal[0] - pressure_levels[0])
+    p_top = jnp.maximum(p_top, 1.0)  # Ensure positive
+    # Surface: extrapolate to higher pressure
+    p_surface = pressure_levels[-1] + (pressure_levels[-1] - pressure_interfaces_internal[-1])
+    pressure_interfaces = jnp.concatenate([
+        jnp.array([p_top]),
+        pressure_interfaces_internal,
+        jnp.array([p_surface])
+    ])
+
     # Temperature profile with lapse rate
     temperature = 288.0 - 6.5e-3 * height_levels  # K (standard lapse rate)
     temperature = jnp.maximum(temperature, 200.0)  # Don't go below 200K
-    
+
     # Humidity decreases exponentially with height
     specific_humidity = 0.01 * jnp.exp(-height_levels / 8000.0)  # kg/kg
     specific_humidity = jnp.maximum(specific_humidity, 1e-6)  # Minimum humidity
-    
+
     # Some clouds in middle troposphere
     cloud_water = jnp.zeros(nlev)
     cloud_ice = jnp.zeros(nlev)
     cloud_fraction = jnp.zeros(nlev)
-    
+
     # Add clouds in middle levels (around 2-8km altitude)
     mid_indices = jnp.where((height_levels >= 2000) & (height_levels <= 8000))[0]
     if len(mid_indices) > 0:
         cloud_water = cloud_water.at[mid_indices[:2]].set(1e-4)  # kg/kg
         cloud_ice = cloud_ice.at[mid_indices[-2:]].set(5e-5)     # kg/kg
         cloud_fraction = cloud_fraction.at[mid_indices].set(0.5)
-    
+
     return {
         'temperature': temperature,
         'specific_humidity': specific_humidity,
         'pressure_levels': pressure_levels,
+        'pressure_interfaces': pressure_interfaces,
         'height_levels': height_levels,
         'cloud_water': cloud_water,
         'cloud_ice': cloud_ice,
@@ -88,16 +103,17 @@ def test_prepare_radiation_state():
     """Test radiation state preparation"""
     atm = create_test_atmosphere(nlev=5)
     cos_zenith = jnp.array(0.5)
-    
+
     # Calculate layer thickness and air density as required by prepare_radiation_state
     from jcm.physics.icon.unit_conversions import calculate_air_density, calculate_layer_thickness
     air_density = calculate_air_density(atm['pressure_levels'], atm['temperature'])
     layer_thickness = calculate_layer_thickness(atm['pressure_levels'], atm['temperature'])
-    
+
     rad_state = prepare_radiation_state(
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -165,6 +181,7 @@ def test_radiation_scheme_basic():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -180,7 +197,7 @@ def test_radiation_scheme_basic():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Check output shapes
     nlev = len(atm['temperature'])
     assert tendencies.temperature_tendency.shape == (nlev,)
@@ -237,6 +254,7 @@ def test_radiation_scheme_nighttime():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -252,7 +270,7 @@ def test_radiation_scheme_nighttime():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Should have minimal shortwave at night and valid longwave
     # Note: Some layers may have small positive LW heating due to radiative exchange
     assert not jnp.any(jnp.isnan(tendencies.longwave_heating))
@@ -296,6 +314,7 @@ def test_radiation_scheme_custom_parameters():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -311,7 +330,7 @@ def test_radiation_scheme_custom_parameters():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Check output shapes - hardcoded to max_bands=10
     assert diagnostics.sw_flux_up.shape == (7, 10)  # max_bands hardcoded
     assert diagnostics.lw_flux_up.shape == (7, 10)  # max_bands hardcoded
@@ -324,31 +343,38 @@ def test_radiation_scheme_custom_parameters():
 def test_radiation_scheme_extreme_conditions():
     """Test radiation scheme with extreme atmospheric conditions"""
     nlev = 5
-    
+
     # Very cold, dry atmosphere
     temperature = jnp.ones(nlev) * 180.0  # Very cold
     specific_humidity = jnp.ones(nlev) * 1e-6  # Very dry
     pressure_levels = jnp.logspace(jnp.log10(10000.0), jnp.log10(100.0), nlev)  # Very low pressure
     cloud_water = jnp.zeros(nlev)
-    cloud_ice = jnp.zeros(nlev) 
+    cloud_ice = jnp.zeros(nlev)
     cloud_fraction = jnp.zeros(nlev)
 
+    # Create pressure interfaces
+    pressure_interfaces_internal = 0.5 * (pressure_levels[:-1] + pressure_levels[1:])
+    p_top = jnp.maximum(pressure_levels[0] - (pressure_interfaces_internal[0] - pressure_levels[0]), 1.0)
+    p_surface = pressure_levels[-1] + (pressure_levels[-1] - pressure_interfaces_internal[-1])
+    pressure_interfaces = jnp.concatenate([jnp.array([p_top]), pressure_interfaces_internal, jnp.array([p_surface])])
+
     date = jdt.Datetime.from_pydatetime(datetime(2025, 12, 21, 12, 0, 0))  # December 21, noon
-    
+
     # Calculate layer thickness and air density as required by radiation_scheme
     air_density = calculate_air_density(pressure_levels, temperature)
     layer_thickness = calculate_layer_thickness(pressure_levels, temperature)
-    
+
     # Create default radiation parameters
     parameters = RadiationParameters.default()
-    
+
     # Create default aerosol data
     aerosol_data = create_default_aerosol_data(nlev=nlev, parameters=parameters, ncols=1)
-    
+
     tendencies, diagnostics = radiation_scheme(
         temperature=temperature,
         specific_humidity=specific_humidity,
         pressure_levels=pressure_levels,
+        pressure_interfaces=pressure_interfaces,
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=cloud_water,
@@ -396,6 +422,7 @@ def test_radiation_scheme_very_cloudy():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=cloud_water,
@@ -411,7 +438,7 @@ def test_radiation_scheme_very_cloudy():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Should handle heavy clouds without NaN
     assert not jnp.any(jnp.isnan(tendencies.temperature_tendency))
     
@@ -444,6 +471,7 @@ def test_radiation_scheme_energy_conservation():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -459,7 +487,7 @@ def test_radiation_scheme_energy_conservation():
         surface_emissivity=jnp.array([0.95]),
         surface_temperature=jnp.array([288.0])
     )
-    
+
     # Energy conservation checks
     toa_net = diagnostics.toa_sw_down - diagnostics.toa_sw_up - diagnostics.toa_lw_up
     surface_net = (diagnostics.surface_sw_down - diagnostics.surface_sw_up + 
@@ -495,6 +523,7 @@ def test_radiation_scheme_realistic_values():
         temperature=atm['temperature'],
         specific_humidity=atm['specific_humidity'],
         pressure_levels=atm['pressure_levels'],
+        pressure_interfaces=atm['pressure_interfaces'],
         layer_thickness=layer_thickness,
         air_density=air_density,
         cloud_water=atm['cloud_water'],
@@ -573,6 +602,7 @@ def test_radiation_scheme_reproducibility():
             temperature=atm['temperature'],
             specific_humidity=atm['specific_humidity'],
             pressure_levels=atm['pressure_levels'],
+            pressure_interfaces=atm['pressure_interfaces'],
             layer_thickness=layer_thickness,
             air_density=air_density,
             cloud_water=atm['cloud_water'],
