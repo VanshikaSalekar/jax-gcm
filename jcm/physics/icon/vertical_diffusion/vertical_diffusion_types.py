@@ -34,7 +34,7 @@ class VDiffParameters:
     itop: int           # Top level for turbulence calculation
 
     @classmethod
-    def default(cls, tpfac1=1.0, tpfac2=0.0, tpfac3=0.0,
+    def default(cls, tpfac1=1.5, tpfac2=0.667, tpfac3=0.333,
                  totte_min=1.0e-6, z0m_min=1.0e-5, cchar=0.018,
                  nsfc_type=3, iwtr=0, iice=1, ilnd=2, itop=1) -> 'VDiffParameters':
         """Return default vertical diffusion parameters"""

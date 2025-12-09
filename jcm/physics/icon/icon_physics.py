@@ -973,12 +973,6 @@ def apply_vertical_diffusion(
     # Update TKE
     new_tke = tke + dt * tke_tend
     new_tke = jnp.maximum(new_tke, 0.01)  # Minimum TKE
-    
-    # Clamp temperature tendency to prevent numerical instability
-    # Max reasonable cooling/heating rate for vertical diffusion is ~3 K/hour = 0.001 K/s
-    # This is typical for boundary layer turbulent mixing
-    max_temp_tend = 0.001  # K/s (~3.6 K/hour max)
-    temp_tend = jnp.clip(temp_tend, -max_temp_tend, max_temp_tend)
 
     # Create physics tendencies
     physics_tendencies = PhysicsTendency(
