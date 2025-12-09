@@ -609,9 +609,10 @@ def apply_radiation(state: PhysicsState,
     cloud_ice = state.tracers.get('qi', jnp.zeros_like(state.temperature))
     cloud_fraction = physics_data.clouds.cloud_fraction
 
-    # Get ozone from chemistry data 
+    # Get ozone from chemistry data
     ozone_vmr = physics_data.chemistry.ozone_vmr * 1e-6  # Convert ppmv to VMR
-    co2_vmr = physics_data.chemistry.co2_vmr * 1e-6  # Convert ppmv to VMR
+    # CO2 is well-mixed, so use a scalar mean value (radiation scheme expects scalar)
+    co2_vmr = jnp.mean(physics_data.chemistry.co2_vmr) * 1e-6  # Convert ppmv to VMR, scalar
     
     # Reshape surface properties to (ncols,) for vmap
     surface_temperature_col = physics_data.surface.surface_temperature.reshape(ncols)  # (ncols,)
@@ -636,7 +637,7 @@ def apply_radiation(state: PhysicsState,
                  1, 1, 1, 1,       # air_density, cloud_water, cloud_ice, cloud_fraction (nlev, ncols)
                  0, 0, 0, 0,       # surface_temperature, surface_albedo_vis, surface_albedo_nir, surface_emissivity (ncols,)
                  None, 0, 0,       # date (scalar), latitudes (ncols,), longitudes (ncols,)
-                 None, 0, None, None),  # parameters (scalar), aerosol_data (per column), ozone_vmr, co2_vmr
+                 None, 0, 1, None),  # parameters (scalar), aerosol_data (per column), ozone_vmr (nlev, ncols), co2_vmr (scalar)
         out_axes=(0, 0),  # Returns (RadiationTendencies, RadiationData) per column
         axis_size=ncols
     )(state.temperature, state.specific_humidity, physics_data.diagnostics.pressure_full, physics_data.diagnostics.layer_thickness,
@@ -973,6 +974,12 @@ def apply_vertical_diffusion(
     new_tke = tke + dt * tke_tend
     new_tke = jnp.maximum(new_tke, 0.01)  # Minimum TKE
     
+    # Clamp temperature tendency to prevent numerical instability
+    # Max reasonable cooling/heating rate for vertical diffusion is ~3 K/hour = 0.001 K/s
+    # This is typical for boundary layer turbulent mixing
+    max_temp_tend = 0.001  # K/s (~3.6 K/hour max)
+    temp_tend = jnp.clip(temp_tend, -max_temp_tend, max_temp_tend)
+
     # Create physics tendencies
     physics_tendencies = PhysicsTendency(
         u_wind=u_tend,

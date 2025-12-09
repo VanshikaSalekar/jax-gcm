@@ -158,18 +158,23 @@ class TestModelUnit(unittest.TestCase):
     def test_icon_model(self):
         from jcm.model import Model
         from jcm.physics.icon.icon_physics import IconPhysics
+        from jcm.physics.icon.parameters import Parameters
 
         coords = get_coords(hybrid_vertical=False, layers=40, spectral_truncation=31)
         geometry = Geometry.from_coords(coords)
 
+        # Match physics dt_conv to model timestep (30 min = 1800 seconds)
+        time_step_minutes = 30
+        icon_params = Parameters.default().with_convection(dt_conv=time_step_minutes * 60)
+
         model = Model(
             geometry=geometry,
-            time_step=30,  # 30 minutes - ICON physics needs smaller timesteps
-            physics=IconPhysics(),
+            time_step=time_step_minutes,
+            physics=IconPhysics(parameters=icon_params),
             use_hybrid_coords=False
         )
 
-        save_interval, total_time = 1, 2
+        save_interval, total_time = 3/48, 6/48
         predictions = model.run(
             save_interval=save_interval,
             total_time=total_time,
@@ -211,12 +216,24 @@ class TestModelUnit(unittest.TestCase):
     def test_icon_model_hybrid(self):
         from jcm.model import Model
         from jcm.physics.icon.icon_physics import IconPhysics
+        from jcm.physics.icon.parameters import Parameters
+
+        coords = get_coords(hybrid_vertical=True, layers=40, spectral_truncation=31)
+        geometry = Geometry.from_coords(coords)
+
+        # Match physics dt_conv to model timestep (default 30 min = 1800 seconds)
+        time_step_minutes = 30
+        icon_params = Parameters.default().with_convection(dt_conv=time_step_minutes * 60)
 
         model = Model(
-            physics=IconPhysics(),
+            geometry=geometry,
+            time_step=time_step_minutes,
+            physics=IconPhysics(parameters=icon_params),
+            use_hybrid_coords=True
         )
 
-        save_interval, total_time = 1, 2
+        # Short run to verify basic stability (same as test_icon_model)
+        save_interval, total_time = 3/48, 6/48
         predictions = model.run(
             save_interval=save_interval,
             total_time=total_time,

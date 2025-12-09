@@ -30,36 +30,49 @@ def apply_forcing_data(
         Updated boundary conditions
     """
     
+    # Get expected output shape from physics_data (column format)
+    ncols = physics_data.surface.surface_temperature.shape[0]
+
     # Compute surface properties based on existing masks
     surface_albedo_vis, surface_albedo_nir, surface_emissivity = _compute_surface_properties(
         geometry.fmask,  # Land fraction
         forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am,  # Sea ice
     )
-    
+
     # Surface temperature (use existing SST for ocean, land temperature for land)
+    land_temp = forcing.stl_am[..., 0] if forcing.stl_am.ndim == 3 else forcing.stl_am
+    sst = forcing.sea_surface_temperature[..., 0] if forcing.sea_surface_temperature.ndim == 3 else forcing.sea_surface_temperature
     surface_temperature = jnp.where(
         geometry.fmask > 0.5,  # Land
-        forcing.stl_am[..., 0] if forcing.stl_am.ndim == 3 else forcing.stl_am,  # Land temp
-        forcing.sea_surface_temperature  # SST
+        land_temp,  # Land temp
+        sst  # SST
     )
-    
+
     # Roughness length (higher over land)
     roughness_length = jnp.where(
         geometry.fmask > 0.5,  # Land
         0.01,  # 1 cm over land
         0.0001  # 0.1 mm over ocean
     )
+
+    # Reshape surface properties from grid (nlon, nlat) to column (ncols) format
+    surface_albedo_vis = surface_albedo_vis.reshape(ncols)
+    surface_albedo_nir = surface_albedo_nir.reshape(ncols)
+    surface_emissivity = surface_emissivity.reshape(ncols)
+    surface_temperature = surface_temperature.reshape(ncols)
+    roughness_length = roughness_length.reshape(ncols)
     
     # Greenhouse gas concentrations (uniform for now)
+    # Fill arrays with constant values to maintain array shapes
     co2_concentration = 420.0  # ppmv
     ch4_concentration = 1900.0  # ppbv
     o3_concentration = 300.0  # ppbv
-    
+
     # Sea ice fraction (from existing data)
     #TODO: use these somewhere
     sea_ice_fraction = forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am
     sea_ice_thickness = jnp.where(sea_ice_fraction > 0.1, 1.0, 0.0)  # 1m where ice exists
-    
+
     tendencies = PhysicsTendency.zeros(state.temperature.shape)
 
     radiation_data = physics_data.radiation.copy(
@@ -67,13 +80,15 @@ def apply_forcing_data(
         surface_albedo_nir=surface_albedo_nir,
         surface_emissivity=surface_emissivity,
     )
+    # Fill chemistry arrays with constant values (maintaining original shapes)
     chemistry_data = physics_data.chemistry.copy(
-        co2_vmr=co2_concentration,
-        methane_vmr=ch4_concentration * 1e-3,  # Convert ppbv to ppmv
-        ozone_vmr=o3_concentration * 1e-3,    # Convert ppbv to ppmv
+        co2_vmr=jnp.ones_like(physics_data.chemistry.co2_vmr) * co2_concentration,
+        methane_vmr=jnp.ones_like(physics_data.chemistry.methane_vmr) * ch4_concentration * 1e-3,  # Convert ppbv to ppmv
+        ozone_vmr=jnp.ones_like(physics_data.chemistry.ozone_vmr) * o3_concentration * 1e-3,    # Convert ppbv to ppmv
     )
     surface_data = physics_data.surface.copy(
         surface_temperature=surface_temperature,
+        skin_temperature=surface_temperature,
         roughness_length=roughness_length,
     )
     updated_physics_data = physics_data.copy(
