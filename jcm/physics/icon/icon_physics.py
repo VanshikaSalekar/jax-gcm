@@ -48,23 +48,31 @@ class IconPhysics(Physics):
     - Simple chemistry schemes
     """
     
-    def __init__(self, 
+    def __init__(self,
                  write_output: bool = True,
                  checkpoint_terms: bool = True,
-                 parameters: Optional[Parameters] = None):
+                 parameters: Optional[Parameters] = None,
+                 dt_physics: Optional[float] = None):
         """
         Initialize the ICON physics.
-        
+
         Args:
             write_output: Whether to write physics output to predictions
             checkpoint_terms: Whether to checkpoint physics terms
             parameters: Optional physics parameters (uses defaults if None)
+            dt_physics: Physics timestep in seconds. If provided, overrides
+                all internal physics timesteps (dt_conv, dt_rad, etc.) to match
+                the model integration timestep. This is important since we don't
+                have sub-timestepping - all physics must use the same timestep.
         """
         self.write_output = write_output
         self.checkpoint_terms = checkpoint_terms
-        
-        # Store parameters
-        self.parameters = parameters or Parameters.default()
+
+        # Store parameters, optionally updating timesteps
+        params = parameters or Parameters.default()
+        if dt_physics is not None:
+            params = params.with_timestep(dt_physics)
+        self.parameters = params
         
         # Build list of physics terms
         self.terms = [

@@ -243,6 +243,12 @@ class Model:
         
         self.physics = physics or SpeedyPhysics()
 
+        # Ensure IconPhysics uses the correct timestep for all parameterizations
+        from jcm.physics.icon import IconPhysics
+        if isinstance(self.physics, IconPhysics):
+            # Update physics parameters to use model timestep
+            self.physics.parameters = self.physics.parameters.with_timestep(self.dt_si.m)
+
         self.diffusion = diffusion or DiffusionFilter.default()
 
         # TODO: make the truncation number a parameter consistent with the grid shape

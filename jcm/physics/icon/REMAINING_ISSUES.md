@@ -170,22 +170,29 @@ def two_stream_coefficients(
 
 ## Convection
 
-### Issue CONV-1: Timestep Parameter Validation
-**Location:** `convection/tiedtke_nordeng.py:74`
-**FIXME:** `# FIXME: validate dt_conv`
+### ~~Issue CONV-1: Timestep Parameter Validation~~ **FIXED**
+**Status:** RESOLVED
+**Location:** `convection/tiedtke_nordeng.py:74`, `parameters.py`, `icon_physics.py`, `model.py`
 
+**Previous:**
 ```python
-def default(cls, dt_conv=3600.0, ...)
+def default(cls, dt_conv=3600.0, ...)  # FIXME: validate dt_conv
 ```
 
-**Issue:** Default `dt_conv=3600s` (1 hour) doesn't match typical model timesteps (720-1800s).
+**Issue:** Default `dt_conv=3600s` (1 hour) didn't match typical model timesteps (720-1800s).
 
-**Fortran Reference:** Uses actual model timestep `pdtime` for mass flux limits.
+**Fix Applied:**
+1. Added `Parameters.with_timestep(dt_seconds)` method that updates all physics timesteps (dt_conv, dt_rad, dt_sedi)
+2. Added `dt_physics` parameter to `IconPhysics.__init__` for explicit timestep setting
+3. Model class now automatically calls `parameters.with_timestep(dt_si)` when using IconPhysics
 
-**Impact:** Using larger `dt_conv` allows ~2-5x larger mass fluxes than physically reasonable.
+**Usage:** Timesteps are now automatically synchronized. Users can also explicitly set:
+```python
+physics = IconPhysics(dt_physics=1800.0)  # 30 minutes in seconds
+# Or the Model class handles it automatically based on time_step parameter
+```
 
-**Recommendation:** Remove `dt_conv` from parameters; pass model timestep directly.
-**Priority:** MEDIUM
+**Priority:** ~~MEDIUM~~ N/A
 
 ### Issue CONV-2: Updraft States Not Investigated
 **Location:** `icon_physics.py:719`
@@ -386,14 +393,14 @@ sea_ice_thickness = jnp.where(sea_ice_fraction > 0.1, 1.0, 0.0)
 - ~~Vertical diffusion temperature instability~~ - Fixed with proper prefactor and time-stepping
 - ~~VD-4: Height level offset~~ - Fixed with proper extrapolation instead of arbitrary 1000m
 - ~~RAD-0: Incorrect pressure interfaces~~ - Fixed by passing model's pressure_half to radiation
+- ~~CONV-1: Timestep parameter~~ - Fixed with automatic timestep synchronization
 
 ### HIGH Priority (3 issues)
 - Hybrid coordinate NaNs
 - Surface fraction setup (SFC-1)
 - Exchange coefficient coupling (SFC-2)
 
-### MEDIUM Priority (5 issues)
-- Convection timestep (CONV-1)
+### MEDIUM Priority (4 issues)
 - Updraft states (CONV-2)
 - Downdraft LFS criteria (CONV-3)
 - Sea ice integration (FORC-1)

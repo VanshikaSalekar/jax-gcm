@@ -186,3 +186,50 @@ class Parameters:
             surface=self.surface,
             aerosol=aerosol_params
         )
+
+    def with_timestep(self, dt_seconds: float) -> 'Parameters':
+        """Create new Parameters with all physics timesteps set to the model timestep.
+
+        This ensures consistency between the model integration timestep and
+        the physics parameterization timesteps. Without sub-timestepping,
+        all physics schemes should use the same timestep as the model.
+
+        Args:
+            dt_seconds: Model timestep in seconds
+
+        Returns:
+            New Parameters with updated timesteps in convection, radiation,
+            and microphysics (dt_sedi capped at dt_seconds).
+        """
+        import jax.numpy as jnp
+
+        # Update convection timestep
+        convection_params = self.convection.__class__(**{
+            **self.convection.__dict__,
+            'dt_conv': jnp.array(dt_seconds)
+        })
+
+        # Update radiation timestep
+        radiation_params = self.radiation.__class__(**{
+            **self.radiation.__dict__,
+            'dt_rad': jnp.array(dt_seconds)
+        })
+
+        # Update microphysics sedimentation timestep
+        # dt_sedi should be <= dt_seconds (it's a sub-timestep)
+        dt_sedi = min(float(self.microphysics.dt_sedi), dt_seconds)
+        microphysics_params = self.microphysics.__class__(**{
+            **self.microphysics.__dict__,
+            'dt_sedi': jnp.array(dt_sedi)
+        })
+
+        return self.__class__(
+            convection=convection_params,
+            clouds=self.clouds,
+            microphysics=microphysics_params,
+            gravity_waves=self.gravity_waves,
+            radiation=radiation_params,
+            vertical_diffusion=self.vertical_diffusion,
+            surface=self.surface,
+            aerosol=self.aerosol
+        )
