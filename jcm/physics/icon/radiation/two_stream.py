@@ -208,7 +208,11 @@ def longwave_fluxes_single_band(
     def upward_step(carry, x):
         flux_below = carry
         lev, R, T, S = x
-        flux_above = R * flux_below + T * flux_below + S
+        # CRITICAL FIX: Removed R * flux_below term
+        # Upward flux = transmitted from below + emitted by layer
+        # The R * flux_below term was incorrectly reflecting upward flux back upward
+        # which doesn't make physical sense and was causing flux to be 15-25x too large
+        flux_above = T * flux_below + S
         return flux_above, flux_above
         
     # Scan from bottom to top

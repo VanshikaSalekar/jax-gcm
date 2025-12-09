@@ -331,3 +331,152 @@ def test_extreme_optical_depths():
     # Very large optical depths should have low transmission
     assert T_dif[-1] < 1e-10
     assert T_dif[-2] < 1e-10
+
+
+def test_longwave_realistic_olr():
+    """
+    BUG TEST: Ensure longwave radiation produces realistic OLR.
+
+    Bug found: OLR is 0.17 W/m² instead of expected ~240 W/m²
+    """
+    nlev = 15
+    n_lw_bands = 3
+
+    # Realistic atmospheric profile
+    tau_lw = jnp.array([
+        [0.01, 0.01, 0.01],  # TOA - very thin
+        [0.02, 0.02, 0.02],
+        [0.03, 0.03, 0.03],
+        [0.05, 0.05, 0.05],
+        [0.08, 0.08, 0.08],
+        [0.12, 0.12, 0.12],
+        [0.18, 0.18, 0.18],
+        [0.27, 0.27, 0.27],
+        [0.40, 0.40, 0.40],
+        [0.60, 0.60, 0.60],
+        [0.90, 0.90, 0.90],
+        [1.35, 1.35, 1.35],
+        [2.00, 2.00, 2.00],
+        [3.00, 3.00, 3.00],
+        [4.50, 4.50, 4.50],  # Surface - thickest
+    ])
+
+    lw_optics = OpticalProperties(
+        optical_depth=tau_lw,
+        single_scatter_albedo=jnp.zeros((nlev, n_lw_bands)),  # Pure absorption for LW
+        asymmetry_factor=jnp.zeros((nlev, n_lw_bands))
+    )
+
+    # Realistic temperature profile
+    temperature = jnp.array([200, 200, 200, 200, 204, 214, 223, 232,
+                            242, 251, 260, 269, 279, 288, 288])
+
+    # Planck functions
+    lw_bands = ((10, 350), (350, 500), (500, 2500))
+    planck_layer = planck_bands_lw(temperature, lw_bands)
+
+    # Interface temperatures (linearly interpolated)
+    temp_interface = jnp.concatenate([
+        jnp.array([temperature[0]]),
+        0.5 * (temperature[:-1] + temperature[1:]),
+        jnp.array([temperature[-1]])
+    ])
+    planck_interface = planck_bands_lw(temp_interface, lw_bands)
+
+    # Surface properties
+    surface_emissivity = 0.98
+    surface_temp = 288.0
+    surface_planck = planck_bands_lw(jnp.array([surface_temp]), lw_bands)[0]
+
+    # Calculate fluxes
+    flux_up_lw, flux_down_lw = longwave_fluxes(
+        lw_optics, planck_layer, planck_interface,
+        surface_emissivity, surface_planck, n_lw_bands
+    )
+
+    # TOA upward flux (OLR) is sum of all bands at top level
+    olr = jnp.sum(flux_up_lw[0, :n_lw_bands])
+
+    # BUG CHECK: OLR should be realistic (100-500 W/m² range)
+    # Earth's global mean OLR is ~240 W/m²
+    # Realistic range depends on atmospheric opacity and temperature profile
+    assert olr > 50.0, f"OLR {olr:.1f} W/m² too small - likely LW flux bug (expected ~150-350 W/m²)"
+    assert olr < 500.0, f"OLR {olr:.1f} W/m² too large - check for flux amplification bugs"
+
+    # Surface upward LW should be close to surface emission
+    # Note: surface_planck is in W/m²/sr (radiance), need to multiply by π for flux
+    surface_up = jnp.sum(flux_up_lw[-1, :n_lw_bands])
+    expected_surface = surface_emissivity * jnp.pi * jnp.sum(surface_planck[:n_lw_bands])
+    assert jnp.abs(surface_up - expected_surface) / expected_surface < 0.1, \
+        f"Surface LW up {surface_up:.1f} W/m² differs from expected {expected_surface:.1f} W/m²"
+
+
+def test_shortwave_toa_net_flux():
+    """
+    BUG TEST: Ensure shortwave doesn't have 100% reflection at TOA.
+
+    Bug found: SW up at TOA = 1306.59 W/m², SW down = 1306.60 W/m²
+    (99.99% reflection, essentially nothing entering atmosphere!)
+    """
+    nlev = 15
+    n_sw_bands = 2
+
+    # Realistic atmospheric optical properties
+    # Stratosphere (low tau), troposphere (higher tau)
+    tau_sw = jnp.array([
+        [0.02, 0.01],  # TOA
+        [0.03, 0.02],
+        [0.04, 0.03],
+        [0.06, 0.04],
+        [0.09, 0.06],
+        [0.13, 0.09],
+        [0.19, 0.13],
+        [0.28, 0.19],
+        [0.41, 0.28],
+        [0.61, 0.41],
+        [0.91, 0.61],
+        [1.36, 0.91],
+        [2.03, 1.36],
+        [3.04, 2.03],
+        [4.55, 3.04],  # Surface
+    ])
+
+    sw_optics = OpticalProperties(
+        optical_depth=tau_sw,
+        single_scatter_albedo=jnp.ones((nlev, n_sw_bands)) * 0.85,  # Moderate scattering
+        asymmetry_factor=jnp.ones((nlev, n_sw_bands)) * 0.85
+    )
+
+    # Solar parameters (noon at mid-latitude)
+    cos_zenith = 0.5  # 60° solar zenith angle
+    toa_flux = jnp.array([600.0, 600.0])  # W/m² per band
+    surface_albedo = jnp.array([0.2, 0.2])  # Typical land surface
+
+    # Calculate fluxes
+    flux_up_sw, flux_down_sw, flux_dir, flux_dif = shortwave_fluxes(
+        sw_optics, cos_zenith, toa_flux, surface_albedo, n_sw_bands
+    )
+
+    # TOA fluxes
+    toa_down = jnp.sum(flux_down_sw[0, :n_sw_bands])
+    toa_up = jnp.sum(flux_up_sw[0, :n_sw_bands])
+    toa_net = toa_down - toa_up
+
+    # BUG CHECK: TOA should not have 100% reflection
+    # Planetary albedo is typically 0.3-0.4, so we expect 60-70% to enter atmosphere
+    reflection_fraction = toa_up / toa_down if toa_down > 0 else 1.0
+
+    assert reflection_fraction < 0.6, \
+        f"TOA reflection {reflection_fraction*100:.1f}% too high - likely SW flux bug (expected ~30-40%)"
+
+    # Net flux entering atmosphere should be positive and significant
+    total_toa_flux = jnp.sum(toa_flux[:n_sw_bands])
+    net_fraction = toa_net / total_toa_flux if total_toa_flux > 0 else 0.0
+
+    assert net_fraction > 0.4, \
+        f"Net SW flux entering atmosphere is only {net_fraction*100:.1f}% of TOA - too low!"
+
+    # Surface should receive significant SW radiation
+    surface_down = jnp.sum(flux_down_sw[-1, :n_sw_bands])
+    assert surface_down > 0.3 * total_toa_flux, \
+        f"Surface SW down {surface_down:.1f} W/m² too small (expected >30% of TOA flux)"
