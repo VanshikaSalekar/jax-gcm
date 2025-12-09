@@ -70,14 +70,14 @@ class IconPhysics(Physics):
         self.terms = [
             _prepare_common_physics_state,
             apply_forcing_data,             # Time-varying boundary conditions
-            get_simple_aerosol,            # Aerosol before radiation FIXME: get_CDNC issue
+            get_simple_aerosol,            # Aerosol before radiation
             apply_chemistry,               # Chemistry for ozone, methane etc.
-            # apply_radiation,             # DISABLED: SW flux constant (no atm heating), LW flux near-zero (0.01 W/m² OLR vs 240 expected), causing -143 K/day cooling. SW heating negative everywhere. Needs debug of flux calculation and ozone optical depth.
-            apply_convection,              # FIXME: surface evaporation drives strong updraft causing temperature blowup in layer 1 in 4-5 hours of model time (or in 1 step if vertical_diffusion is on)
+            apply_radiation,               
+            apply_convection,              
             apply_clouds,
             apply_microphysics,
-            apply_surface,                 # Surface after radiation
-            # apply_vertical_diffusion,    # DISABLED: Matrix solver produces T=0K, causing immediate model crash. Needs complete rewrite.
+            apply_vertical_diffusion,      
+            apply_surface,                 # Surface after radiation and vertical diffusion
             apply_gravity_waves
         ]
     
