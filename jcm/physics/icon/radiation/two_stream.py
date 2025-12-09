@@ -330,37 +330,51 @@ def shortwave_fluxes_single_band(
     # Initialize diffuse fluxes
     flux_down_dif = jnp.zeros(nlev + 1)
     flux_up_dif = jnp.zeros(nlev + 1)
-    
-    # Surface reflection of direct beam
+
+    # Initial surface reflection of direct beam only
     flux_up_dif = flux_up_dif.at[nlev].set(surface_albedo * flux_direct[nlev])
-    
+
     # Upward diffuse calculation
     def upward_diffuse_step(carry, x):
         flux_below = carry
         R, T, S = x
         flux_above = T * flux_below + S
         return flux_above, flux_above
-    
+
     _, flux_up_levels = jax.lax.scan(
         upward_diffuse_step,
         flux_up_dif[nlev],
         (R_dif[::-1], T_dif[::-1], source_diffuse[::-1])
     )
     flux_up_dif = flux_up_dif.at[:-1].set(flux_up_levels[::-1])
-    
+
     # Downward diffuse calculation
     def downward_diffuse_step(carry, x):
         flux_above = carry
         R, T, S, flux_up = x
-        flux_below = T * flux_above + R * flux_up + S # FIXME: verify this logic
+        flux_below = T * flux_above + R * flux_up + S
         return flux_below, flux_below
-    
+
     _, flux_down_levels = jax.lax.scan(
         downward_diffuse_step,
         0.0,  # No diffuse at TOA
         (R_dif, T_dif, source_diffuse, flux_up_dif[:-1])
     )
     flux_down_dif = flux_down_dif.at[1:].set(flux_down_levels)
+
+    # CRITICAL FIX: Update surface upward flux to include diffuse reflection
+    # Surface reflects both direct AND diffuse downward radiation
+    flux_up_dif = flux_up_dif.at[nlev].set(
+        surface_albedo * (flux_direct[nlev] + flux_down_dif[nlev])
+    )
+
+    # Recalculate upward diffuse with correct surface boundary condition
+    _, flux_up_levels = jax.lax.scan(
+        upward_diffuse_step,
+        flux_up_dif[nlev],
+        (R_dif[::-1], T_dif[::-1], source_diffuse[::-1])
+    )
+    flux_up_dif = flux_up_dif.at[:-1].set(flux_up_levels[::-1])
     
     # Total fluxes
     flux_down_total = flux_direct + flux_down_dif
