@@ -20,7 +20,6 @@ from .radiation_types import OpticalProperties
 
 @jax.jit
 def two_stream_coefficients(
-    tau: jnp.ndarray, # FIXME: remove this if unused
     ssa: jnp.ndarray,
     g: jnp.ndarray,
     mu0: Optional[float] = None
@@ -31,7 +30,6 @@ def two_stream_coefficients(
     Using Eddington approximation (Meador & Weaver 1980).
     
     Args:
-        tau: Optical depth
         ssa: Single scattering albedo
         g: Asymmetry factor
         mu0: Cosine of solar zenith angle (for SW only)
@@ -49,8 +47,8 @@ def two_stream_coefficients(
         gamma4 = 1.0 - gamma3
     else:
         # Longwave (no direct beam)
-        gamma3 = jnp.zeros_like(tau)
-        gamma4 = jnp.ones_like(tau)
+        gamma3 = jnp.zeros_like(ssa)
+        gamma4 = jnp.ones_like(ssa)
     
     return gamma1, gamma2, gamma3, gamma4
 
@@ -76,7 +74,7 @@ def layer_reflectance_transmittance(
         For LW, only diffuse components are used
     """
     # Get two-stream coefficients
-    gamma1, gamma2, gamma3, gamma4 = two_stream_coefficients(tau, ssa, g, mu0)
+    gamma1, gamma2, gamma3, gamma4 = two_stream_coefficients(ssa, g, mu0)
     
     # Calculate lambda (eigenvalue)
     lambda_val = jnp.sqrt(gamma1**2 - gamma2**2)
@@ -209,7 +207,6 @@ def longwave_fluxes_single_band(
         flux_below = carry
         lev, R, T, S = x
         # CRITICAL FIX: Removed R * flux_below term
-        # Upward flux = transmitted from below + emitted by layer
         # The R * flux_below term was incorrectly reflecting upward flux back upward
         # which doesn't make physical sense and was causing flux to be 15-25x too large
         flux_above = T * flux_below + S
@@ -324,8 +321,10 @@ def shortwave_fluxes_single_band(
     flux_direct = toa_flux * direct_trans_full
     
     # Diffuse radiation calculation
-    # Source from direct beam scattering
+    # Source from direct beam scattering (split into upward/downward components)
     source_diffuse = toa_flux * R_dir * direct_trans_full[:-1]
+    source_up = 0.5 * source_diffuse
+    source_down = 0.5 * source_diffuse
     
     # Initialize diffuse fluxes
     flux_down_dif = jnp.zeros(nlev + 1)
@@ -344,7 +343,7 @@ def shortwave_fluxes_single_band(
     _, flux_up_levels = jax.lax.scan(
         upward_diffuse_step,
         flux_up_dif[nlev],
-        (R_dif[::-1], T_dif[::-1], source_diffuse[::-1])
+        (R_dif[::-1], T_dif[::-1], source_up[::-1])
     )
     flux_up_dif = flux_up_dif.at[:-1].set(flux_up_levels[::-1])
 
@@ -358,7 +357,7 @@ def shortwave_fluxes_single_band(
     _, flux_down_levels = jax.lax.scan(
         downward_diffuse_step,
         0.0,  # No diffuse at TOA
-        (R_dif, T_dif, source_diffuse, flux_up_dif[:-1])
+        (R_dif, T_dif, source_down, flux_up_dif[:-1])
     )
     flux_down_dif = flux_down_dif.at[1:].set(flux_down_levels)
 
@@ -372,9 +371,17 @@ def shortwave_fluxes_single_band(
     _, flux_up_levels = jax.lax.scan(
         upward_diffuse_step,
         flux_up_dif[nlev],
-        (R_dif[::-1], T_dif[::-1], source_diffuse[::-1])
+        (R_dif[::-1], T_dif[::-1], source_up[::-1])
     )
     flux_up_dif = flux_up_dif.at[:-1].set(flux_up_levels[::-1])
+
+    # Recalculate downward diffuse with updated upward flux for consistency
+    _, flux_down_levels = jax.lax.scan(
+        downward_diffuse_step,
+        0.0,  # No diffuse at TOA
+        (R_dif, T_dif, source_down, flux_up_dif[:-1])
+    )
+    flux_down_dif = flux_down_dif.at[1:].set(flux_down_levels)
     
     # Total fluxes
     flux_down_total = flux_direct + flux_down_dif
