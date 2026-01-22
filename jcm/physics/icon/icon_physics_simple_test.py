@@ -14,7 +14,7 @@ from jcm.physics.icon.icon_physics_data import PhysicsData
 from jcm.physics.icon.parameters import Parameters
 from jcm.physics_interface import PhysicsState, PhysicsTendency
 from jcm.date import DateData
-from jcm.boundaries import BoundaryData
+from jcm.forcing import ForcingData
 from jcm.geometry import Geometry
 from typing import Tuple
 
@@ -76,12 +76,12 @@ def test_prepare_common_physics_state():
     date = DateData.zeros()
     physics_data = PhysicsData.zeros((nlat, nlon), nlev, date=date)
     parameters = Parameters.default()
-    boundaries = BoundaryData.zeros((nlat, nlon))
+    forcing = ForcingData.zeros((nlat, nlon))
     geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
     
     # Run preparation
     tendencies, updated_physics_data = _prepare_common_physics_state(
-        state, physics_data, parameters, boundaries, geometry
+        state, physics_data, parameters, forcing, geometry
     )
     
     # Check outputs
@@ -128,12 +128,12 @@ def test_simple_physics_integration():
     
     # Create other inputs
     date = DateData.zeros()
-    boundaries = BoundaryData.zeros((nlat, nlon))
+    forcing = ForcingData.zeros((nlat, nlon))
     geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
     
     # Run physics
     tendencies, physics_data = physics.compute_tendencies(
-        state, boundaries, geometry, date
+        state, forcing, geometry, date
     )
     
     # Check outputs
@@ -177,12 +177,12 @@ def test_physics_vectorization():
     
     # Create other inputs
     date = DateData.zeros()
-    boundaries = BoundaryData.zeros((nlat, nlon))
+    forcing = ForcingData.zeros((nlat, nlon))
     geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
     
     # Run physics
     tendencies, physics_data = physics.compute_tendencies(
-        state, boundaries, geometry, date
+        state, forcing, geometry, date
     )
     
     # Check that all columns got processed
