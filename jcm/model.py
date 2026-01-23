@@ -20,7 +20,7 @@ from jcm.date import DateData
 from jcm.forcing import ForcingData, default_forcing
 from jcm.physics_interface import PhysicsState, Physics, get_physical_tendencies, dynamics_state_to_physics_state
 from jcm.physics.speedy.speedy_physics import SpeedyPhysics
-from jcm.utils import DYNAMICS_UNITS_TABLE_CSV_PATH, stack_trees, get_coords
+from jcm.utils import DYNAMICS_UNITS_TABLE_CSV_PATH, get_coords
 from jcm.diffusion import DiffusionFilter
 import pandas as pd
 from functools import partial
@@ -154,7 +154,11 @@ def averaged_trajectory_from_step(
     """
     def integrate(x_initial, empty_data):
         diagnostics_collector = DiagnosticsCollector(steps_to_average=inner_steps)
-        diagnostics_collector.data = nnx.Variable(stack_trees([empty_data] * outer_steps))
+        stacked_empty_data = tree_map(
+            lambda x: jnp.zeros((outer_steps,) + jnp.array(x).shape, dtype=jnp.float32),
+            empty_data
+        )
+        diagnostics_collector.data = nnx.Variable(stacked_empty_data)
         graphdef, init_diag_state = nnx.split(diagnostics_collector)
 
         empty_sum = tree_map(jnp.zeros_like, x_initial)
@@ -367,7 +371,7 @@ class Model:
     def _date_from_sim_time(self, sim_time) -> DateData:
         return DateData.set_date(
             model_time=self.start_date + jdt.Timedelta(seconds=jnp.round(sim_time).astype(jnp.int32)),
-            model_step=jnp.asarray(sim_time / self.dt_si.m).astype(jnp.int32),
+            model_step=jnp.int32(sim_time / self.dt_si.m),
             dt_seconds=self.dt_si.m
         )
 
@@ -436,17 +440,17 @@ class Model:
         trajectory_fn = averaged_trajectory_from_step if output_averages else dinosaur.time_integration.trajectory_from_step
 
         def _integrate_fn(state):
-            integrate_fn = jax.jit(trajectory_fn(
+            integrate_fn = trajectory_fn(
                 step_fn=step_fn,
                 outer_steps=outer_steps,
                 inner_steps=inner_steps,
                 **kwargs,
                 post_process_fn=post_process_fn
-            ))
-            
+            )
+
             # integrate_fn for avgs has different signature b/c empty physics data structure needed for DiagnosticsCollector initialization
             return integrate_fn(state, self.physics.get_empty_data(self.geometry)) if output_averages else integrate_fn(state)
-        
+
         return _integrate_fn
 
     @partial(jax.jit, static_argnums=(0, 3, 4, 5)) # Note: if model fields assumed to be static are changed, the changes will not be picked up here

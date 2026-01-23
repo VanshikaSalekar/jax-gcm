@@ -298,7 +298,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
             # Dimensionalize other tracers (assuming they have same units as specific_humidity for now)
             all_tracers[tracer_name] = dynamics.physics_specs.dimensionalize(tracer_value, units.gram / units.kilogram).m
 
-    return PhysicsState(u, v, t, q, phi, jnp.squeeze(sp), all_tracers)
+    return PhysicsState(u, v, t, q, phi, jnp.squeeze(sp, axis=-3), all_tracers)
 
 def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: PrimitiveEquations) -> State:
     """Convert state variables from the physics (nodal space) back to the dynamical core (spectral space).
@@ -339,7 +339,7 @@ def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: Primi
         vorticity=modal_vorticity,
         divergence=modal_divergence,
         temperature_variation=temperature_modal, # does this need to be referenced to ref_temp ?
-        log_surface_pressure=modal_log_sp,
+        log_surface_pressure=modal_log_sp[..., jnp.newaxis, :, :], # Dinosaur expects log_sp to have a vertical dimension
         tracers=tracers_modal
     )
 
@@ -469,7 +469,7 @@ def filter_tendencies(dynamics_tendency: State,
                       diffusion: DiffusionFilter,
                       time_step, 
                       grid) -> State:
-    """Apply dinsoaur horizontal diffusion filter to the dynamics divergence tendency
+    """Apply dinosaur horizontal diffusion filter to the dynamics divergence tendency
 
     Args:
         dynamics_tendency: Dynamics tendencies in dinosaur.primitive_equations.State format
