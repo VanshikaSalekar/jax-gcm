@@ -266,7 +266,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
             temperature=spectral_temperature_variation,
             coordinates=dynamics.coords.vertical,
             ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
-            p_s_ref=dynamics.p_s_ref,  # Use same reference pressure as dynamics core
+            p_surface=dynamics.p_s_ref,  # Use same reference pressure as dynamics core
             method='dense',
             sharding=None
         )

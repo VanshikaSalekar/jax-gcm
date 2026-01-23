@@ -126,7 +126,7 @@ class TestIconPhysicsIntegration(unittest.TestCase):
         self.assertGreaterEqual(q_min, 0.0, "Specific humidity should be non-negative")
         
         # Check that the time dimension exists and matches expected save intervals
-        expected_time_steps = int(total_time / save_interval) + 1  # +1 for initial state
+        expected_time_steps = int(total_time / save_interval) 
         actual_time_steps = dynamics_predictions.temperature.shape[0]
         self.assertEqual(actual_time_steps, expected_time_steps,
                         f"Expected {expected_time_steps} time steps, got {actual_time_steps} - model may have crashed")

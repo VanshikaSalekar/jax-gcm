@@ -54,7 +54,7 @@ def apply_simple_test_physics(
 def test_prepare_common_physics_state():
     """Test common physics state preparation"""
     # Setup
-    nlev, nlat, nlon = 8, 4, 8
+    nlev, nlat, nlon = 8, 64, 32
     ncols = nlat * nlon
     
     # Create state
@@ -77,7 +77,7 @@ def test_prepare_common_physics_state():
     physics_data = PhysicsData.zeros((nlat, nlon), nlev, date=date)
     parameters = Parameters.default()
     forcing = ForcingData.zeros((nlat, nlon))
-    geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
+    geometry = Geometry.from_grid_shape((nlat, nlon), num_levels=nlev)
     
     # Run preparation
     tendencies, updated_physics_data = _prepare_common_physics_state(
@@ -95,7 +95,7 @@ def test_prepare_common_physics_state():
 def test_simple_physics_integration():
     """Test simple physics integration without complex schemes"""
     # Setup
-    nlev, nlat, nlon = 8, 4, 8
+    nlev, nlat, nlon = 8, 64, 32
     ncols = nlat * nlon
     
     # Create test physics with only simple terms
@@ -129,7 +129,7 @@ def test_simple_physics_integration():
     # Create other inputs
     date = DateData.zeros()
     forcing = ForcingData.zeros((nlat, nlon))
-    geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
+    geometry = Geometry.from_grid_shape((nlat, nlon), num_levels=nlev)
     
     # Run physics
     tendencies, physics_data = physics.compute_tendencies(
@@ -151,7 +151,7 @@ def test_simple_physics_integration():
 def test_physics_vectorization():
     """Test that physics properly vectorizes over columns"""
     # Setup
-    nlev, nlat, nlon = 8, 4, 8
+    nlev, nlat, nlon = 8, 64, 32
     
     physics = IconPhysics()
     physics.terms = [_prepare_common_physics_state, apply_simple_test_physics]
@@ -178,7 +178,7 @@ def test_physics_vectorization():
     # Create other inputs
     date = DateData.zeros()
     forcing = ForcingData.zeros((nlat, nlon))
-    geometry = Geometry.from_grid_shape((nlat, nlon), nlev)
+    geometry = Geometry.from_grid_shape((nlat, nlon), num_levels=nlev)
     
     # Run physics
     tendencies, physics_data = physics.compute_tendencies(
