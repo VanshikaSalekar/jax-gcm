@@ -168,6 +168,7 @@ Attributes:
 
 class Physics:
     UNITS_TABLE_CSV_PATH = None
+    cached_coords = None
 
     def cache_coords(self, coords: CoordinateSystem):
         return None
