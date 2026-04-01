@@ -13,7 +13,6 @@ import platform
 import time
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from jcm.model import Model
