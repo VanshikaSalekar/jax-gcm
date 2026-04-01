@@ -94,10 +94,11 @@ class ModelPredictions:
         """
         from jcm.utils import data_to_xarray
 
+
         # float0s are placeholders representing the lack of tangent space for non-differentiable variables
         # jax.numpy arrays cannot have float0 dtype, so jcm handles them with numpy arrays
         # substituting jax.numpy arrays here allows us to handle Predictions objects that contain derivatives
-        float0s_to_nans = lambda pytree: tree_map(lambda x: jnp.full_like(x, jnp.nan, dtype=jnp.float32) if x.dtype == jax.dtypes.float0 else x, pytree)
+        float0s_to_nans = lambda pytree: tree_map(lambda x: jnp.full_like(x, jnp.nan, dtype=float) if x.dtype == jax.dtypes.float0 else x, pytree)
 
         dynamics_predictions = float0s_to_nans(self.dynamics)
         physics_predictions = float0s_to_nans(self.physics)
@@ -210,7 +211,7 @@ def averaged_trajectory_from_step(
     def integrate(x_initial, empty_data):
         diagnostics_collector = DiagnosticsCollector(steps_to_average=inner_steps)
         stacked_empty_data = tree_map(
-            lambda x: jnp.zeros((outer_steps,) + jnp.array(x).shape, dtype=jnp.float32),
+            lambda x: jnp.zeros((outer_steps,) + jnp.array(x).shape, dtype=float),
             empty_data
         )
         diagnostics_collector.data = nnx.Variable(stacked_empty_data)
@@ -293,6 +294,7 @@ class Model:
             coords=self.coords,
             physics_specs=self.physics_specs,
             p0=p0*units.pascal,
+            p1=0.01*p0*units.pascal,
         )
         
         self.physics = physics or SpeedyPhysics()
@@ -461,7 +463,7 @@ class Model:
 
         """
         from jcm.physics_interface import verify_state
-        jax.debug.callback(logger.info, "Post processing: %s simulated seconds", state.sim_time)
+        jax.debug.callback(lambda t: logger.info("Post processing: %s simulated seconds", t), state.sim_time)
 
         predictions = Predictions(
             dynamics=dynamics_state_to_physics_state(state, self.primitive),
@@ -579,8 +581,10 @@ class Model:
 
         """
         # starts from preexisting self._final_modal_state, then updates self._final_modal_state
-        jax.debug.callback(logger.info, "Model starting with params: forcing: %s, save_interval: %s, total_time: %s, output_averages: %s",
-                                        forcing, save_interval, total_time, output_averages)
+        jax.debug.callback(
+            lambda: logger.info("Model starting with params: save_interval: %s, total_time: %s, output_averages: %s",
+                                save_interval, total_time, output_averages)
+        )
         final_modal_state, predictions = self.run_from_state(
             initial_state=self._final_modal_state,
             forcing=forcing or default_forcing(self.coords.horizontal),
@@ -588,7 +592,7 @@ class Model:
             total_time=total_time,
             output_averages=output_averages
         )
-        jax.debug.callback(logger.info, "Run completed.")
+        jax.debug.callback(lambda: logger.info("Run completed."))
         self._final_modal_state = final_modal_state
         return predictions
 

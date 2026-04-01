@@ -8,21 +8,21 @@ _DAYS_YEAR = 365.2425
 
 @tree_math.struct
 class DateData:
-    tyear: jnp.float32 # Fractional time of year, should possibly be part of the model itself (i.e. not in physics_data)
+    tyear: float # Fractional time of year, should possibly be part of the model itself (i.e. not in physics_data)
     dt: jdt.Datetime  # Actual datetime object, may be None if not needed
     model_year: jnp.int32
     model_step: jnp.int32
-    dt_seconds: jnp.float32 # Model timestep in seconds
+    dt_seconds: float # Model timestep in seconds
 
     @classmethod
     def zeros(cls, dt=None, tyear=None, model_year=None, model_step=None, dt_seconds=None):
         return cls(
-          tyear=tyear if tyear is not None else jnp.float32(0.0),
+          tyear=tyear if tyear is not None else 0.0,
           # FIXME: dt should be required and tyear and model_year derived from it (as properties)
           dt=dt if dt is not None else jdt.Datetime.from_pydatetime(jdt.to_datetime('1950-01-01')),
           model_year=model_year if model_year is not None else jnp.int32(1950),
           model_step=model_step if model_step is not None else jnp.int32(0),
-          dt_seconds=dt_seconds if dt_seconds is not None else jnp.float32(1800.0))
+          dt_seconds=dt_seconds if dt_seconds is not None else 1800.0)
 
     @classmethod
     def set_date(cls, model_time, model_step=None, dt_seconds=None):
@@ -31,16 +31,16 @@ class DateData:
           dt=model_time,
           model_year=get_year(model_time),
           model_step=model_step if model_step is not None else jnp.int32(0),
-          dt_seconds=dt_seconds if dt_seconds is not None else jnp.float32(1800.0))
+          dt_seconds=dt_seconds if dt_seconds is not None else 1800.0)
 
     @classmethod
     def ones(cls, tyear=None, dt=None, model_year=None, model_step=None, dt_seconds=None):
         return cls(
-          tyear=tyear if tyear is not None else jnp.float32(1.0),
+          tyear=tyear if tyear is not None else 1.0,
           dt=dt if dt is not None else jdt.Datetime.from_pydatetime(jdt.to_datetime('1950-01-01')),
           model_year=model_year if model_year is not None else jnp.int32(1950),
           model_step=model_step if model_step is not None else jnp.int32(0),
-          dt_seconds=dt_seconds if dt_seconds is not None else jnp.float32(1800.0))
+          dt_seconds=dt_seconds if dt_seconds is not None else 1800.0)
 
     def model_day(self):
         return jnp.round(self.tyear*_DAYS_YEAR).astype(jnp.int32)
@@ -79,4 +79,4 @@ def fraction_of_year_elapsed(dt: jdt.Datetime):
     days_elapsed_in_year += dt.delta.seconds / (24 * 60 * 60)
     
     # Calculate the fraction of the year elapsed
-    return jnp.float32(days_elapsed_in_year / _DAYS_YEAR)
+    return days_elapsed_in_year / _DAYS_YEAR

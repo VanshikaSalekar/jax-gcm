@@ -1,0 +1,45 @@
+Device info: {
+  "platform": "cpu",
+  "device_kind": "cpu",
+  "num_devices": 1,
+  "python_version": "3.11.2",
+  "jax_version": "0.9.0.1",
+  "hostname": "jcm-bench-cpu-c4"
+}
+Creating model (T31, 8 layers, dt=30min)...
+Model created.
+Warmup run (360.0 days, save every 30.0 days)...
+Warmup (includes compile): 146.38s
+Running 5 timed iterations...
+  Run 1/5: 137.481s
+  Run 2/5: 139.392s
+  Run 3/5: 141.591s
+  Run 4/5: 138.409s
+  Run 5/5: 137.778s
+
+============================================================
+RESULTS
+============================================================
+{
+  "platform": "cpu",
+  "device_kind": "cpu",
+  "num_devices": 1,
+  "python_version": "3.11.2",
+  "jax_version": "0.9.0.1",
+  "hostname": "jcm-bench-cpu-c4",
+  "total_time_days": 360.0,
+  "save_interval_days": 30.0,
+  "n_repeats": 5,
+  "compile_time_s": 146.379,
+  "mean_s": 138.93,
+  "std_s": 1.483,
+  "min_s": 137.481,
+  "max_s": 141.591,
+  "all_times_s": [
+    137.481,
+    139.392,
+    141.591,
+    138.409,
+    137.778
+  ]
+}
