@@ -29,11 +29,10 @@ class CloudParameters:
     nex: float           # Exponent for RH threshold profile
     csatsc: float        # Saturation factor for stratocumulus
     
-    # Microphysics parameters
-    ccraut: float        # Autoconversion threshold (kg/kg)
+    # Cloud droplet parameters
     ceffmin: float       # Minimum cloud droplet radius (microns)
     ceffmax: float       # Maximum cloud droplet radius (microns)
-    
+
     # Numerical parameters
     epsilon: float       # Small number for numerical stability
     
@@ -44,7 +43,7 @@ class CloudParameters:
 
     @classmethod
     def default(cls, crt=0.9, crs=0.7, nex=4.0,
-                 csatsc=0.97, ccraut=0.0005, ceffmin=10.0, 
+                 csatsc=0.97, ceffmin=10.0,
                  ceffmax=150.0, epsilon=1.0e-12,
                  t_ice=238.15, t_mix_min=238.15, t_mix_max=273.15) -> 'CloudParameters':
         """Return default cloud parameters"""
@@ -53,7 +52,6 @@ class CloudParameters:
             crs=jnp.array(crs),
             nex=jnp.array(nex),
             csatsc=jnp.array(csatsc),
-            ccraut=jnp.array(ccraut),
             ceffmin=jnp.array(ceffmin),
             ceffmax=jnp.array(ceffmax),
             epsilon=jnp.array(epsilon),
@@ -76,16 +74,15 @@ class CloudState(NamedTuple):
     
     
 class CloudTendencies(NamedTuple):
-    """Tendencies from cloud processes"""
-    
+    """Tendencies from cloud condensation processes.
+
+    Precipitation is handled by cloud_microphysics, not here.
+    """
+
     dtedt: jnp.ndarray         # Temperature tendency (K/s)
     dqdt: jnp.ndarray          # Specific humidity tendency (kg/kg/s)
     dqcdt: jnp.ndarray         # Cloud water tendency (kg/kg/s)
     dqidt: jnp.ndarray         # Cloud ice tendency (kg/kg/s)
-    
-    # Surface precipitation fluxes
-    rain_flux: jnp.ndarray     # Surface rain flux (kg/m²/s)
-    snow_flux: jnp.ndarray     # Surface snow flux (kg/m²/s)
 
 
 def saturation_vapor_pressure_water(temperature: jnp.ndarray) -> jnp.ndarray:
@@ -317,7 +314,7 @@ def condensation_evaporation(
 
 def shallow_cloud_scheme(
     temperature: jnp.ndarray,
-    specific_humidity: jnp.ndarray, 
+    specific_humidity: jnp.ndarray,
     pressure: jnp.ndarray,
     cloud_water: jnp.ndarray,
     cloud_ice: jnp.ndarray,
@@ -326,7 +323,7 @@ def shallow_cloud_scheme(
     config: Optional[CloudParameters] = None
 ) -> Tuple[CloudTendencies, CloudState]:
     """Run shallow cloud scheme
-    
+
     Args:
         temperature: Temperature (K) [nlev] or scalar
         specific_humidity: Specific humidity (kg/kg) [nlev] or scalar
@@ -336,7 +333,7 @@ def shallow_cloud_scheme(
         surface_pressure: Surface pressure (Pa)
         dt: Time step (s)
         config: Cloud configuration
-        
+
     Returns:
         Tuple of (tendencies, cloud_state)
 
@@ -362,30 +359,14 @@ def shallow_cloud_scheme(
         cloud_fraction, pressure, dt, config
     )
     
-    # Simple precipitation formation (autoconversion)
-    # Convert cloud water to rain if it exceeds threshold
-    rain_rate = jnp.where(
-        cloud_water > config.ccraut,
-        0.001 * (cloud_water - config.ccraut) / dt,  # Simple rate
-        0.0
-    )
-    snow_rate = jnp.where(
-        cloud_ice > config.ccraut * 0.1,  # Lower threshold for ice
-        0.01 * cloud_ice / dt,  # Faster rate for ice
-        0.0
-    )
-    
-    # Update tendencies for precipitation
-    dqcdt = dqcdt - rain_rate
-    dqidt = dqidt - snow_rate
-    
-    # Calculate total cloud cover (maximum overlap assumption)
+    # Within-timestep condensation: update cloud water/ice with condensation
+    # so that microphysics (called next) sees non-zero values.
+    # Following ECHAM mo_cloud.f90 where zxlb += zcnd within the same call.
+    updated_cloud_water = jnp.maximum(cloud_water + dqcdt * dt, 0.0)
+    updated_cloud_ice = jnp.maximum(cloud_ice + dqidt * dt, 0.0)
+
+    # Total cloud cover (maximum overlap assumption)
     total_cloud_cover = jnp.max(cloud_fraction)
-    
-    # Surface precipitation fluxes (simplified - no vertical integration)
-    # In reality, would need to integrate through column accounting for evaporation
-    rain_flux = jnp.sum(rain_rate) * 1000.0  # Convert to kg/m²/s (approximate)
-    snow_flux = jnp.sum(snow_rate) * 1000.0
     
     # Create output structures
     tendencies = CloudTendencies(
@@ -393,14 +374,12 @@ def shallow_cloud_scheme(
         dqdt=dqdt,
         dqcdt=dqcdt,
         dqidt=dqidt,
-        rain_flux=jnp.array(rain_flux),
-        snow_flux=jnp.array(snow_flux)
     )
-    
+
     state = CloudState(
         cloud_fraction=cloud_fraction,
-        cloud_water=cloud_water,
-        cloud_ice=cloud_ice,
+        cloud_water=updated_cloud_water,
+        cloud_ice=updated_cloud_ice,
         rel_humidity=rel_humidity,
         total_cloud_cover=jnp.array(total_cloud_cover)
     )

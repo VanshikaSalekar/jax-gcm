@@ -63,6 +63,9 @@ class MicrophysicsParameters:
     vt_rain_a: float     # Rain fall speed coefficient a
     vt_rain_b: float     # Rain fall speed exponent b
     
+    # Cloud droplet number concentration
+    base_cdnc: float     # Baseline CDNC in clean air (1/m³), modulated by aerosol cdnc_factor
+
     # Numerical parameters
     epsilon: float       # Small number for numerical stability
     dt_sedi: float       # Sub-timestep for sedimentation (s)
@@ -72,7 +75,8 @@ class MicrophysicsParameters:
                  crhosno=100.0, cvtfall=3.29, cthomi=233.15, csecfrl=0.1, ccollec=0.7,
                  ccollei=0.3, tau_melt=100.0, tau_freeze=100.0, cevaprain=1.0e-3,
                  cevapsnow=5.0e-4, vt_ice=0.1, vt_snow_a=8.8, vt_snow_b=0.15,
-                 vt_rain_a=386.0, vt_rain_b=0.67, epsilon=1.0e-12, dt_sedi=10.0) -> 'MicrophysicsParameters':
+                 vt_rain_a=386.0, vt_rain_b=0.67, base_cdnc=100.0e6,
+                 epsilon=1.0e-12, dt_sedi=10.0) -> 'MicrophysicsParameters':
         """Return default microphysics parameters"""
         return cls(
             ccraut=jnp.array(ccraut),
@@ -96,6 +100,7 @@ class MicrophysicsParameters:
             vt_snow_b=jnp.array(vt_snow_b),
             vt_rain_a=jnp.array(vt_rain_a),
             vt_rain_b=jnp.array(vt_rain_b),
+            base_cdnc=jnp.array(base_cdnc),
             epsilon=jnp.array(epsilon),
             dt_sedi=jnp.array(dt_sedi)
         )
@@ -217,11 +222,7 @@ def autoconversion_kk2000(
     
     # Convert to grid-mean tendency
     autoconv_rate = autoconv_rate * cloud_fraction
-    
-    # Limit to available cloud water
-    max_rate = cloud_water / dt
-    autoconv_rate = jnp.minimum(autoconv_rate, max_rate)
-    
+
     return autoconv_rate
 
 
@@ -647,15 +648,22 @@ def cloud_microphysics(
     dqrdt = dqrdt - rain_sedi
     dqsdt = dqsdt - snow_sedi
     
-    # Calculate precipitation fluxes (simplified - just from lowest level)
-    rain_flux = jnp.zeros(nlev)
-    snow_flux = jnp.zeros(nlev)
-    rain_flux = rain_flux.at[-1].set(rain_sedi[-1] * air_density[-1] * layer_thickness[-1])
-    snow_flux = snow_flux.at[-1].set(snow_sedi[-1] * air_density[-1] * layer_thickness[-1])
-    
-    # Surface precipitation
-    precip_rain = rain_flux[-1]
-    precip_snow = snow_flux[-1]
+    # Surface precipitation: column-integrated rain/snow production
+    # Following ECHAM mo_cloud.f90: zzdrr = zrpr * pmref / pdtime
+    # where pmref = air_density * layer_thickness (layer mass per unit area)
+    layer_mass = air_density * layer_thickness  # kg/m²
+
+    # Rain production per level: autoconversion + accretion + snow melting
+    rain_prod = (qc_auto + qc_accr + snow_melt) * cloud_fraction
+    # Snow production per level: ice autoconversion + aggregation + riming + rain freezing
+    snow_prod = (qi_auto + qi_aggr + qc_rime + rain_freeze) * cloud_fraction
+
+    # Column-integrated surface flux (kg/m²/s)
+    precip_rain = jnp.sum(rain_prod * layer_mass)
+    precip_snow = jnp.sum(snow_prod * layer_mass)
+
+    rain_flux = rain_prod * layer_mass
+    snow_flux = snow_prod * layer_mass
     
     # Create output structures
     tendencies = MicrophysicsTendencies(

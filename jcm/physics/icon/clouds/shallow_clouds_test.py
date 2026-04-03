@@ -274,8 +274,6 @@ class TestShallowCloudScheme:
         assert jnp.max(jnp.abs(tendencies.dtedt)) < 2e-3  # < ~200 K/day max
         assert jnp.all(jnp.abs(tendencies.dqdt) < 1e-6)   # < ~0.1 g/kg/day
         assert jnp.all(state.cloud_fraction < 0.1)
-        assert tendencies.rain_flux < 1e-6
-        assert tendencies.snow_flux < 1e-6
     
     def test_cloudy_conditions(self):
         """Test scheme with existing clouds"""
@@ -311,28 +309,32 @@ class TestShallowCloudScheme:
         assert jnp.all(jnp.abs(tendencies.dtedt) < 1e-3)  # < ~100 K/day
         assert jnp.all(jnp.abs(tendencies.dqdt) < 1e-5)   # < ~1 g/kg/day
     
-    def test_precipitation_formation(self):
-        """Test precipitation formation from thick clouds"""
+    def test_condensation_updates_cloud_water(self):
+        """Test that condensation updates cloud water within the call.
+
+        Precipitation is now handled by microphysics (called after clouds),
+        but the cloud scheme must produce updated cloud_water for microphysics.
+        """
         config = CloudParameters.default()
-        
-        # Create profile with thick clouds
+
+        # Supersaturated single-level profile
         temperature = jnp.array(280.0)
         pressure = jnp.array(90000.0)
-        specific_humidity = jnp.array(0.008)
-        cloud_water = jnp.array(0.002)  # 2 g/kg - above autoconversion threshold
-        cloud_ice = jnp.array(0.0001)   # Small amount of ice
+        qs = saturation_specific_humidity(pressure, temperature)
+        specific_humidity = jnp.array(float(1.05 * qs))  # 105% RH
+        cloud_water = jnp.array(0.0)
+        cloud_ice = jnp.array(0.0)
         surface_pressure = 100000.0
         dt = 1800.0
-        
+
         tendencies, state = shallow_cloud_scheme(
             temperature, specific_humidity, pressure,
             cloud_water, cloud_ice, surface_pressure, dt, config
         )
-        
-        # Should produce precipitation
-        assert tendencies.rain_flux > 0.0
-        # Check net tendency - condensation may offset precipitation
-        assert tendencies.dqcdt[0] < 1e-6  # Should be small or negative
+
+        # Cloud water should be updated with condensation
+        assert state.cloud_water[0] > 0.0, \
+            "Cloud water should increase from condensation"
     
     def test_jax_transformations(self):
         """Test JAX transformations work correctly"""
@@ -352,11 +354,11 @@ class TestShallowCloudScheme:
         
         t, q, p, qc, qi = create_profile()
         tendencies, state = jitted_scheme(t, q, p, qc, qi, 100000.0, 1800.0, config)
-        
+
         # Should produce valid output
         assert tendencies.dtedt.shape == t.shape
         assert state.cloud_fraction.shape == t.shape
-        
+
         # Test gradient computation
         def loss_fn(temperature):
             t, q, p, qc, qi = create_profile()
@@ -369,6 +371,144 @@ class TestShallowCloudScheme:
         # Should produce valid gradients
         assert grad.shape == t.shape
         assert jnp.all(jnp.isfinite(grad))
+
+
+class TestCondensationToCloudWater:
+    """Tests for within-timestep condensation updating cloud water.
+
+    The cloud scheme must produce non-zero cloud water from supersaturation
+    even when initial qc/qi are zero, so that microphysics (called next)
+    can convert it to precipitation.
+    """
+
+    def test_supersaturated_column_produces_cloud_water(self):
+        """A supersaturated column must produce non-zero cloud water.
+
+        This is the key regression test: with cloud_water=0 but RH > 100%,
+        the scheme must condense moisture into cloud water within the call.
+        """
+        config = CloudParameters.default()
+        nlev = 20
+        pressure = jnp.linspace(100000, 20000, nlev)
+        temperature = jnp.linspace(290, 220, nlev)
+
+        qs = jax.vmap(saturation_specific_humidity)(pressure, temperature)
+        specific_humidity = jnp.where(pressure > 60000, 1.05 * qs, 0.3 * qs)
+
+        cloud_water = jnp.zeros(nlev)
+        cloud_ice = jnp.zeros(nlev)
+
+        tendencies, state = shallow_cloud_scheme(
+            temperature, specific_humidity, pressure,
+            cloud_water, cloud_ice, 100000.0, 1800.0, config
+        )
+
+        # Cloud water should be updated with condensation
+        assert jnp.max(state.cloud_water) > 0.0, \
+            f"Cloud water should be > 0 for supersaturated column, got {float(jnp.max(state.cloud_water)):.6e}"
+
+    def test_subsaturated_column_no_cloud_water(self):
+        """A dry subsaturated column with no initial cloud water stays dry."""
+        config = CloudParameters.default()
+        nlev = 20
+        pressure = jnp.linspace(100000, 20000, nlev)
+        temperature = jnp.linspace(290, 220, nlev)
+
+        qs = jax.vmap(saturation_specific_humidity)(pressure, temperature)
+        specific_humidity = 0.3 * qs
+
+        cloud_water = jnp.zeros(nlev)
+        cloud_ice = jnp.zeros(nlev)
+
+        tendencies, state = shallow_cloud_scheme(
+            temperature, specific_humidity, pressure,
+            cloud_water, cloud_ice, 100000.0, 1800.0, config
+        )
+
+        assert jnp.allclose(state.cloud_water, 0.0), \
+            "Cloud water should remain 0 for dry column"
+        assert jnp.allclose(state.cloud_ice, 0.0), \
+            "Cloud ice should remain 0 for dry column"
+
+    def test_cold_supersaturated_column_produces_cloud_ice(self):
+        """A cold supersaturated column should produce cloud ice."""
+        config = CloudParameters.default()
+        nlev = 10
+        pressure = jnp.linspace(50000, 20000, nlev)
+        temperature = jnp.full(nlev, 240.0)  # Below freezing
+
+        qs = jax.vmap(saturation_specific_humidity)(pressure, temperature)
+        specific_humidity = 1.1 * qs
+
+        cloud_water = jnp.zeros(nlev)
+        cloud_ice = jnp.zeros(nlev)
+
+        tendencies, state = shallow_cloud_scheme(
+            temperature, specific_humidity, pressure,
+            cloud_water, cloud_ice, 50000.0, 1800.0, config
+        )
+
+        assert jnp.max(state.cloud_ice) > 0.0, \
+            f"Cloud ice should be > 0 for cold supersaturated column, got {float(jnp.max(state.cloud_ice)):.6e}"
+
+
+class TestAerosolPrecipitationCoupling:
+    """Test that aerosol CDNC affects precipitation through autoconversion."""
+
+    def _run_column(self, cdnc_value):
+        """Run the combined cloud+microphysics column with given CDNC."""
+        from ..clouds.cloud_microphysics import MicrophysicsParameters
+        from ..icon_physics import _cloud_and_microphysics_column
+        from ..constants.physical_constants import rd
+
+        nlev = 20
+        pressure = jnp.linspace(100000, 20000, nlev)
+        temperature = jnp.linspace(290, 220, nlev)
+
+        # Supersaturated in lower troposphere to generate cloud water
+        qs = jax.vmap(saturation_specific_humidity)(pressure, temperature)
+        specific_humidity = jnp.where(pressure > 60000, 1.05 * qs, 0.3 * qs)
+
+        qc = jnp.zeros(nlev)
+        qi = jnp.zeros(nlev)
+        rho = pressure / (rd * temperature)
+        dz = jnp.full(nlev, 500.0)
+        # CDNC in 1/kg as expected by microphysics
+        droplet_number = jnp.full(nlev, cdnc_value) / rho
+
+        cloud_config = CloudParameters.default()
+        micro_config = MicrophysicsParameters.default()
+
+        cloud_tend, cloud_state, micro_tend, micro_state = _cloud_and_microphysics_column(
+            temperature, specific_humidity, pressure, qc, qi,
+            100000.0, rho, dz, droplet_number,
+            1800.0, cloud_config, micro_config
+        )
+
+        return micro_state.precip_rain, micro_state.precip_snow
+
+    def test_higher_cdnc_reduces_precipitation(self):
+        """Higher CDNC should suppress autoconversion and reduce precipitation.
+
+        This is the Twomey/Albrecht second indirect effect: more droplets
+        means smaller droplets, slower coalescence, less rain.
+        """
+        precip_clean, _ = self._run_column(cdnc_value=50e6)    # 50 per cm³
+        precip_polluted, _ = self._run_column(cdnc_value=500e6)  # 500 per cm³
+
+        assert precip_clean > 0.0, \
+            f"Clean-air precipitation should be > 0, got {float(precip_clean):.6e}"
+        assert precip_polluted >= 0.0, \
+            f"Polluted precipitation should be >= 0, got {float(precip_polluted):.6e}"
+        assert precip_clean > precip_polluted, \
+            f"Higher CDNC should reduce precipitation: clean={float(precip_clean):.6e} vs polluted={float(precip_polluted):.6e}"
+
+    def test_zero_cdnc_still_produces_precipitation(self):
+        """Even with very low CDNC, precipitation should be finite (not NaN)."""
+        precip, snow = self._run_column(cdnc_value=10e6)  # Very clean air
+
+        assert jnp.isfinite(precip), f"Precipitation should be finite, got {float(precip)}"
+        assert jnp.isfinite(snow), f"Snow should be finite, got {float(snow)}"
 
 
 if __name__ == "__main__":
