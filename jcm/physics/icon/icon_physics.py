@@ -35,7 +35,7 @@ from jcm.physics.icon.forcing import apply_forcing_data
 
 class IconPhysics(Physics):
     """ICON atmospheric physics implementation for JAX-GCM
-    
+
     This class implements the ICON physics suite including:
     - Radiation (shortwave and longwave)
     - Convection (Tiedtke-Nordeng scheme)
@@ -45,23 +45,20 @@ class IconPhysics(Physics):
     - Gravity wave drag
     - Simple chemistry schemes
     """
-    
+
     def __init__(self,
                  write_output: bool = True,
                  checkpoint_terms: bool = True,
                  parameters: Optional[Parameters] = None,
-                 dt_physics: Optional[float] = None,
                  radiation_scheme: str = "grey"):
         """Initialize the ICON physics.
 
         Args:
             write_output: Whether to write physics output to predictions
             checkpoint_terms: Whether to checkpoint physics terms
-            parameters: Optional physics parameters (uses defaults if None)
-            dt_physics: Physics timestep in seconds. If provided, overrides
-                all internal physics timesteps (dt_conv, dt_rad, etc.) to match
-                the model integration timestep. This is important since we don't
-                have sub-timestepping - all physics must use the same timestep.
+            parameters: Optional physics parameters (uses defaults if None).
+                Set ``radiation_interval`` on the radiation parameters to
+                control sub-stepping (e.g. 7200 s for 2-hourly radiation).
             radiation_scheme: Which radiation scheme to use. Either "grey"
                 (default simplified multi-band scheme) or "rrtmgp" (requires
                 jax-rrtmgp package).
@@ -69,12 +66,7 @@ class IconPhysics(Physics):
         """
         self.write_output = write_output
         self.checkpoint_terms = checkpoint_terms
-
-        # Store parameters, optionally updating timesteps
-        params = parameters or Parameters.default()
-        if dt_physics is not None:
-            params = params.with_timestep(dt_physics)
-        self.parameters = params
+        self.parameters = parameters or Parameters.default()
 
         # Cached coordinate data (populated by cache_coords)
         self.cached_coords = None
@@ -108,12 +100,26 @@ class IconPhysics(Physics):
         """Cache coordinate system data needed by ICON physics."""
         self.cached_coords = IconCoords.from_coordinate_system(coords)
 
+    def get_empty_data(self, coords: CoordinateSystem) -> PhysicsData:
+        """Return a zeroed PhysicsData for diagnostics accumulation."""
+        from jax.tree_util import tree_map
+        nodal_shape = self.cached_coords.nodal_shape
+        empty = PhysicsData.zeros(
+            (nodal_shape[1] * nodal_shape[2],),
+            nodal_shape[0],
+            icon_coords=self.cached_coords,
+        )
+        return tree_map(jnp.zeros_like, empty).copy(
+            icon_coords=self.cached_coords
+        )
+
     def compute_tendencies(
         self,
         state: PhysicsState,
         forcing: ForcingData,
         terrain: TerrainData,
         date: DateData,
+        prev_physics_data=None,
     ) -> Tuple[PhysicsTendency, PhysicsData]:
         """Compute the physical tendencies given the current state and data structs. Loops through the ICON physics terms, accumulating the tendencies.
 
@@ -122,6 +128,9 @@ class IconPhysics(Physics):
             forcing: Forcing data
             terrain: Terrain data (boundary conditions)
             date: Date data
+            prev_physics_data: Previous step's PhysicsData for caching
+                (e.g. radiation tendencies). None on first step or when
+                caching is not active.
 
         Returns:
             Physical tendencies in PhysicsTendency format
@@ -136,6 +145,11 @@ class IconPhysics(Physics):
             icon_coords=self.cached_coords,
             date=date
         )
+
+        # Carry forward radiation data from previous step (cached tendencies
+        # and fluxes used by downstream terms like surface physics).
+        if prev_physics_data is not None:
+            physics_data = physics_data.copy(radiation=prev_physics_data.radiation)
 
         # Initialize zero tendencies with tracer tendencies
         tracer_tends = {name: jnp.zeros_like(tracer) for name, tracer in state.tracers.items()}
@@ -636,14 +650,86 @@ def _prepare_common_physics_state(
     return zero_tendencies, updated_physics_data
 
 # Physics term methods
+
+
+def _radiation_with_caching(
+    radiation_fn,
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData,
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """Wrap a radiation term with sub-stepping via ``jax.lax.cond``.
+
+    On radiation steps the full scheme runs; on other steps the cached
+    heating rates from ``physics_data.radiation`` are reused.
+    """
+    nlev, ncols = state.temperature.shape
+    interval = parameters.radiation.radiation_interval
+    dt = physics_data.date.dt_seconds
+    step = physics_data.date.model_step
+
+    # interval <= 0 ⇒ compute every step (default)
+    steps_per_call = jnp.where(
+        interval > 0, jnp.int32(jnp.round(interval / dt)), jnp.int32(1)
+    )
+    should_compute = jnp.mod(step, steps_per_call) == 0
+
+    def _compute():
+        return radiation_fn(state, physics_data, parameters, forcing, terrain)
+
+    def _use_cached():
+        cached_tend = PhysicsTendency(
+            u_wind=jnp.zeros((nlev, ncols)),
+            v_wind=jnp.zeros((nlev, ncols)),
+            temperature=(
+                physics_data.radiation.sw_heating_rate
+                + physics_data.radiation.lw_heating_rate
+            ),
+            specific_humidity=jnp.zeros((nlev, ncols)),
+            tracers={},
+        )
+        return cached_tend, physics_data
+
+    return jax.lax.cond(should_compute, _compute, _use_cached)
+
+
+def apply_radiation(
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData,
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """Grey radiation with sub-stepping."""
+    return _radiation_with_caching(
+        _apply_radiation_inner, state, physics_data, parameters, forcing, terrain
+    )
+
+
+def apply_radiation_rrtmgp(
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData,
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """RRTMGP radiation with sub-stepping."""
+    return _radiation_with_caching(
+        _apply_radiation_rrtmgp_inner,
+        state, physics_data, parameters, forcing, terrain,
+    )
+
+
 @jit
-def apply_radiation(state: PhysicsState,
+def _apply_radiation_inner(state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
     forcing: ForcingData,
     terrain: TerrainData
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """Apply radiation heating rates"""
+    """Apply grey radiation heating rates."""
     # Note: state is already in 2D format [nlev, ncols] from compute_tendencies
     nlev, ncols = state.temperature.shape
     
@@ -725,11 +811,11 @@ def apply_radiation(state: PhysicsState,
         surface_albedo_vis=diagnostics_vmapped.surface_albedo_vis,
         surface_albedo_nir=diagnostics_vmapped.surface_albedo_nir,
         surface_emissivity=diagnostics_vmapped.surface_emissivity,
-        sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2),  # [ncols, nlev+1, nbands] -> [nlev+1, ncols, nbands]
-        sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2),
+        sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2).sum(axis=-1),  # [nlev+1, ncols] (summed over bands)
+        sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2).sum(axis=-1),
         sw_heating_rate=tendencies_vmapped.shortwave_heating.T,  # [ncols, nlev] -> [nlev, ncols]
-        lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2),
-        lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2),
+        lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2).sum(axis=-1),
+        lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2).sum(axis=-1),
         lw_heating_rate=tendencies_vmapped.longwave_heating.T,  # [ncols, nlev] -> [nlev, ncols]
         surface_sw_down=diagnostics_vmapped.surface_sw_down,  # Already [ncols]
         surface_lw_down=diagnostics_vmapped.surface_lw_down,
@@ -746,19 +832,14 @@ def apply_radiation(state: PhysicsState,
 
 
 @jit
-def apply_radiation_rrtmgp(
+def _apply_radiation_rrtmgp_inner(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
     forcing: ForcingData,
     terrain: TerrainData
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """Apply RRTMGP radiation heating rates.
-
-    Drop-in replacement for ``apply_radiation`` that calls the RRTMGP
-    radiation scheme instead of the grey/simplified scheme.  The input
-    preparation and output post-processing are identical.
-    """
+    """Apply RRTMGP radiation heating rates (inner, always-compute version)."""
     from jcm.physics.icon.radiation.radiation_scheme_rrtmgp import (
         radiation_scheme_rrtmgp,
     )
@@ -837,11 +918,11 @@ def apply_radiation_rrtmgp(
         surface_albedo_vis=diagnostics_vmapped.surface_albedo_vis,
         surface_albedo_nir=diagnostics_vmapped.surface_albedo_nir,
         surface_emissivity=diagnostics_vmapped.surface_emissivity,
-        sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2),
-        sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2),
+        sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2).sum(axis=-1),
+        sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2).sum(axis=-1),
         sw_heating_rate=tendencies_vmapped.shortwave_heating.T,
-        lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2),
-        lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2),
+        lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2).sum(axis=-1),
+        lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2).sum(axis=-1),
         lw_heating_rate=tendencies_vmapped.longwave_heating.T,
         surface_sw_down=diagnostics_vmapped.surface_sw_down,
         surface_lw_down=diagnostics_vmapped.surface_lw_down,
