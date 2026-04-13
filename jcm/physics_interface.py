@@ -9,14 +9,17 @@ import tree_math
 from dinosaur import scales
 from dinosaur.scales import units
 from dinosaur.spherical_harmonic import vor_div_to_uv_nodal, uv_nodal_to_vor_div_modal
-from dinosaur.primitive_equations import get_geopotential, compute_diagnostic_state, State, PrimitiveEquations
+from dinosaur.primitive_equations import (
+    compute_diagnostic_state, State, PrimitiveEquations,
+    get_geopotential_on_sigma, get_geopotential_diff_hybrid,
+)
 from dinosaur.coordinate_systems import CoordinateSystem
 from dinosaur.filtering import horizontal_diffusion_filter
 from jax import tree_util
 from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
 from jcm.date import DateData
-from typing import Tuple, Any
+from typing import Tuple, Any, Dict
 from jcm.diffusion import DiffusionFilter
 import logging
 
@@ -30,37 +33,51 @@ class PhysicsState:
     specific_humidity: jnp.ndarray
     geopotential: jnp.ndarray
     normalized_surface_pressure: jnp.ndarray # Normalized by global mean sea level pressure
+    tracers: Dict[str, jnp.ndarray]  # Additional tracers beyond specific_humidity
+
+    def __init__(self, u_wind, v_wind, temperature, specific_humidity, geopotential, normalized_surface_pressure, tracers=None):
+        """Initialize PhysicsState with atmospheric variables."""
+        self.u_wind = u_wind
+        self.v_wind = v_wind
+        self.temperature = temperature
+        self.specific_humidity = specific_humidity
+        self.geopotential = geopotential
+        self.normalized_surface_pressure = normalized_surface_pressure
+        self.tracers = tracers if tracers is not None else {}
 
     @classmethod
-    def zeros(cls, shape, u_wind=None, v_wind=None, temperature=None, specific_humidity=None, geopotential=None, normalized_surface_pressure=None):
+    def zeros(cls, shape, u_wind=None, v_wind=None, temperature=None, specific_humidity=None, geopotential=None, normalized_surface_pressure=None, tracers=None):
         return cls(
             u_wind if u_wind is not None else jnp.zeros(shape),
             v_wind if v_wind is not None else jnp.zeros(shape),
             temperature if temperature is not None else jnp.zeros(shape),
             specific_humidity if specific_humidity is not None else jnp.zeros(shape),
             geopotential if geopotential is not None else jnp.zeros(shape),
-            normalized_surface_pressure if normalized_surface_pressure is not None else jnp.zeros(shape[1:])
+            normalized_surface_pressure if normalized_surface_pressure is not None else jnp.zeros(shape[1:]),
+            tracers if tracers is not None else {}
         )
 
     @classmethod
-    def ones(cls, shape, u_wind=None, v_wind=None, temperature=None, specific_humidity=None, geopotential=None, normalized_surface_pressure=None):
+    def ones(cls, shape, u_wind=None, v_wind=None, temperature=None, specific_humidity=None, geopotential=None, normalized_surface_pressure=None, tracers=None):
         return cls(
             u_wind if u_wind is not None else jnp.ones(shape),
             v_wind if v_wind is not None else jnp.ones(shape),
             temperature if temperature is not None else jnp.ones(shape),
             specific_humidity if specific_humidity is not None else jnp.ones(shape),
             geopotential if geopotential is not None else jnp.ones(shape),
-            normalized_surface_pressure if normalized_surface_pressure is not None else jnp.ones(shape[1:])
+            normalized_surface_pressure if normalized_surface_pressure is not None else jnp.ones(shape[1:]),
+            tracers if tracers is not None else {}
         )
 
-    def copy(self,u_wind=None,v_wind=None,temperature=None,specific_humidity=None,geopotential=None,normalized_surface_pressure=None):
+    def copy(self,u_wind=None,v_wind=None,temperature=None,specific_humidity=None,geopotential=None,normalized_surface_pressure=None,tracers=None):
         return PhysicsState(
             u_wind if u_wind is not None else self.u_wind,
             v_wind if v_wind is not None else self.v_wind,
             temperature if temperature is not None else self.temperature,
             specific_humidity if specific_humidity is not None else self.specific_humidity,
             geopotential if geopotential is not None else self.geopotential,
-            normalized_surface_pressure if normalized_surface_pressure is not None else self.normalized_surface_pressure
+            normalized_surface_pressure if normalized_surface_pressure is not None else self.normalized_surface_pressure,
+            tracers if tracers is not None else self.tracers
         )
 
     def isnan(self):
@@ -95,31 +112,43 @@ class PhysicsTendency:
     v_wind: jnp.ndarray
     temperature: jnp.ndarray
     specific_humidity: jnp.ndarray
+    tracers: Dict[str, jnp.ndarray]  # Tendencies for additional tracers
+
+    def __init__(self, u_wind, v_wind, temperature, specific_humidity, tracers=None):
+        """Initialize PhysicsTendency with tendency fields."""
+        self.u_wind = u_wind
+        self.v_wind = v_wind
+        self.temperature = temperature
+        self.specific_humidity = specific_humidity
+        self.tracers = tracers if tracers is not None else {}
 
     @classmethod
-    def zeros(cls,shape,u_wind=None,v_wind=None,temperature=None,specific_humidity=None):
+    def zeros(cls,shape,u_wind=None,v_wind=None,temperature=None,specific_humidity=None,tracers=None):
         return cls(
             u_wind if u_wind is not None else jnp.zeros(shape),
             v_wind if v_wind is not None else jnp.zeros(shape),
             temperature if temperature is not None else jnp.zeros(shape),
-            specific_humidity if specific_humidity is not None else jnp.zeros(shape)
+            specific_humidity if specific_humidity is not None else jnp.zeros(shape),
+            tracers if tracers is not None else {}
         )
 
     @classmethod
-    def ones(cls,shape,u_wind=None,v_wind=None,temperature=None,specific_humidity=None):
+    def ones(cls,shape,u_wind=None,v_wind=None,temperature=None,specific_humidity=None,tracers=None):
         return cls(
             u_wind if u_wind is not None else jnp.ones(shape),
             v_wind if v_wind is not None else jnp.ones(shape),
             temperature if temperature is not None else jnp.ones(shape),
-            specific_humidity if specific_humidity is not None else jnp.ones(shape)
+            specific_humidity if specific_humidity is not None else jnp.ones(shape),
+            tracers if tracers is not None else {}
         )
 
-    def copy(self,u_wind=None,v_wind=None,temperature=None,specific_humidity=None):
+    def copy(self,u_wind=None,v_wind=None,temperature=None,specific_humidity=None,tracers=None):
         return PhysicsTendency(
             u_wind if u_wind is not None else self.u_wind,
             v_wind if v_wind is not None else self.v_wind,
             temperature if temperature is not None else self.temperature,
-            specific_humidity if specific_humidity is not None else self.specific_humidity
+            specific_humidity if specific_humidity is not None else self.specific_humidity,
+            tracers if tracers is not None else self.tracers
         )
 
 PhysicsTendency.__doc__ = """Represents the tendencies (rates of change) of physical variables.
@@ -139,11 +168,12 @@ Attributes:
 
 class Physics:
     UNITS_TABLE_CSV_PATH = None
+    cached_coords = None
 
     def cache_coords(self, coords: CoordinateSystem):
         return None
 
-    def compute_tendencies(self, state: PhysicsState, forcing: ForcingData, terrain: TerrainData, date: DateData) -> Tuple[PhysicsTendency, Any]:
+    def compute_tendencies(self, state: PhysicsState, forcing: ForcingData, terrain: TerrainData, date: DateData, prev_physics_data=None) -> Tuple[PhysicsTendency, Any]:
         """Compute the physical tendencies given the current state and data structs.
 
         Args:
@@ -151,6 +181,8 @@ class Physics:
             forcing: Forcing data
             terrain: Terrain data (boundary conditions)
             date: Date data
+            prev_physics_data: Previous step's physics data for caching
+                expensive computations (e.g. radiation). None on first step.
 
         Returns:
             Physical tendencies in PhysicsTendency format
@@ -212,6 +244,7 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
         Physics state variables
 
     """
+    from dinosaur.hybrid_coordinates import HybridCoordinates
     jax.debug.callback(lambda: logger.debug("Converting state variables from dynamics to physics state variables"))
     # Calculate u and v from vorticity and divergence
     u, v = vor_div_to_uv_nodal(dynamics.coords.horizontal, state.vorticity, state.divergence)
@@ -221,23 +254,48 @@ def dynamics_state_to_physics_state(state: State, dynamics: PrimitiveEquations) 
     t = nodal_state.temperature_variation
     q = nodal_state.tracers['specific_humidity']
 
-    phi_spectral = get_geopotential(
-        state.temperature_variation,
-        dynamics.reference_temperature,
-        dynamics.orography,
-        dynamics.coords.vertical,
-        dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION),
-        dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
-    )
+    # Compute geopotential - different approaches for sigma vs hybrid coordinates
+    nodal_orography = dynamics.coords.horizontal.to_nodal(dynamics.orography)
 
-    phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
+    if isinstance(dynamics.coords.vertical, HybridCoordinates):
+        # For hybrid coordinates, compute geopotential difference then add orography
+        spectral_temperature_variation = dynamics.coords.horizontal.to_modal(nodal_state.temperature_variation)
+        phi_spectral_diff = get_geopotential_diff_hybrid(
+            temperature=spectral_temperature_variation,
+            coordinates=dynamics.coords.vertical,
+            ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
+            p_surface=dynamics.p_s_ref,
+            method='dense',
+            sharding=None
+        )
+        phi_spectral = phi_spectral_diff + dynamics.orography[jnp.newaxis, :, :] * dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION)
+        phi = dynamics.coords.horizontal.to_nodal(phi_spectral)
+    else:
+        # For sigma coordinates, use the full geopotential calculation in nodal space
+        full_temperature = nodal_state.temperature_variation + dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
+        phi = get_geopotential_on_sigma(
+            temperature=full_temperature,
+            specific_humidity=None,
+            nodal_orography=nodal_orography,
+            sigma=dynamics.coords.vertical,
+            gravity_acceleration=dynamics.physics_specs.nondimensionalize(scales.GRAVITY_ACCELERATION),
+            ideal_gas_constant=dynamics.physics_specs.nondimensionalize(scales.IDEAL_GAS_CONSTANT),
+            sharding=None
+        )
+
     log_sp = dynamics.coords.horizontal.to_nodal(state.log_surface_pressure)
     sp = jnp.exp(log_sp)
 
     t += dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
     q = dynamics.physics_specs.dimensionalize(q, units.gram / units.kilogram).m
 
-    return PhysicsState(u, v, t, q, phi, jnp.squeeze(sp, axis=-3))
+    # Extract all tracers from the nodal state (except specific_humidity which is handled separately)
+    all_tracers = {}
+    for tracer_name, tracer_value in nodal_state.tracers.items():
+        if tracer_name != 'specific_humidity':
+            all_tracers[tracer_name] = dynamics.physics_specs.dimensionalize(tracer_value, units.gram / units.kilogram).m
+
+    return PhysicsState(u, v, t, q, phi, jnp.squeeze(sp, axis=-3), all_tracers)
 
 def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: PrimitiveEquations) -> State:
     """Convert state variables from the physics (nodal space) back to the dynamical core (spectral space).
@@ -267,12 +325,18 @@ def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: Primi
     log_surface_pressure = jnp.log(physics_state.normalized_surface_pressure)
     modal_log_sp = dynamics.coords.horizontal.to_modal(log_surface_pressure)
 
+    # Convert all tracers to modal
+    tracers_modal = {'specific_humidity': q_modal}
+    for tracer_name, tracer_value in physics_state.tracers.items():
+        tracer_nd = dynamics.physics_specs.nondimensionalize(tracer_value * units.gram / units.kilogram)
+        tracers_modal[tracer_name] = dynamics.coords.horizontal.to_modal(tracer_nd)
+
     return State(
         vorticity=modal_vorticity,
         divergence=modal_divergence,
         temperature_variation=temperature_modal, # does this need to be referenced to ref_temp ?
         log_surface_pressure=modal_log_sp[..., jnp.newaxis, :, :], # Dinosaur expects log_sp to have a vertical dimension
-        tracers={'specific_humidity': q_modal}
+        tracers=tracers_modal
     )
 
 def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dynamics: PrimitiveEquations) -> State:
@@ -299,6 +363,12 @@ def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dyn
     
     log_sp_tend_modal = jnp.zeros_like(t_tend_modal[0, ...])
 
+    # Convert all tracer tendencies to modal
+    tracers_tend_modal = {'specific_humidity': q_tend_modal}
+    for tracer_name, tracer_tend in physics_tendency.tracers.items():
+        tracer_tend_nd = dynamics.physics_specs.nondimensionalize(tracer_tend * units.gram / units.kilogram / units.second)
+        tracers_tend_modal[tracer_name] = dynamics.coords.horizontal.to_modal(tracer_tend_nd)
+
     # Create a new state object with the updated tendencies (which will be added to the current state)
     dynamics_tendency = State(
         vor_tend_modal,
@@ -306,7 +376,7 @@ def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dyn
         t_tend_modal,
         log_sp_tend_modal,
         sim_time=0.,
-        tracers={'specific_humidity': q_tend_modal}
+        tracers=tracers_tend_modal
     )
     return dynamics_tendency
 
@@ -379,7 +449,21 @@ def get_physical_tendencies(
     physics_state = dynamics_state_to_physics_state(state, dynamics)
 
     clamped_physics_state = verify_state(physics_state)
-    physics_tendency, physics_data = physics.compute_tendencies(clamped_physics_state, forcing, terrain, date)
+
+    # Retrieve cached physics data from the collector (if available) so
+    # that expensive terms like radiation can reuse previous results.
+    prev_physics_data = None
+    if diagnostics_collector is not None and hasattr(diagnostics_collector, 'physics_data_cache'):
+        prev_physics_data = diagnostics_collector.physics_data_cache.value
+
+    physics_tendency, physics_data = physics.compute_tendencies(
+        clamped_physics_state, forcing, terrain, date,
+        prev_physics_data=prev_physics_data,
+    )
+
+    # Update the cache so the next timestep can reuse this data.
+    if diagnostics_collector is not None and hasattr(diagnostics_collector, 'physics_data_cache'):
+        diagnostics_collector.physics_data_cache.value = physics_data
 
     physics_tendency = verify_tendencies(physics_state, physics_tendency, time_step)
 

@@ -339,7 +339,9 @@ def clouds(operand):
     # Compute gradient of static energy: logic from physics.f90:147
     se = physics_data.convection.se
     phig = state.geopotential
-    gse = (se[-2] - se[-1])/(phig[-2] - phig[-1])
+    # Safety check to prevent division by zero (can happen during initialization)
+    dphi = phig[-2] - phig[-1]
+    gse = jnp.where(jnp.abs(dphi) > 1e-10, (se[-2] - se[-1])/dphi, 0.0)
 
     humidity = physics_data.humidity
     conv = physics_data.convection
