@@ -22,13 +22,21 @@ implemented as a separate JAX function that can be composed together.
 """
 
 from jcm.physics.icon.constants import physical_constants
-from jcm.physics.icon.icon_physics import IconPhysics
-from jcm.physics.icon.parameters import Parameters
-from jcm.physics.icon.diagnostics import wmo_tropopause
 
 __all__ = [
     'physical_constants',
-    'IconPhysics',
-    'Parameters',
-    'wmo_tropopause',
 ]
+
+
+def __getattr__(name):
+    """Lazy imports to avoid circular dependencies after reorganization."""
+    if name == "icon_physics":
+        from jcm.physics.icon.icon_terms import icon_physics
+        return icon_physics
+    if name == "Parameters":
+        from jcm.physics.icon.parameters import Parameters
+        return Parameters
+    if name == "wmo_tropopause":
+        from jcm.physics.diagnostics.wmo_tropopause import wmo_tropopause
+        return wmo_tropopause
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

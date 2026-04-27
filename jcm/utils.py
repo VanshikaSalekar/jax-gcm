@@ -56,7 +56,11 @@ def get_coords(
               jcm.physics.icon.icon_levels.get_icon_levels().
         spectral_truncation: Spectral truncation number (default 31)
         nodal_shape: Optional nodal shape (ix, il) to infer spectral_truncation
-        spmd_mesh: Optional SPMD mesh for parallelization
+        spmd_mesh: Optional tuple ``(x, y, z)`` describing the SPMD device mesh
+            for sharding (longitude, latitude, vertical). The product must equal
+            ``len(jax.devices())``. When set, a ``FastSphericalHarmonics`` implementation
+            is used; otherwise the model runs on a single device. This is the only
+            place to configure SPMD — ``Model`` consumes the sharding via ``coords``.
 
     Returns:
         CoordinateSystem object

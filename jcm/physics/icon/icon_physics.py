@@ -1,545 +1,32 @@
-"""Main ICON Physics class for JAX-GCM
+"""ICON physics term functions.
 
-This module contains the main IconPhysics class that orchestrates the 
-ICON atmospheric physics parameterizations. It follows the same pattern
-as SpeedyPhysics but implements the ICON physics suite.
-
-Date: 2025-01-09
+Standalone functions implementing the individual ICON parameterizations
+(``apply_radiation``, ``apply_convection``, etc.). These are wrapped by
+``ComposablePhysics`` term classes in ``icon_terms.py``; there is no
+monolithic orchestrator class — use ``icon_physics()`` from
+``icon_terms`` to build a composable ICON physics package.
 """
 
 import jax
 from jax import jit
 import jax.numpy as jnp
-from typing import Tuple, Optional
-from dinosaur.coordinate_systems import CoordinateSystem
-from jcm.physics_interface import PhysicsState, PhysicsTendency, Physics
+from jcm.physics_interface import PhysicsState, PhysicsTendency
 from jcm.forcing import ForcingData
 from jcm.terrain import TerrainData
-from jcm.date import DateData
 from jcm.physics.icon.constants import physical_constants
-from jcm.physics.icon.icon_coords import IconCoords
 
 # Import physics modules (will be implemented progressively)
-from jcm.physics.icon.radiation.radiation_scheme import radiation_scheme
+from jcm.physics.radiation.grey_two_stream.radiation_scheme import radiation_scheme
 from jcm.physics.icon.icon_physics_data import RadiationData
-from jcm.physics.icon.convection import tiedtke_nordeng_convection
-from jcm.physics.icon.clouds import shallow_cloud_scheme, cloud_microphysics
+from jcm.physics.convection.tiedtke_nordeng import tiedtke_nordeng_convection
+from jcm.physics.clouds.sundqvist import shallow_cloud_scheme
+from jcm.physics.clouds.echam_1m import cloud_microphysics
 from jcm.physics.icon.parameters import Parameters
-from jcm.physics.icon.surface import surface_physics_step, initialize_surface_state
-from jcm.physics.icon.surface.surface_types import AtmosphericForcing
-from jcm.physics.icon.gravity_waves import gravity_wave_drag
-from jcm.physics.icon.chemistry import simple_chemistry
-from jcm.physics.icon.aerosol.simple_aerosol import get_simple_aerosol
+from jcm.physics.surface.icon import surface_physics_step, initialize_surface_state
+from jcm.physics.surface.icon.surface_types import AtmosphericForcing
+from jcm.physics.gravity_waves.hines import gravity_wave_drag
+from jcm.physics.chemistry import simple_chemistry
 from jcm.physics.icon.icon_physics_data import PhysicsData
-from jcm.physics.icon.forcing import apply_forcing_data
-
-class IconPhysics(Physics):
-    """ICON atmospheric physics implementation for JAX-GCM
-
-    This class implements the ICON physics suite including:
-    - Radiation (shortwave and longwave)
-    - Convection (Tiedtke-Nordeng scheme)
-    - Large-scale cloud microphysics
-    - Vertical diffusion and boundary layer
-    - Surface fluxes and land model
-    - Gravity wave drag
-    - Simple chemistry schemes
-    """
-
-    def __init__(self,
-                 write_output: bool = True,
-                 checkpoint_terms: bool = True,
-                 parameters: Optional[Parameters] = None,
-                 radiation_scheme: str = "grey"):
-        """Initialize the ICON physics.
-
-        Args:
-            write_output: Whether to write physics output to predictions
-            checkpoint_terms: Whether to checkpoint physics terms
-            parameters: Optional physics parameters (uses defaults if None).
-                Set ``radiation_interval`` on the radiation parameters to
-                control sub-stepping (e.g. 7200 s for 2-hourly radiation).
-            radiation_scheme: Which radiation scheme to use. One of "grey"
-                (default simplified multi-band scheme), "rrtmgp" (requires
-                jax-rrtmgp package), or "emulated" (bidirectional GRU
-                neural network emulator — see ``nn_emulator`` module).
-
-        """
-        self.write_output = write_output
-        self.checkpoint_terms = checkpoint_terms
-        self.parameters = parameters or Parameters.default()
-
-        # Cached coordinate data (populated by cache_coords)
-        self.cached_coords = None
-
-        # Select radiation term based on scheme choice
-        if radiation_scheme == "rrtmgp":
-            rad_term = apply_radiation_rrtmgp
-        elif radiation_scheme == "grey":
-            rad_term = apply_radiation
-        elif radiation_scheme == "emulated":
-            rad_term = apply_radiation_emulated
-        else:
-            raise ValueError(
-                f"Unknown radiation_scheme={radiation_scheme!r}. "
-                "Choose 'grey', 'rrtmgp', or 'emulated'."
-            )
-
-        # Build list of physics terms
-        self.terms = [
-            _prepare_common_physics_state,
-            apply_forcing_data,             # Time-varying boundary conditions
-            get_simple_aerosol,            # Aerosol before radiation
-            apply_chemistry,               # Chemistry for ozone, methane etc.
-            rad_term,
-            apply_convection,
-            apply_clouds_and_microphysics,
-            apply_vertical_diffusion,
-            apply_surface,                 # Surface after radiation and vertical diffusion
-            apply_gravity_waves
-        ]
-    
-    def cache_coords(self, coords: CoordinateSystem):
-        """Cache coordinate system data needed by ICON physics."""
-        self.cached_coords = IconCoords.from_coordinate_system(coords)
-
-    def get_empty_data(self, coords: CoordinateSystem) -> PhysicsData:
-        """Return a zeroed PhysicsData for diagnostics accumulation."""
-        from jax.tree_util import tree_map
-        nodal_shape = self.cached_coords.nodal_shape
-        empty = PhysicsData.zeros(
-            (nodal_shape[1] * nodal_shape[2],),
-            nodal_shape[0],
-            icon_coords=self.cached_coords,
-        )
-        return tree_map(jnp.zeros_like, empty).copy(
-            icon_coords=self.cached_coords
-        )
-
-    def compute_tendencies(
-        self,
-        state: PhysicsState,
-        forcing: ForcingData,
-        terrain: TerrainData,
-        date: DateData,
-        prev_physics_data=None,
-    ) -> Tuple[PhysicsTendency, PhysicsData]:
-        """Compute the physical tendencies given the current state and data structs. Loops through the ICON physics terms, accumulating the tendencies.
-
-        Args:
-            state: Current state variables
-            forcing: Forcing data
-            terrain: Terrain data (boundary conditions)
-            date: Date data
-            prev_physics_data: Previous step's PhysicsData for caching
-                (e.g. radiation tendencies). None on first step or when
-                caching is not active.
-
-        Returns:
-            Physical tendencies in PhysicsTendency format
-            Object containing physics data (PhysicsData format)
-
-        """
-        nodal_shape = self.cached_coords.nodal_shape
-
-        physics_data = PhysicsData.zeros(
-            (nodal_shape[1]*nodal_shape[2], ),
-            nodal_shape[0],
-            icon_coords=self.cached_coords,
-            date=date
-        )
-
-        # Carry forward radiation data from previous step (cached tendencies
-        # and fluxes used by downstream terms like surface physics).
-        if prev_physics_data is not None:
-            physics_data = physics_data.copy(radiation=prev_physics_data.radiation)
-
-        # Initialize zero tendencies with tracer tendencies
-        tracer_tends = {name: jnp.zeros_like(tracer) for name, tracer in state.tracers.items()}
-        tendencies = PhysicsTendency.zeros(state.temperature.shape, tracers=tracer_tends)
-
-        # Get array dimensions for vectorization
-        nlev, nlon, nlat = state.temperature.shape  # Note: geometry uses (nlev, nlon, nlat) convention
-        ncols = nlat * nlon
-        
-        # OPTIMIZATION: Single reshape operation using tree_map for TPU efficiency
-        vectorized_state = self._reshape_state_to_columns(state, nlev, ncols)
-        
-        # OPTIMIZATION: Accumulate tendencies in column format for TPU efficiency
-        # Initialize column-format accumulators
-        accumulated_tendencies = self._initialize_column_tendencies(nlev, ncols, state.tracers)
-        
-        # Apply physics terms with column-based accumulation
-        for term in self.terms:
-            if self.checkpoint_terms:
-                term = jax.checkpoint(term)
-            
-            # Apply term to vectorized state (returns column format)
-            term_tendency, physics_data = term(
-                vectorized_state, physics_data, self.parameters, forcing, terrain
-            )
-            
-            # OPTIMIZATION: Direct accumulation in column format (no reshape)
-            accumulated_tendencies = self._accumulate_column_tendencies(
-                accumulated_tendencies, term_tendency
-            )
-        
-        # OPTIMIZATION: Single reshape to 3D only at the very end
-        tendencies = self._reshape_tendencies_to_3d(accumulated_tendencies, nlev, nlat, nlon)
-
-        return tendencies, physics_data
-    
-    def _reshape_state_to_columns(self, state: PhysicsState, nlev: int, ncols: int) -> PhysicsState:
-        """TPU-optimized reshape using single tree_map operation
-        
-        This creates one XLA operation instead of multiple reshapes, 
-        which is crucial for TPUv4 performance at T85 resolution.
-        """
-        def reshape_field(field):
-            if field.ndim == 3:  # [nlev, nlat, nlon] → [nlev, ncols]
-                return field.reshape(nlev, ncols)
-            elif field.ndim == 2:  # [nlat, nlon] → [ncols]
-                return field.reshape(ncols)
-            else:
-                return field  # Leave scalars unchanged
-        
-        # Single tree_map operation handles all main fields efficiently
-        reshaped_fields = jax.tree_util.tree_map(reshape_field, {
-            'u_wind': state.u_wind,
-            'v_wind': state.v_wind,
-            'temperature': state.temperature,
-            'specific_humidity': state.specific_humidity,
-            'geopotential': state.geopotential,
-            'normalized_surface_pressure': state.normalized_surface_pressure,
-        })
-        
-        # Handle tracers separately to maintain dict structure
-        vectorized_tracers = {
-            name: tracer.reshape(nlev, ncols) 
-            for name, tracer in state.tracers.items()
-        }
-        
-        return PhysicsState(
-            **reshaped_fields,
-            tracers=vectorized_tracers
-        )
-    
-    def _initialize_column_tendencies(self, nlev: int, ncols: int, tracers: dict) -> dict:
-        """Initialize tendency accumulators in column format
-        
-        Using dict avoids repeated PhysicsTendency object creation during accumulation
-        """
-        return {
-            'u_wind': jnp.zeros((nlev, ncols)),
-            'v_wind': jnp.zeros((nlev, ncols)),
-            'temperature': jnp.zeros((nlev, ncols)),
-            'specific_humidity': jnp.zeros((nlev, ncols)),
-            'tracers': {name: jnp.zeros((nlev, ncols)) for name in tracers.keys()}
-        }
-    
-    def _accumulate_column_tendencies(self, accumulated: dict, new_tendency: PhysicsTendency) -> dict:
-        """Efficiently accumulate tendencies in column format
-        
-        Avoids object creation and intermediate arrays for optimal TPU performance
-        """
-        return {
-            'u_wind': accumulated['u_wind'] + new_tendency.u_wind,
-            'v_wind': accumulated['v_wind'] + new_tendency.v_wind,
-            'temperature': accumulated['temperature'] + new_tendency.temperature,
-            'specific_humidity': accumulated['specific_humidity'] + new_tendency.specific_humidity,
-            'tracers': {
-                name: accumulated['tracers'][name] + new_tendency.tracers.get(name, 0.0)
-                for name in accumulated['tracers'].keys()
-            }
-        }
-    
-    def _reshape_tendencies_to_3d(self, tendencies: dict, nlev: int, nlat: int, nlon: int) -> PhysicsTendency:
-        """Reshape tendencies to 3D format as a single operation at the end.
-
-        This is the only reshape back to 3D, done once at the very end.
-        """
-        def reshape_to_3d(field):
-            if field.ndim == 2:  # [nlev, ncols] → [nlev, nlon, nlat]
-                return field.reshape(nlev, nlon, nlat)
-            else:
-                return field
-        
-        # Single tree_map for all main fields
-        reshaped_main = jax.tree_util.tree_map(reshape_to_3d, {
-            'u_wind': tendencies['u_wind'],
-            'v_wind': tendencies['v_wind'],
-            'temperature': tendencies['temperature'],
-            'specific_humidity': tendencies['specific_humidity'],
-        })
-        
-        # Reshape tracers
-        reshaped_tracers = {
-            name: field.reshape(nlev, nlon, nlat)
-            for name, field in tendencies['tracers'].items()
-        }
-        
-        return PhysicsTendency(
-            **reshaped_main,
-            tracers=reshaped_tracers
-        )
-    
-    def data_struct_to_dict(self, struct, nodal_shape=None, sep="."):
-        """Convert physics data struct to dictionary, reshaping column data to 3D.
-
-        This overrides the base class method to handle ICON physics data which
-        contains fields in column format that need reshaping for xarray output.
-        """
-        if struct is None:
-            return {}
-
-        nodal_shape = nodal_shape or self.cached_coords.nodal_shape
-
-        # Use a simple namespace to pass nodal_shape to helper methods
-        class _ShapeInfo:
-            pass
-        shape_info = _ShapeInfo()
-        shape_info.nodal_shape = nodal_shape
-
-        # Get the base struct conversion or handle manually if needed
-        result = self._get_base_struct_dict(struct, shape_info, sep)
-
-        # Reshape all arrays to add time dimension and convert column format to spatial grid
-        result = self._reshape_arrays_for_xarray(result, shape_info)
-
-        # Handle multi-channel arrays and filter problematic fields
-        result = self._process_multi_channel_arrays(result, shape_info)
-
-        # Filter out non-array and scalar fields
-        return self._filter_xarray_compatible_fields(result)
-    
-    def _get_base_struct_dict(self, struct, shape_info, sep):
-        """Get the base dictionary conversion, handling non-array fields gracefully."""
-        try:
-            return super().data_struct_to_dict(struct, nodal_shape=shape_info.nodal_shape, sep=sep)
-        except (AttributeError, ValueError):
-            # Handle case where some fields are not arrays (e.g. IconCoords.nodal_shape is a tuple)
-            return self._manual_struct_to_dict(struct, shape_info, sep)
-    
-    def _manual_struct_to_dict(self, struct, shape_info, sep):
-        """Manual conversion when base class fails."""
-        _skip_keys = {'icon_coords'}
-
-        def _to_dict_recursive(obj, parent_key=""):
-            items = {}
-            for key, val in obj.__dict__.items():
-                if key in _skip_keys:
-                    continue
-                new_key = f"{parent_key}{sep}{key}" if parent_key else key
-                if hasattr(val, "__dict__") and val.__dict__:
-                    items.update(_to_dict_recursive(val, parent_key=new_key))
-                else:
-                    items[new_key] = val
-            return items
-
-        result = _to_dict_recursive(struct)
-        nodal_shape = shape_info.nodal_shape
-
-        # Process array fields for multi-channel splitting (from base class)
-        _original_keys = list(result.keys())
-        for k in _original_keys:
-            val = result[k]
-            if hasattr(val, 'shape'):
-                s = val.shape
-                if len(s) == 5 and s[1:-1] == nodal_shape or len(s) == 4 and s[1:-1] == nodal_shape[1:]:
-                    result.update({f"{k}.{i}": result[k][..., i] for i in range(s[-1])})
-                    del result[k]
-
-        return result
-    
-    def _reshape_arrays_for_xarray(self, result, shape_info):
-        """Reshape arrays to add time dimension and handle column format."""
-        import numpy as np
-
-        nlev, nlon, nlat = shape_info.nodal_shape
-        ncols = nlon * nlat
-        
-        for key, value in list(result.items()):
-            if isinstance(value, (jnp.ndarray, np.ndarray)) and value.size > 1:
-                reshaped = self._reshape_single_array(value, nlev, nlon, nlat, ncols)
-                if reshaped is not None:
-                    result[key] = reshaped
-        
-        return result
-    
-    def _reshape_single_array(self, value, nlev, nlon, nlat, ncols):
-        """Reshape a single array based on its dimensions."""
-        # 1D arrays
-        if value.ndim == 1:
-            if value.shape[0] == ncols:
-                return value.reshape(1, nlon, nlat)
-            elif value.shape[0] != 1:
-                return value.reshape(1, *value.shape)
-        
-        # 2D arrays
-        elif value.ndim == 2:
-            return self._reshape_2d_array(value, nlev, nlon, nlat, ncols)
-        
-        # 3D arrays
-        elif value.ndim == 3:
-            return self._reshape_3d_array(value, nlev, nlon, nlat, ncols)
-        
-        # 4D arrays
-        elif value.ndim == 4:
-            return self._reshape_4d_array(value, nlev, nlon, nlat, ncols)
-        
-        return None
-    
-    def _reshape_2d_array(self, value, nlev, nlon, nlat, ncols):
-        """Reshape 2D arrays with various patterns."""
-        if value.shape[1] == 1 and value.shape[0] == ncols:
-            # [ncols, 1] -> [1, nlon, nlat]
-            return value.reshape(1, nlon, nlat)
-        elif value.shape == (nlev, ncols):
-            # [nlev, ncols] -> [1, nlev, nlon, nlat]
-            return value.reshape(1, nlev, nlon, nlat)
-        elif value.shape == (nlon, nlat):
-            # [nlon, nlat] -> [1, nlon, nlat]
-            return value.reshape(1, nlon, nlat)
-        elif value.shape[0] == nlev + 1 and value.shape[1] == ncols:
-            # [nlev+1, ncols] -> [1, nlev+1, nlon, nlat] (interfaces)
-            return value.reshape(1, nlev + 1, nlon, nlat)
-        elif value.shape[1] == ncols:
-            # [time, ncols] -> [time, nlon, nlat]
-            ntime = value.shape[0]
-            return value.reshape(ntime, nlon, nlat)
-        
-        return None
-    
-    def _reshape_3d_array(self, value, nlev, nlon, nlat, ncols):
-        """Reshape 3D arrays with various patterns."""
-        if value.shape == (nlev, ncols, value.shape[2]):
-            # [nlev, ncols, channels] -> [1, nlev, nlon, nlat, channels]
-            return value.reshape(1, nlev, nlon, nlat, value.shape[2])
-        elif value.shape == (nlev + 1, ncols, value.shape[2]):
-            # [nlev+1, ncols, channels] -> [1, nlev+1, nlon, nlat, channels]
-            return value.reshape(1, nlev + 1, nlon, nlat, value.shape[2])
-        elif value.shape[0] == nlev and value.shape[1] == nlon and value.shape[2] == nlat:
-            # [nlev, nlon, nlat] -> [1, nlev, nlon, nlat]
-            return value.reshape(1, nlev, nlon, nlat)
-        elif value.shape[1] == nlev and value.shape[2] == ncols:
-            # [time, nlev, ncols] -> [time, nlev, nlon, nlat]
-            ntime = value.shape[0]
-            return value.reshape(ntime, nlev, nlon, nlat)
-        elif value.shape[1] == nlev + 1 and value.shape[2] == ncols:
-            # [time, nlev+1, ncols] -> [time, nlev+1, nlon, nlat] (interfaces)
-            ntime = value.shape[0]
-            return value.reshape(ntime, nlev + 1, nlon, nlat)
-        
-        return None
-    
-    def _reshape_4d_array(self, value, nlev, nlon, nlat, ncols):
-        """Reshape 4D arrays with various patterns."""
-        if value.shape[1] == nlev and value.shape[2] == ncols:
-            # [time, nlev, ncols, channels] -> [time, nlev, nlon, nlat, channels]
-            ntime = value.shape[0]
-            nchannels = value.shape[3]
-            return value.reshape(ntime, nlev, nlon, nlat, nchannels)
-        elif value.shape[1] == nlev + 1 and value.shape[2] == ncols:
-            # [time, nlev+1, ncols, channels] -> [time, nlev+1, nlon, nlat, channels]
-            ntime = value.shape[0]
-            nchannels = value.shape[3]
-            return value.reshape(ntime, nlev + 1, nlon, nlat, nchannels)
-        
-        return None
-    
-    def _process_multi_channel_arrays(self, result, shape_info):
-        """Handle multi-channel arrays and filter problematic fields."""
-        nlev, nlon, nlat = shape_info.nodal_shape
-                
-        _original_keys = list(result.keys())
-        for k in _original_keys:
-            val = result[k]
-            if not hasattr(val, 'shape'):
-                continue
-                
-            s = val.shape
-            if len(s) == 5 and s[1:4] == (nlev, nlon, nlat):
-                # [time, nlev, nlon, nlat, channels] -> split into separate fields
-                result.update({f"{k}.{i}": result[k][..., i] for i in range(s[-1])})
-                del result[k]
-            elif len(s) == 5 and s[1:4] == (nlev + 1, nlon, nlat):
-                # Skip interface-level multi-channel arrays
-                print(f"Skipping interface-level multi-channel array: {k} with shape {s}")
-                del result[k]
-            elif len(s) == 4 and s[1:4] == (nlev + 1, nlon, nlat):
-                # Skip interface-level data
-                print(f"Skipping interface-level data: {k} with shape {s}")
-                del result[k]
-            elif len(s) == 2 and s[0] == 1:
-                # [1, ncols] -> skip single time dimension arrays
-                print(f"Skipping single time dimension array: {k} with shape {s}")
-                del result[k]
-            elif len(s) == 3 and s[1] == nlat*nlon:
-                # [time, ncols, channels] -> skip for now
-                print(f"Skipping [time, ncols, channels] array: {k} with shape {s}")
-                del result[k]
-        
-        return result
-    
-    def _filter_xarray_compatible_fields(self, result):
-        """Filter out fields that xarray/data_to_xarray doesn't handle well."""
-        nlev = self.cached_coords.nodal_shape[0]
-        filtered_result = {}
-        for key, value in result.items():
-            if not hasattr(value, 'shape'):
-                continue
-            if value.shape == ():
-                continue
-            if nlev + 1 in value.shape:
-                # Skip interface-level (half-level) fields
-                continue
-            filtered_result[key] = value
-
-        return filtered_result
-
-    def reshape_physics_data_to_3d(self, physics_data: PhysicsData, nodal_shape=None) -> PhysicsData:
-        """Reshape PhysicsData from column format to 3D nodal format for output.
-
-        This converts arrays from (ncols,) or (nlev, ncols) to (nlon, nlat) or (nlev, nlon, nlat)
-        respectively, making them suitable for plotting and analysis.
-
-        Args:
-            physics_data: PhysicsData in column format (ncols,) or (nlev, ncols)
-            nodal_shape: Tuple (nlev, nlon, nlat). If None, uses cached nodal_shape.
-
-        Returns:
-            PhysicsData with arrays reshaped to 3D nodal format
-
-        """
-        nodal_shape = nodal_shape or self.cached_coords.nodal_shape
-        nlev, nlon, nlat = nodal_shape
-        ncols = nlon * nlat
-
-        def reshape_array(arr):
-            """Reshape a single array based on its dimensions."""
-            if not isinstance(arr, jnp.ndarray):
-                return arr  # Return non-arrays unchanged
-
-            if arr.ndim == 1 and arr.shape[0] == ncols:
-                # (ncols,) -> (nlon, nlat)
-                return arr.reshape(nlon, nlat)
-            elif arr.ndim == 2 and arr.shape[1] == ncols:
-                # (nlev, ncols) -> (nlev, nlon, nlat)
-                return arr.reshape(arr.shape[0], nlon, nlat)
-            elif arr.ndim == 2 and arr.shape[0] == nlev and arr.shape[1] == ncols:
-                # Explicitly handle (nlev, ncols) -> (nlev, nlon, nlat)
-                return arr.reshape(nlev, nlon, nlat)
-            elif arr.ndim == 2 and arr.shape[0] == nlev + 1 and arr.shape[1] == ncols:
-                # Handle interface levels (nlev+1, ncols) -> (nlev+1, nlon, nlat)
-                return arr.reshape(nlev + 1, nlon, nlat)
-            else:
-                # Return unchanged if shape doesn't match expected patterns
-                return arr
-
-        # Use tree_map to reshape all arrays in the nested PhysicsData structure
-        reshaped_data = jax.tree_util.tree_map(reshape_array, physics_data)
-
-        return reshaped_data
 
 @jit
 def _prepare_common_physics_state(
@@ -836,7 +323,7 @@ def _apply_radiation_rrtmgp_inner(
     terrain: TerrainData
 ) -> tuple[PhysicsTendency, PhysicsData]:
     """Apply RRTMGP radiation heating rates (inner, always-compute version)."""
-    from jcm.physics.icon.radiation.radiation_scheme_rrtmgp import (
+    from jcm.physics.radiation.rrtmgp import (
         radiation_scheme_rrtmgp,
     )
 
@@ -946,7 +433,7 @@ def _apply_radiation_emulated_inner(
     Uses bidirectional GRU networks to predict SW and LW fluxes for each
     atmospheric column, then derives heating rates from flux divergence.
     """
-    from jcm.physics.icon.radiation.radiation_scheme_emulated import (
+    from jcm.physics.radiation.nn_emulator_scheme import (
         radiation_scheme_emulated,
     )
 
@@ -1083,7 +570,7 @@ def apply_convection(
     
     physics_tendencies = PhysicsTendency(
         u_wind=conv_tendencies_all.dudt.T,
-        v_wind=conv_tendencies_all.dvdt.T, 
+        v_wind=conv_tendencies_all.dvdt.T,
         temperature=conv_tendencies_all.dtedt.T,
         specific_humidity=conv_tendencies_all.dqdt.T,
         tracers={
@@ -1236,7 +723,7 @@ def apply_vertical_diffusion(
     wrapping a fake single-column vmap around it. Inputs to physics terms are
     ``(nlev, ncols)``; we transpose to ``(ncols, nlev)`` at the boundary.
     """
-    from jcm.physics.icon.vertical_diffusion import (
+    from jcm.physics.vertical_diffusion.tte_tke import (
         prepare_vertical_diffusion_state,
         vertical_diffusion_column,
     )
@@ -1324,9 +811,17 @@ def apply_vertical_diffusion(
         vdiff_diagnostics.exchange_coeff_momentum[:, -1:], nsfc_type, axis=1
     )  # (ncols, nsfc_type)
     
-    # Update TKE
+    # Update TKE — clip to a physically defensible range. Strong
+    # convective storms produce updraft-core TKE of ~50–100 m²/s²;
+    # values above ~250 are non-physical and indicate the implicit
+    # vdiff solver has gone unstable (which it does in the moist run
+    # within ~10 timesteps if left unconstrained — TKE then cascades
+    # through the exchange-coefficient back-reaction and NaNs the
+    # whole column on the next step). A hard upper cap is the cheapest
+    # safeguard that lets the rest of the physics step finish; the
+    # underlying TKE budget should be retuned separately.
     new_tke = tke + dt * tke_tend
-    new_tke = jnp.maximum(new_tke, 0.01)  # Minimum TKE
+    new_tke = jnp.clip(new_tke, 0.01, 250.0)
 
     # Create physics tendencies
     physics_tendencies = PhysicsTendency(
@@ -1511,9 +1006,19 @@ def apply_gravity_waves(
     height_levels = physics_data.diagnostics.height_full
     air_density = physics_data.diagnostics.air_density
     
-    # Need orography standard deviation - use a placeholder for now
-    # In a real implementation, this would come from boundary data
-    h_std = jnp.ones(ncols) * 200.0  # 200m standard deviation
+    # Subgrid orography standard deviation drives the launch amplitude
+    # for orographic GWs (flux ∝ h_std²). Without it the scheme
+    # defaulted to a hard-coded 200 m global field, which on an
+    # aquaplanet (no orography) sprays gravity-wave momentum into the
+    # stratosphere everywhere and overshoots the column wind in the
+    # 30-200 hPa range — we observed u_wind growing past ±70 m/s at
+    # levels 2-4 by day 0.4 of the moist run, which then NaN'd the
+    # dynamics. The proper subgrid std dev needs a terrain preprocessing
+    # step we don't have yet; for now scale ~10% of the local orography
+    # height as a rough proxy. Aquaplanet (orog ≡ 0) ⇒ h_std = 0 ⇒ GWD
+    # is silent, which is what we want for flat ocean.
+    orog_flat = terrain.orog.reshape(-1)
+    h_std = jnp.abs(orog_flat) * 0.1
     
     gwd_results = jax.vmap(
         gravity_wave_drag,

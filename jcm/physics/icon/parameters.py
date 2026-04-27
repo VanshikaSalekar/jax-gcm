@@ -8,13 +8,14 @@ Date: 2025-01-10
 
 import tree_math
 
-from .convection import ConvectionParameters
-from .clouds import CloudParameters, MicrophysicsParameters
-from .gravity_waves import GravityWaveParameters
-from .radiation import RadiationParameters
-from .vertical_diffusion.vertical_diffusion_types import VDiffParameters
-from .surface import SurfaceParameters
-from .aerosol.aerosol_params import AerosolParameters
+from jcm.physics.convection.tiedtke_nordeng import ConvectionParameters
+from jcm.physics.clouds.sundqvist import CloudParameters
+from jcm.physics.clouds.echam_1m import MicrophysicsParameters
+from jcm.physics.gravity_waves.hines import GravityWaveParameters
+from jcm.physics.radiation.radiation_types import RadiationParameters
+from jcm.physics.vertical_diffusion.tte_tke.vertical_diffusion_types import VDiffParameters
+from jcm.physics.surface.icon import SurfaceParameters
+from jcm.physics.aerosol.macv2_sp_params import AerosolParameters
 
 @tree_math.struct
 class Parameters:

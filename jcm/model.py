@@ -19,7 +19,7 @@ from jcm.terrain import TerrainData
 from jcm.date import DateData
 from jcm.forcing import ForcingData, default_forcing
 from jcm.physics_interface import PhysicsState, Physics, get_physical_tendencies, dynamics_state_to_physics_state
-from jcm.physics.speedy.speedy_physics import SpeedyPhysics
+from jcm.physics.speedy.speedy_terms import speedy_physics
 from jcm.utils import DYNAMICS_UNITS_TABLE_CSV_PATH
 from jcm.diffusion import DiffusionFilter
 import pandas as pd
@@ -258,13 +258,14 @@ class Model:
     """Top level class for a JAX-GCM configuration using the Speedy physics on an aquaplanet."""
 
     def __init__(self, coords: CoordinateSystem, time_step=30.0, terrain: TerrainData=None,
-                 physics: Physics=None, diffusion: DiffusionFilter=None, spmd_mesh: tuple[int, ...]=None,
+                 physics: Physics=None, diffusion: DiffusionFilter=None,
                  start_date: jdt.Datetime=jdt.to_datetime('2000-01-01'), log_level=logging.CRITICAL) -> None:
         """Initialize the model with the given time step, save interval, and total time.
 
         Args:
             coords:
-                CoordinateSystem object describing the model coordinates
+                CoordinateSystem object describing the model coordinates. To enable SPMD
+                parallelization, pass ``spmd_mesh`` to the coords helper (e.g. ``get_speedy_coords``).
             time_step:
                 Model time step in minutes
             terrain:
@@ -273,8 +274,6 @@ class Model:
                 Physics object describing the model physics
             diffusion:
                 DiffusionFilter object describing horizontal diffusion filter params
-            spmd_mesh:
-                Optional tuple describing the SPMD mesh for parallelization
             start_date:
                 jax_datetime.Datetime object containing start date of the simulation (default January 1, 2000)
             log_level:
@@ -302,13 +301,13 @@ class Model:
             p1=0.01*p0*units.pascal,
         )
         
-        self.physics = physics or SpeedyPhysics()
+        self.physics = physics or speedy_physics()
         self.physics.cache_coords(self.coords)
 
-        # Ensure IconPhysics uses the correct timestep for all parameterizations
-        from jcm.physics.icon import IconPhysics
-        if isinstance(self.physics, IconPhysics):
-            self.physics.parameters = self.physics.parameters.with_timestep(self.dt_si.m)
+        # Ensure ComposableIconPhysics uses the correct timestep for all parameterizations
+        from jcm.physics.icon.icon_terms import ComposableIconPhysics
+        if isinstance(self.physics, ComposableIconPhysics):
+            self.physics.apply_timestep(self.dt_si.m)
 
         self.diffusion = diffusion or DiffusionFilter.default()
 
@@ -320,6 +319,11 @@ class Model:
         # ICON-style hybrid coords store `a_boundaries` in Pa, so we override
         # `hpa_quantity` so dinosaur's internal nondimensionalization treats
         # them as Pa (not hPa which is the dinosaur default).
+        # Wire up the ``specific_humidity`` tracer as the dynamics' humidity
+        # so that moisture contributes to virtual temperature in the dycore
+        # (and the moisture-related divergence/vorticity corrections fire).
+        # Without this, q is transported as an inert passive tracer and the
+        # dynamics are effectively dry — inconsistent with the moist physics.
         from dinosaur.hybrid_coordinates import HybridCoordinates
         if isinstance(self.coords.vertical, HybridCoordinates):
             self.primitive = primitive_equations.PrimitiveEquationsHybrid(
@@ -328,8 +332,12 @@ class Model:
                 coords=self.coords,
                 physics_specs=self.physics_specs,
                 hpa_quantity=units.pascal,
+                humidity_key='specific_humidity',
             )
         else:
+            # Sigma-coord dinosaur ``PrimitiveEquations`` does not accept
+            # ``humidity_key``; moisture-Tv coupling is only available on the
+            # hybrid variant in this version.
             self.primitive = primitive_equations.PrimitiveEquations(
                 reference_temperature=aux_features[dinosaur.xarray_utils.REF_TEMP_KEY],
                 orography=self.truncated_orography,
@@ -347,19 +355,22 @@ class Model:
         diffuse_div = self._make_diffusion_fn(
             self.diffusion.div_timescale,
             self.diffusion.div_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(divergence=u_temp.divergence)
+            replace_fn=lambda u_next, u_temp: u_next.replace(divergence=u_temp.divergence),
+            level_orders=self.diffusion.level_orders_div,
         )
 
         diffuse_vor_q = self._make_diffusion_fn(
             self.diffusion.vor_q_timescale,
             self.diffusion.vor_q_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(vorticity=u_temp.vorticity,tracers={'specific_humidity': u_temp.tracers['specific_humidity']})
+            replace_fn=lambda u_next, u_temp: u_next.replace(vorticity=u_temp.vorticity,tracers={'specific_humidity': u_temp.tracers['specific_humidity']}),
+            level_orders=self.diffusion.level_orders_vor_q,
         )
 
         diffuse_temp = self._make_diffusion_fn(
             self.diffusion.temp_timescale,
             self.diffusion.temp_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(temperature_variation=u_temp.temperature_variation)
+            replace_fn=lambda u_next, u_temp: u_next.replace(temperature_variation=u_temp.temperature_variation),
+            level_orders=self.diffusion.level_orders_temp,
         )
         
         self.filters = [
@@ -377,22 +388,48 @@ class Model:
         # spectral space primitive_equations.State updated by model.run and model.resume
         self._final_modal_state = None
     
-    def _make_diffusion_fn(self, timescale: jnp.float_, order: jnp.int_, replace_fn):
-        """Return diffusion filter function handle for use in the model time step.
+    def _make_diffusion_fn(self, timescale, order, replace_fn, level_orders=None):
+        """Return a diffusion filter closure for one of the three state slots.
 
-        timescale: diffusion timescale (s)
-        order: order of diffusion operator
-        replace_fn: function that takes (u_next, u_temp) and returns the updated u_next after diffusion (selects which variables to diffuse)
+        Args:
+            timescale: base hyperdiffusion timescale (s).
+            order: uniform-order spectral power (used when level_orders is None).
+            replace_fn: picks which state variables get overwritten by the filter.
+            level_orders: optional 1-D array of per-level orders (length nlev)
+                enabling the ECHAM-style level-dependent hyperdiffusion.
+
         """
         from dinosaur.filtering import horizontal_diffusion_filter
+        from jcm.diffusion import level_dependent_scaling
+        import jax
+
+        if level_orders is None:
+            def diffusion_filter(u, u_next):
+                eigenvalues = self.coords.horizontal.laplacian_eigenvalues
+                scale = self.dt / (timescale * abs(eigenvalues[-1]) ** order)
+                filter_fn = horizontal_diffusion_filter(self.coords.horizontal, scale, order)
+                u_temp = filter_fn(u_next)
+                return replace_fn(u_next, u_temp)
+            return diffusion_filter
+
+        import numpy as np
+        # Precompute the scaling once (pure constant, not traced). This avoids
+        # JIT-time issues observed when the 3-D scaling was rebuilt inside the
+        # filter closure at high hyperdiffusion orders.
+        eigenvalues = self.coords.horizontal.laplacian_eigenvalues
+        scaling_const = np.asarray(level_dependent_scaling(
+            eigenvalues, timescale, level_orders, self.dt,
+        ))  # (nlev, 1, lat_modes), numpy array → inlined as JIT constant
 
         def diffusion_filter(u, u_next):
-            eigenvalues = self.coords.horizontal.laplacian_eigenvalues
-            scale = self.dt / (timescale * abs(eigenvalues[-1]) ** order)
-
-            filter_fn = horizontal_diffusion_filter(self.coords.horizontal, scale, order)
-
-            u_temp = filter_fn(u_next)
+            def rescale(x):
+                if not hasattr(x, "shape"):
+                    return x
+                target_shape = np.shape(x)
+                if target_shape != np.broadcast_shapes(target_shape, scaling_const.shape):
+                    return x
+                return scaling_const * x
+            u_temp = jax.tree_util.tree_map(rescale, u_next)
             return replace_fn(u_next, u_temp)
         return diffusion_filter
     

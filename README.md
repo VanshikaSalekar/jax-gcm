@@ -12,7 +12,8 @@ JCM is a physical climate model that combines the [Dinosaur](https://github.com/
 
 - **Fully Differentiable**: Automatic differentiation through the entire model using JAX
 - **GPU/TPU Accelerated**: JIT compilation and hardware acceleration via JAX
-- **Modular Physics**: SPEEDY physics package with radiation, convection, clouds, and surface processes
+- **Modular Physics**: SPEEDY and ICON physics packages with radiation, convection, clouds, and surface processes
+- **Composable**: Mix and match parameterizations across physics packages (e.g., SPEEDY convection + ICON radiation)
 - **Flexible Grids**: Spectral dynamical core supporting multiple resolutions (T21 to T425)
 - **ML-Ready**: Designed for hybrid physics-ML workflows and parameter optimization
 
@@ -52,12 +53,15 @@ Run a simple aquaplanet simulation:
 
 ```python
 from jcm.model import Model
+from jcm.physics.speedy.speedy_coords import get_speedy_coords
+
+# Build coords (pass spmd_mesh=(x, y, z) here to enable multi-device sharding)
+coords = get_speedy_coords(layers=8, spectral_truncation=31)
 
 # Create a model with default configuration
 model = Model(
-    time_step=30.0,          # minutes
-    layers=8,                 # vertical levels
-    horizontal_resolution=31  # T31 spectral grid
+    coords=coords,
+    time_step=30.0,  # minutes
 )
 
 # Run a 120-day simulation
@@ -75,12 +79,14 @@ print(ds)
 
 Example notebooks are available in the `notebooks/` directory:
 
-- **`run-speedy.ipynb`**: Basic model simulation with SPEEDY physics
-- **`run-speedy-gradients.ipynb`**: Computing gradients through the model
-- **`optimization_example.ipynb`**: Parameter optimization examples
-- **`autodiff_userguide.ipynb`**: Guide to automatic differentiation features
+- **`01_jcm_demo.ipynb`**: Basic model simulation with SPEEDY physics
+- **`02_optimization_example.ipynb`**: Parameter optimization examples
+- **`04_jcm_slides.ipynb`**: Presentation-ready overview
+- **`05_jcm_icon_demo.ipynb`**: Running with ICON physics and composable physics
 
 ## Physics Packages
+
+JCM provides two physics packages and a composable framework for mixing parameterizations across them.
 
 ### SPEEDY Physics
 
@@ -93,7 +99,36 @@ The SPEEDY (Simplified Parameterizations, primitivE-Equation DYnamics) physics p
 - Vertical diffusion
 - Orographic drag
 
-> **Note**: ICON atmospheric physics is currently under development but not yet available in released versions.
+### ICON Physics
+
+The ICON physics package provides comprehensive atmospheric parameterizations based on the ECHAM/ICON Earth System Model:
+
+- Tiedtke-Nordeng mass-flux convection
+- Single-moment cloud microphysics (Lohmann & Roeckner)
+- Two-stream radiation with gas, cloud, and aerosol optics (+ RRTMGP and NN emulator options)
+- TKE-based vertical diffusion
+- Multi-surface tile scheme (ocean, sea ice, land)
+- Gravity wave drag
+- MACv2-SP aerosol scheme with aerosol-cloud coupling
+- Simple chemistry (ozone, CO2, CH4)
+
+### Composable Physics
+
+Individual parameterizations can be mixed across packages using the composable physics API:
+
+```python
+from jcm.physics.speedy.speedy_terms import speedy_physics
+from jcm.physics.icon.icon_terms import IconRadiationRRTMGP
+
+# Start with SPEEDY defaults, replace radiation with ICON RRTMGP
+physics = speedy_physics().replace("radiation_sw", IconRadiationRRTMGP())
+
+# Or build from individual terms
+from jcm.physics.icon.icon_terms import icon_physics
+physics = icon_physics(radiation_scheme="emulated")  # Use NN radiation emulator
+```
+
+Each `PhysicsTerm` stores its own tunable parameters as `flax.nnx.Param`, enabling per-scheme gradient-based optimization.
 
 ## Documentation
 

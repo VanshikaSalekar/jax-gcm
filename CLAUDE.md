@@ -24,21 +24,46 @@ jcm/                          # Main package
 ├── diffusion.py              # Diffusion filter
 ├── config/                   # Hydra configuration files
 ├── physics/
-│   ├── speedy/               # SPEEDY physics parameterizations
-│   │   ├── speedy_physics.py # Main SPEEDY orchestrator
-│   │   ├── speedy_coords.py  # SPEEDY coordinate caching (vertical/horizontal)
-│   │   ├── params.py         # Tunable parameter structs
-│   │   ├── convection.py     # Convection scheme
-│   │   ├── humidity.py       # Moisture processes
-│   │   ├── large_scale_condensation.py
-│   │   ├── shortwave_radiation.py
-│   │   ├── longwave_radiation.py
-│   │   ├── surface_flux.py   # Surface exchange
-│   │   ├── vertical_diffusion.py
-│   │   └── *_test.py         # Co-located unit tests
-│   └── held_suarez/          # Simplified Held-Suarez physics
+│   ├── physics_term.py          # PhysicsTerm base class
+│   ├── composable_physics.py    # ComposablePhysics container
+│   ├── speedy/                  # SPEEDY infrastructure (params, coords)
+│   │   ├── speedy_terms.py      # Composable terms + speedy_physics() factory
+│   │   ├── speedy_coords.py
+│   │   ├── params.py
+│   │   ├── physics_data.py
+│   │   └── physical_constants.py
+│   ├── icon/                    # ICON infrastructure (params, coords)
+│   │   ├── icon_terms.py        # Composable terms + icon_physics() factory
+│   │   ├── icon_physics.py      # Standalone apply_* term functions used by icon_terms
+│   │   ├── icon_coords.py, icon_levels.py, icon_physics_data.py, parameters.py
+│   │   ├── unit_conversions.py, forcing.py
+│   │   └── constants/           # ICON physical constants
+│   ├── radiation/
+│   │   ├── grey_two_stream/     # ICON-style grey two-stream package
+│   │   ├── rrtmgp.py
+│   │   ├── nn_emulator.py + nn_emulator_scheme.py
+│   │   ├── radiation_types.py, cloud_optics.py, constants.py   # shared
+│   │   └── speedy_shortwave.py, speedy_longwave.py
+│   ├── convection/
+│   │   ├── tiedtke_nordeng/     # Tiedtke-Nordeng mass flux scheme
+│   │   └── speedy_convection.py
+│   ├── clouds/
+│   │   ├── sundqvist.py         # Sundqvist diagnostic cloud fraction
+│   │   ├── echam_1m.py          # ECHAM 1-moment microphysics
+│   │   ├── speedy_humidity.py, speedy_condensation.py
+│   ├── vertical_diffusion/
+│   │   ├── tte_tke/             # TTE-TKE closure
+│   │   └── speedy_vdiff.py
+│   ├── gravity_waves/hines/     # Hines (1997) gravity wave drag
+│   ├── aerosol/macv2_sp.py      # Stevens et al. (2017) MACv2-SP simple plumes
+│   ├── chemistry/simple_chemistry.py
+│   ├── diagnostics/wmo_tropopause.py
+│   ├── surface/                 # Speedy bulk + ICON multi-tile (in surface/icon/)
+│   ├── forcing/speedy_forcing.py
+│   ├── orographic_correction/speedy_orographic.py
+│   └── held_suarez/             # Simplified Held-Suarez forcing
 │       ├── held_suarez_physics.py
-│       └── utils.py          # Coordinate helpers for Held-Suarez
+│       └── utils.py             # Coordinate helpers for Held-Suarez
 ├── data/
 │   ├── bc/                   # Boundary condition data (T30 climatology)
 │   └── test/                 # Test reference data
@@ -150,9 +175,11 @@ Auto-generated physics variable translation docs come from `jcm/physics/speedy/u
 ## Architecture Notes
 
 - **Dynamics** are handled by the external `dinosaur` package (spectral dynamical core)
-- **Physics** parameterizations are modular — SPEEDY is the main implementation, Held-Suarez is a simpler alternative
+- **Physics** parameterizations are modular — SPEEDY and ICON ports are the main implementations, Held-Suarez is a simpler alternative
+- **Composable physics is the only physics API.** `PhysicsTerm` (flax.nnx.Module) base class wraps each parameterization. `ComposablePhysics` (and `ComposableIconPhysics`) aggregates terms with `replace()`, `remove()`, and `__add__()` operators. Build pre-configured packages via the `speedy_physics()` and `icon_physics()` factories.
 - **physics_interface.py** bridges dynamics (spectral space) and physics (gridpoint space) with `PhysicsState` and `PhysicsTendency` structs
 - **model.py** orchestrates time-stepping, combining dynamics and physics
+- **Physics directory** is organized by physical process. Files are named after the **scheme** (e.g. `convection/tiedtke_nordeng/`, `clouds/sundqvist.py`, `aerosol/macv2_sp.py`), not the model they were ported from. Model-specific *infrastructure* (parameter containers, coords, data structs) stays under `speedy/` and `icon/`.
 - Configuration is managed via **Hydra** (see `jcm/config/`)
 - Supports multiple resolutions: T21 to T425 spectral truncations
 - SPMD sharding support for multi-device execution
@@ -172,7 +199,7 @@ The grid/geometry system is split into three layers with clear separation of con
 from jcm.model import Model
 from jcm.terrain import TerrainData
 from jcm.physics.speedy.speedy_coords import get_speedy_coords
-from jcm.physics.speedy.speedy_physics import SpeedyPhysics
+from jcm.physics.speedy.speedy_terms import speedy_physics
 
 # 1. Create coordinate system (includes sigma boundaries)
 coords = get_speedy_coords(layers=8, spectral_truncation=31)
@@ -181,7 +208,7 @@ coords = get_speedy_coords(layers=8, spectral_truncation=31)
 terrain = TerrainData.from_coords(coords)  # or .aquaplanet()
 
 # 3. Create model (physics caches coords internally)
-model = Model(coords=coords, terrain=terrain, physics=SpeedyPhysics())
+model = Model(coords=coords, terrain=terrain, physics=speedy_physics())
 ```
 
 **Key design principles:**

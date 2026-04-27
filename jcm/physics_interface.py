@@ -100,7 +100,9 @@ Attributes:
     temperature : jnp.ndarray
         Atmospheric temperature.
     specific_humidity : jnp.ndarray
-        The mass of water vapor per unit mass of moist air.
+        The mass of water vapor per unit mass of moist air, in g/kg
+        (convention inherited from SPEEDY). Schemes that work natively in
+        kg/kg — notably ICON — convert on entry/exit.
     geopotential : jnp.ndarray
         The gravitational potential energy per unit mass at a given height.
     normalized_surface_pressure : jnp.ndarray
@@ -164,7 +166,8 @@ Attributes:
     temperature : jnp.ndarray
         Tendency of temperature.
     specific_humidity : jnp.ndarray
-        Tendency of specific humidity.
+        Tendency of specific humidity, in (g/kg)/s. ICON schemes that work
+        natively in kg/kg/s convert when composing their tendency.
 """
 
 class Physics:
@@ -341,8 +344,26 @@ def physics_state_to_dynamics_state(physics_state: PhysicsState, dynamics: Primi
     temperature = physics_state.temperature - dynamics.reference_temperature[:, jnp.newaxis, jnp.newaxis]
     temperature_modal = dynamics.coords.horizontal.to_modal(temperature)
 
-    # take the log of normalized surface pressure and convert to modal
-    log_surface_pressure = jnp.log(physics_state.normalized_surface_pressure)
+    # Convert normalized surface pressure back to the log-pressure stored by
+    # dinosaur. Convention mirrors ``dynamics_state_to_physics_state``:
+    #
+    #   * SigmaCoordinates: dynamics state carries ``log(P_s / p0)`` — we
+    #     already have ``normalized_surface_pressure = P_s / p0`` in the
+    #     physics state, so just take the log.
+    #   * HybridCoordinates: dynamics state carries ``log(P_s_in_Pa)`` (in
+    #     nondim Pa) because the coordinate blends ``a_boundaries`` (Pa) and
+    #     ``b * P_s`` — we must re-multiply by ``p0_nondim`` before taking
+    #     the log. Without this the reverse conversion produces a near-zero
+    #     surface pressure and the first dynamics step NaNs.
+    from dinosaur.hybrid_coordinates import HybridCoordinates
+    if isinstance(dynamics.coords.vertical, HybridCoordinates):
+        from jcm.constants import p0 as P0_PA
+        p0_nondim = dynamics.physics_specs.nondimensionalize(P0_PA * units.pascal)
+        log_surface_pressure = jnp.log(
+            physics_state.normalized_surface_pressure * p0_nondim
+        )
+    else:
+        log_surface_pressure = jnp.log(physics_state.normalized_surface_pressure)
     modal_log_sp = dynamics.coords.horizontal.to_modal(log_surface_pressure)
 
     # Convert all tracers to modal
@@ -374,13 +395,13 @@ def physics_tendency_to_dynamics_tendency(physics_tendency: PhysicsTendency, dyn
     v_tend = physics_tendency.v_wind
     t_tend = physics_tendency.temperature
     q_tend = physics_tendency.specific_humidity
-    
+
     q_tend = dynamics.physics_specs.nondimensionalize(q_tend * units.gram / units.kilogram / units.second)
-    
+
     vor_tend_modal, div_tend_modal = uv_nodal_to_vor_div_modal(dynamics.coords.horizontal, u_tend, v_tend)
     t_tend_modal = dynamics.coords.horizontal.to_modal(t_tend)
     q_tend_modal = dynamics.coords.horizontal.to_modal(q_tend)
-    
+
     log_sp_tend_modal = jnp.zeros_like(t_tend_modal[0, ...])
 
     # Convert all tracer tendencies to modal
@@ -462,7 +483,7 @@ def get_physical_tendencies(
         state: Dynamic (dinosaur) State variables
         dynamics: PrimitiveEquations object
         time_step: Time step in seconds
-        physics: Physics object (e.g. HeldSuarezPhysics, SpeedyPhysics)
+        physics: Physics object (e.g. composable physics from held_suarez_physics(), speedy_physics())
         forcing: ForcingData object
         terrain: TerrainData object
         date: DateData object

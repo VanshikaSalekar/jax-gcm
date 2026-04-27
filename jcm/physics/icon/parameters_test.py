@@ -5,7 +5,7 @@ Date: 2025-01-10
 
 import jax.numpy as jnp
 from jcm.physics.icon.parameters import Parameters
-from jcm.physics.icon.icon_physics import IconPhysics
+from jcm.physics.icon.icon_terms import icon_physics
 
 
 def test_parameters_initialization():
@@ -17,10 +17,13 @@ def test_parameters_initialization():
     assert params.clouds is not None
     assert params.microphysics is not None
     
-    # Check some default values
+    # Check some default values.
+    # ECHAM-matching convention: crs at surface (0.9), crt aloft (0.7);
+    # ccraut = 1.0e-4 (ECHAM default).
     assert abs(float(params.convection.entrpen) - 1.0e-4) < 1e-7
-    assert abs(float(params.clouds.crt) - 0.9) < 1e-7
-    assert abs(float(params.microphysics.ccraut) - 5.0e-4) < 1e-7
+    assert abs(float(params.clouds.crs) - 0.9) < 1e-7
+    assert abs(float(params.clouds.crt) - 0.7) < 1e-7
+    assert abs(float(params.microphysics.ccraut) - 1.0e-4) < 1e-7
     
     print("✓ Default parameters initialized correctly")
 
@@ -37,29 +40,29 @@ def test_parameters_with_methods():
     # Test with_clouds
     params3 = params.with_clouds(crt=0.85)
     assert abs(float(params3.clouds.crt) - 0.85) < 1e-7
-    assert abs(float(params.clouds.crt) - 0.9) < 1e-7  # Original unchanged
-    
+    assert abs(float(params.clouds.crt) - 0.7) < 1e-7  # Original unchanged (ECHAM default aloft)
+
     # Test with_microphysics
     params4 = params.with_microphysics(ccraut=0.5e-3)
     assert abs(float(params4.microphysics.ccraut) - 0.5e-3) < 1e-7
-    assert abs(float(params.microphysics.ccraut) - 5.0e-4) < 1e-7  # Original unchanged
+    assert abs(float(params.microphysics.ccraut) - 1.0e-4) < 1e-7  # Original unchanged (ECHAM default)
     
     print("✓ Parameter update methods work correctly")
 
 
 def test_icon_physics_with_parameters():
-    """Test that IconPhysics can be initialized with Parameters"""
+    """Test that icon_physics() can be initialized with Parameters"""
     # Default parameters
-    physics1 = IconPhysics()
+    physics1 = icon_physics()
     assert physics1.parameters is not None
     assert abs(float(physics1.parameters.convection.entrpen) - 1.0e-4) < 1e-7
     
     # Custom parameters
     custom_params = Parameters.default().with_convection(entrpen=5.0e-4)
-    physics2 = IconPhysics(parameters=custom_params)
+    physics2 = icon_physics(parameters=custom_params)
     assert abs(float(physics2.parameters.convection.entrpen) - 5.0e-4) < 1e-7
     
-    print("✓ IconPhysics accepts Parameters object")
+    print("✓ icon_physics() accepts Parameters object")
 
 
 def test_physics_terms_use_parameters():
@@ -87,7 +90,7 @@ def test_physics_terms_use_parameters():
     
     # Create physics with custom parameters
     custom_params = Parameters.default().with_clouds(crt=0.8)
-    physics = IconPhysics(parameters=custom_params)
+    physics = icon_physics(parameters=custom_params)
     
     # The physics should be able to compute tendencies
     # (This is a basic smoke test)
