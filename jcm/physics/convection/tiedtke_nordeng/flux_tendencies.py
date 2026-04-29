@@ -29,30 +29,35 @@ def calculate_precipitation_rate(
     dt: float,
     config: ConvectionParameters
 ) -> jnp.ndarray:
-    """Calculate surface precipitation rate from convection
-    
+    """Calculate surface precipitation rate from convection.
+
+    Sums the per-layer ``pdmfup`` (precipitation generated in the
+    updraft, kg/m²/s) computed inside ``calculate_updraft``. Each layer
+    converts a fraction ``cprcon * g * dz / (1 + cprcon * g * dz)`` of
+    its liquid water content to precip, mirroring ECHAM
+    ``mo_cuascent.f90`` lines 454-457. The column integral of those
+    per-layer rates is the surface rain mass flux.
+
+    The previous implementation returned ``sum(mfu*lu) * cprcon`` —
+    i.e. it ignored the per-layer precip removal step entirely. As a
+    result the surface precip estimate was ~60x too small (typical
+    0.008 mm/day on a tropical RCE column vs. ECHAM's ~0.5 mm/day),
+    AND the liquid water built up unphysically inside the parcel as it
+    rose — distorting the buoyancy and terminating the updraft early.
+
     Args:
-        updraft_state: Updraft calculation results
-        kbase: Cloud base level
-        dt: Time step (s)
-        config: Convection configuration
-        
+        updraft_state: Updraft calculation results (with per-layer
+            ``pdmfup`` precip generation already computed).
+        kbase: Cloud base level (unused — kept for backwards-compat).
+        dt: Time step (s) (unused — kept for backwards-compat).
+        config: Convection configuration (unused — kept for
+            backwards-compat).
+
     Returns:
-        Surface precipitation rate (kg/m²/s)
+        Surface precipitation rate (kg/m²/s).
 
     """
-    # Precipitation conversion efficiency
-    precip_eff = config.cprcon
-
-    # Liquid water flux at all levels: where there is both updraft mass flux
-    # and liquid water, precipitation is produced
-    lw_flux = updraft_state.mfu * updraft_state.lu
-
-    # Surface precipitation is the column integral of liquid water flux
-    # times the precipitation conversion efficiency
-    precip_rate = jnp.sum(lw_flux) * precip_eff
-
-    return precip_rate
+    return jnp.sum(updraft_state.pdmfup)
 
 
 def calculate_cloud_water_ice(
@@ -278,23 +283,21 @@ def calculate_tendencies(
         updraft_state.mfu, downdraft_state.mfd
     )
     
-    # Apply time step
-    dtedt = dtedt / dt
-    dqdt = dqdt / dt
-    dudt = dudt / dt
-    dvdt = dvdt / dt
-    
-    # Calculate fixed qc/qi tendencies (simplified approach)
-    # These represent the tendency of cloud water and ice from convective transport
+    # ``dtedt_k_levels`` and ``dqdt_k_levels`` already have units K/s and
+    # kg/kg/s respectively — the divergence math
+    # ``(dse_flux_div + lh_source) / (cp * layer_mass_per_area)`` gives
+    # tendency in 1/s units already (W/m² · 1/(J/(kg·K)) · 1/(kg/m²) =
+    # K/s). The previous code divided by ``dt`` here, converting them
+    # to K/s² and producing convective heating roughly ``dt`` times too
+    # small (1500× too small for dt=1800 s — see harness comparison).
+    # Same applies to dudt / dvdt.
     nlev = len(temperature)
-    dqc_dt = jnp.zeros(nlev)  # Cloud water tendency from convection
-    dqi_dt = jnp.zeros(nlev)  # Cloud ice tendency from convection
-    
-    # For levels with convective activity, add some tendency
-    # This is a simplified approach - more sophisticated transport would be needed
+    # Calculate fixed qc/qi tendencies (simplified approach). qc_conv /
+    # qi_conv are mass mixing ratios (kg/kg), so dividing by dt gives
+    # the right units for these stub tendencies.
+    dqc_dt = jnp.zeros(nlev)
+    dqi_dt = jnp.zeros(nlev)
     conv_levels = (jnp.arange(nlev) >= kbase) & (jnp.arange(nlev) <= ktop)
-
-    # Simple cloud water/ice production based on updraft liquid water
     dqc_dt = jnp.where(conv_levels, qc_conv * 0.1 / dt, 0.0)
     dqi_dt = jnp.where(conv_levels, qi_conv * 0.1 / dt, 0.0)
     

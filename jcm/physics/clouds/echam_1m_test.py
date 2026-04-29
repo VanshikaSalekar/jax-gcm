@@ -6,7 +6,9 @@ Date: 2025-01-10
 import jax.numpy as jnp
 import jax
 from .echam_1m import (
-    MicrophysicsParameters, cloud_droplet_radius, autoconversion_kk2000, accretion_rain_cloud,
+    MicrophysicsParameters, cloud_droplet_radius,
+    autoconversion, autoconversion_beheng, autoconversion_kk2000,
+    accretion_rain_cloud,
     ice_autoconversion, snow_accretion, melting_freezing,
     evaporation_sublimation, sedimentation_flux, cloud_microphysics
 )
@@ -48,63 +50,161 @@ class TestCloudDropletRadius:
 class TestAutoconversion:
     """Test autoconversion processes"""
     
-    def test_kk2000_threshold(self):
-        """Test KK2000 autoconversion has threshold behavior"""
+    def test_autoconversion_no_water_no_rate(self):
+        """Beheng autoconversion gives essentially zero rate at near-zero qc."""
         config = MicrophysicsParameters.default()
         air_density = jnp.array(1.0)
         cloud_fraction = jnp.array(0.5)
         droplet_number = jnp.array(100e6)
         dt = 1800.0
-        
-        # Below threshold - no autoconversion
-        qc_low = config.ccraut * 0.5 * cloud_fraction
-        rate_low = autoconversion_kk2000(
-            qc_low, cloud_fraction, air_density, droplet_number, dt, config
+
+        # qc = 0 → no autoconversion
+        rate_zero = autoconversion_beheng(
+            jnp.array(0.0), cloud_fraction, air_density, droplet_number, dt, config,
         )
-        assert rate_low < 1e-10
-        
-        # Above threshold - significant autoconversion
-        qc_high = config.ccraut * 2.0 * cloud_fraction
-        rate_high = autoconversion_kk2000(
-            qc_high, cloud_fraction, air_density, droplet_number, dt, config
+        assert float(rate_zero) < 1e-15
+
+        # qc = tiny (1e-7 kg/kg) → effectively no autoconversion
+        rate_tiny = autoconversion_beheng(
+            jnp.array(1e-7), cloud_fraction, air_density, droplet_number, dt, config,
         )
-        assert rate_high > 1e-8
-    
-    def test_kk2000_dependencies(self):
-        """Test KK2000 dependencies on cloud water and droplet number"""
+        assert float(rate_tiny) < 1e-12
+
+        # qc = realistic post-convection (0.6 g/kg) → meaningful rate but
+        # bounded by mass conservation (cannot deplete more than qc/dt).
+        qc = jnp.array(0.6e-3)
+        rate_high = autoconversion_beheng(
+            qc, cloud_fraction, air_density, droplet_number, dt, config,
+        )
+        assert float(rate_high) > 0.0
+        assert float(rate_high) <= float(qc) / dt + 1e-12, (
+            "Beheng integral form must respect mass conservation: "
+            "autoconv rate cannot exceed qc/dt."
+        )
+
+    def test_autoconversion_dependencies(self):
+        """Beheng autoconversion: rate increases with qc, decreases with Nc.
+
+        Note: with the implicit-integration formulation, large qc gets
+        capped at the mass-conservation limit qc/dt, so the "rate
+        increases with qc" check uses a short timestep where the rate
+        hasn't saturated yet.
+        """
         config = MicrophysicsParameters.default()
         air_density = jnp.array(1.0)
-        cloud_fraction = jnp.array(1.0)  # Full cloud cover to simplify
-        dt = 1.0  # Very short timestep - we're testing the formula, not the limiter
-        
-        # Use cloud water well above threshold
-        qc = jnp.array(0.8e-3)
-        nc = jnp.array(100e6)
-        rate_base = autoconversion_kk2000(qc, cloud_fraction, air_density, nc, dt, config)
-        
-        # Test that rate increases with cloud water
-        qc_higher = jnp.array(1.0e-3)
-        rate_higher = autoconversion_kk2000(qc_higher, cloud_fraction, air_density, nc, dt, config)
-        # Even with limiter, higher qc should give higher rate
-        assert rate_higher > rate_base
-        
-        # For droplet dependency, use same total water but different cloud fractions
-        # This tests the in-cloud calculation
-        cf_low = jnp.array(0.5)
-        cf_high = jnp.array(1.0)
-        # Same grid-mean cloud water
-        qc_grid = jnp.array(0.4e-3)
-        
-        rate_cf_low = autoconversion_kk2000(qc_grid, cf_low, air_density, nc, dt, config)
-        rate_cf_high = autoconversion_kk2000(qc_grid, cf_high, air_density, nc, dt, config)
-        
-        # Lower cloud fraction means higher in-cloud water, so higher autoconversion
-        assert rate_cf_low > rate_cf_high
-        
-        # Verify no autoconversion below threshold
-        qc_low = config.ccraut * 0.5
-        rate_low = autoconversion_kk2000(qc_low, cloud_fraction, air_density, nc, dt, config)
-        assert rate_low < 1e-10
+        cloud_fraction = jnp.array(1.0)
+        dt = 0.1  # short timestep so rate doesn't saturate at qc/dt
+
+        rate_low_qc = autoconversion_beheng(
+            jnp.array(0.4e-3), cloud_fraction, air_density,
+            jnp.array(100e6), dt, config,
+        )
+        rate_high_qc = autoconversion_beheng(
+            jnp.array(0.8e-3), cloud_fraction, air_density,
+            jnp.array(100e6), dt, config,
+        )
+        assert float(rate_high_qc) > float(rate_low_qc), (
+            "Higher qc → higher Beheng autoconversion rate"
+        )
+
+        # Droplet number dependence: more droplets (cleaner air) → slower
+        # autoconversion (Nc^-3.3 in the formula).
+        rate_few_droplets = autoconversion_beheng(
+            jnp.array(0.6e-3), cloud_fraction, air_density,
+            jnp.array(50e6), dt, config,
+        )
+        rate_many_droplets = autoconversion_beheng(
+            jnp.array(0.6e-3), cloud_fraction, air_density,
+            jnp.array(500e6), dt, config,
+        )
+        assert float(rate_few_droplets) > float(rate_many_droplets), (
+            "Fewer cloud droplets → faster autoconversion (Beheng Nc^-3.3)"
+        )
+
+
+class TestKK2000Autoconversion:
+    """KK2000 explicit-rate autoconversion + dispatcher tests."""
+
+    def test_below_threshold_zero(self):
+        config = MicrophysicsParameters.default(
+            ccraut=1e-5, autoconversion_scheme="kk2000",
+        )
+        rate = autoconversion_kk2000(
+            jnp.array(1e-6),               # below ccraut threshold
+            jnp.array(0.5), jnp.array(1.0),
+            jnp.array(100e6), 1800.0, config,
+        )
+        assert float(rate) == 0.0
+
+    def test_dependencies(self):
+        """KK2000: rate ∝ qc^2.47, ∝ Nc^-1.79 — same monotonicity as Beheng."""
+        config = MicrophysicsParameters.default(
+            ccraut=1e-5, autoconversion_scheme="kk2000",
+        )
+        air_density = jnp.array(1.0)
+        cloud_fraction = jnp.array(1.0)
+        dt = 1800.0
+
+        rate_lo_qc = autoconversion_kk2000(
+            jnp.array(0.4e-3), cloud_fraction, air_density,
+            jnp.array(100e6), dt, config,
+        )
+        rate_hi_qc = autoconversion_kk2000(
+            jnp.array(0.8e-3), cloud_fraction, air_density,
+            jnp.array(100e6), dt, config,
+        )
+        assert float(rate_hi_qc) > float(rate_lo_qc)
+
+        rate_few_drops = autoconversion_kk2000(
+            jnp.array(0.6e-3), cloud_fraction, air_density,
+            jnp.array(50e6), dt, config,
+        )
+        rate_many_drops = autoconversion_kk2000(
+            jnp.array(0.6e-3), cloud_fraction, air_density,
+            jnp.array(500e6), dt, config,
+        )
+        assert float(rate_few_drops) > float(rate_many_drops)
+
+    def test_dispatcher_picks_scheme(self):
+        """``autoconversion(...)`` dispatches by ``config.autoconversion_scheme``."""
+        qc = jnp.array(0.6e-3)
+        cloud_fraction = jnp.array(0.5)
+        air_density = jnp.array(1.0)
+        droplet_number = jnp.array(100e6)
+        dt = 1800.0
+
+        cfg_beheng = MicrophysicsParameters.default(autoconversion_scheme="beheng")
+        cfg_kk2000 = MicrophysicsParameters.default(
+            ccraut=1e-5, autoconversion_scheme="kk2000",
+        )
+
+        rate_via_dispatcher_beheng = autoconversion(
+            qc, cloud_fraction, air_density, droplet_number, dt, cfg_beheng,
+        )
+        rate_direct_beheng = autoconversion_beheng(
+            qc, cloud_fraction, air_density, droplet_number, dt, cfg_beheng,
+        )
+        assert jnp.allclose(rate_via_dispatcher_beheng, rate_direct_beheng)
+
+        rate_via_dispatcher_kk = autoconversion(
+            qc, cloud_fraction, air_density, droplet_number, dt, cfg_kk2000,
+        )
+        rate_direct_kk = autoconversion_kk2000(
+            qc, cloud_fraction, air_density, droplet_number, dt, cfg_kk2000,
+        )
+        assert jnp.allclose(rate_via_dispatcher_kk, rate_direct_kk)
+
+        # Sanity: the two schemes give different rates on the same column
+        assert not jnp.allclose(rate_via_dispatcher_beheng, rate_via_dispatcher_kk)
+
+    def test_scheme_int_alias(self):
+        """SCHEME_BEHENG / SCHEME_KK2000 ints round-trip with string aliases."""
+        cfg_str = MicrophysicsParameters.default(autoconversion_scheme="kk2000")
+        cfg_int = MicrophysicsParameters.default(
+            autoconversion_scheme=MicrophysicsParameters.SCHEME_KK2000,
+        )
+        assert int(cfg_str.autoconversion_scheme) == MicrophysicsParameters.SCHEME_KK2000
+        assert int(cfg_int.autoconversion_scheme) == int(cfg_str.autoconversion_scheme)
     
     def test_ice_autoconversion(self):
         """Test ice autoconversion to snow"""

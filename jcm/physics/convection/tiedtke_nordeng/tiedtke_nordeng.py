@@ -56,7 +56,14 @@ class ConvectionParameters:
     
     # Precipitation parameters
     cprcon: float            # Coefficient for precipitation conversion
-    
+    cu_dnoprc_ocean: float   # Pressure thickness above cloud base before
+                             # precip generation starts, over ocean (Pa)
+                             # — ECHAM ``zdnoprc`` ocean default 1.5e4
+    cu_dnoprc_land: float    # Same threshold over land (Pa) — ECHAM
+                             # ``zdnoprc`` land default 3.0e4 (continental
+                             # convection has thicker non-precipitating
+                             # cloud-base layer)
+
     # Evaporation parameters
     cevapcu: float           # Coefficient for rain evaporation
     
@@ -72,12 +79,14 @@ class ConvectionParameters:
 
     # Downdraft parameters
     cmfdeps: float           # Downdraft mass flux fraction for LFS threshold
+    entrdd: float            # Downdraft fractional entrainment rate (m⁻¹)
 
     @classmethod
     def default(cls, dt_conv=3600.0, entrpen=1.0e-4, entrscv=3.0e-3, entrmid=1.0e-4, # FIXME: validate dt_conv
                  tau=7200.0, cmfcmax=1.0, cmfcmin=1.0e-10, cprcon=1.4e-3,
+                 cu_dnoprc_ocean=1.5e4, cu_dnoprc_land=3.0e4,
                  cevapcu=2.0e-5, epsilon=1.0e-12, rlcrit=8.0e-4, rhcrit=0.9,
-                 cmfctop=0.33, cmfdeps=0.33) -> 'ConvectionParameters':
+                 cmfctop=0.33, cmfdeps=0.33, entrdd=2.0e-4) -> 'ConvectionParameters':
         """Return default convection parameters"""
         return cls(
             dt_conv=jnp.array(dt_conv),
@@ -88,12 +97,15 @@ class ConvectionParameters:
             cmfcmax=jnp.array(cmfcmax),
             cmfcmin=jnp.array(cmfcmin),
             cprcon=jnp.array(cprcon),
+            cu_dnoprc_ocean=jnp.array(cu_dnoprc_ocean),
+            cu_dnoprc_land=jnp.array(cu_dnoprc_land),
             cevapcu=jnp.array(cevapcu),
             epsilon=jnp.array(epsilon),
             rlcrit=jnp.array(rlcrit),
             rhcrit=jnp.array(rhcrit),
             cmfctop=jnp.array(cmfctop),
-            cmfdeps=jnp.array(cmfdeps)
+            cmfdeps=jnp.array(cmfdeps),
+            entrdd=jnp.array(entrdd),
         )
 
 
@@ -466,9 +478,86 @@ def calculate_cape_cin(temperature: jnp.ndarray,
     return cape, cin
 
 
+def cloud_depth_for_target_top(
+    pressure: jnp.ndarray,
+    cloud_base: jnp.ndarray,
+    target_top_pa: float,
+    min_layers: int = 2,
+) -> jnp.ndarray:
+    """Return the number of model levels between ``cloud_base`` and the
+    level closest to ``target_top_pa`` from above — used as the updraft
+    scan ceiling.
+
+    The scan ceiling is a *maximum* depth the updraft is allowed to
+    extend to, NOT the actual cloud top. The actual termination is
+    decided dynamically inside ``calculate_updraft`` (negative
+    buoyancy, or mfu < 1 % of mfb). ``cloud_depth`` only needs to give
+    the scan enough headroom to reach physically plausible cloud tops;
+    too small a value silently truncates real convection, too large
+    just wastes compute on levels that would terminate dynamically
+    anyway.
+
+    A fixed level-count value would be vertical-resolution-dependent in
+    surprising ways:
+
+    * On the 47-level ICON hybrid grid we run T85×L47 on, layers are
+      ~22 hPa thick in the mid-troposphere; ``cloud_depth=35`` ≈ a
+      surface-to-200-hPa scan range.
+    * On a coarser 8-level sigma grid (used in some bisection tests),
+      ``cloud_depth=35`` would be silently clamped to ``nlev-2`` —
+      the cloud is allowed to reach the model top, which both wastes
+      compute and risks unphysical extension into the stratosphere.
+    * On a 90-level grid, the same ``35`` would only let the cloud
+      reach ~700 hPa, cutting off real deep convection.
+
+    Deriving from a target *pressure* makes the value
+    resolution-independent. Recommended targets:
+
+    * Deep convection: 15000 Pa (150 hPa) — tropical Cb tops typically
+      reach the tropopause around this pressure.
+    * Shallow convection: 70000 Pa (700 hPa) — trade-cumulus cloud
+      tops at ~3 km.
+
+    Implementation: for any pressure index ordering, find the level
+    closest to ``target_top_pa`` from above (i.e. the level with the
+    HIGHEST pressure among levels whose pressure ≤ target). That's
+    the level we want the scan to reach. ``cloud_depth`` is then the
+    integer index distance ``|cloud_base - target_top_idx|``. The
+    result is clipped to ``[min_layers, nlev-2]`` so the scan always
+    has at least ``min_layers`` levels of headroom and stops short of
+    TOA.
+
+    Args:
+        pressure: Full-level pressure profile (Pa) [nlev]
+        cloud_base: Cloud-base level index (0-indexed)
+        target_top_pa: Scan should reach (at least) this pressure level
+        min_layers: Minimum scan depth (≥ 2 to avoid degenerate scans)
+
+    Returns:
+        Scan-ceiling depth in *levels* (int32), clipped to
+        ``[min_layers, nlev-2]``.
+
+    """
+    nlev = pressure.shape[0]
+    above_target = pressure <= target_top_pa
+    # Among levels at or above target, pick the HIGHEST-pressure one —
+    # that's the level closest to ``target_top_pa`` from above, where we
+    # want the scan to reach. ``argmax`` of ``-inf`` outside the mask
+    # returns 0 if no level is above target (clipped to ``min_layers``
+    # so it doesn't matter for the result).
+    masked_p = jnp.where(
+        above_target,
+        pressure,
+        jnp.array(-jnp.inf, dtype=pressure.dtype),
+    )
+    target_top_idx = jnp.argmax(masked_p)
+    depth = jnp.abs(cloud_base.astype(jnp.int32) - target_top_idx.astype(jnp.int32))
+    return jnp.clip(depth, min_layers, nlev - 2)
+
+
 def tiedtke_nordeng_convection(
     temperature: jnp.ndarray,
-    humidity: jnp.ndarray, 
+    humidity: jnp.ndarray,
     pressure: jnp.ndarray,
     layer_thickness: jnp.ndarray,
     rho: jnp.ndarray,
@@ -477,10 +566,11 @@ def tiedtke_nordeng_convection(
     qc: jnp.ndarray,
     qi: jnp.ndarray,
     dt: float,
-    config: ConvectionParameters = None
+    config: ConvectionParameters = None,
+    land_fraction: jnp.ndarray = jnp.array(0.0),
 ) -> Tuple[ConvectionTendencies, ConvectionState]:
     """Run Tiedtke-Nordeng convection scheme with fixed qc/qi transport
-    
+
     Args:
         temperature: Environmental temperature (K) [nlev]
         humidity: Environmental specific humidity (kg/kg) [nlev]
@@ -493,7 +583,11 @@ def tiedtke_nordeng_convection(
         qi: Cloud ice mixing ratio (kg/kg) [nlev]
         dt: Time step (s)
         config: Convection configuration
-        
+        land_fraction: Fraction of column underlying land (0=ocean, 1=land).
+            Selects ECHAM's per-surface ``zdnoprc`` precip-zone threshold
+            via ``config.cu_dnoprc_ocean`` / ``config.cu_dnoprc_land``.
+            Defaults to 0 (ocean).
+
     Returns:
         Tuple of (tendencies, final_state) with fixed qc/qi transport
 
@@ -522,13 +616,45 @@ def tiedtke_nordeng_convection(
         lambda: (jnp.array(0.0), jnp.array(0.0))
     )
     
-    # Determine convection type based on CAPE and other criteria
+    # Determine convection type based on CAPE + free-troposphere moisture.
     # 0 = no convection, 1 = deep, 2 = shallow, 3 = mid-level
-    # Use more reasonable CAPE thresholds for triggering
+    #
+    # Mirrors the ECHAM trigger structure (mo_cumastr.f90 ``zktype`` line
+    # 276 + ``cubasmc`` line 660). ECHAM activates ktype=3 (mid-level
+    # convection) inside ``cuasc`` when no surface-based deep/shallow
+    # convection has fired AND a free-tropospheric layer is moist
+    # (RH > 90 %), upward-rising and above the boundary layer (z > 1500 m).
+    #
+    # JAX uses CAPE-based closure (which is more responsive than ECHAM's
+    # PBL-moisture-convergence closure on the same column) so ``ktype=1``
+    # often fires here when ECHAM would have picked ``ktype=3`` instead.
+    # We add ``ktype=3`` as a fallback for *moderate* CAPE columns
+    # (100 < CAPE < 1000 J/kg) with high free-tropospheric RH — a proxy
+    # for the cubasmc trigger that doesn't require a separate vertical-
+    # velocity input. Deep ``ktype=1`` still wins when CAPE is large.
+    qsat_env = jax.vmap(saturation_mixing_ratio)(pressure, temperature)
+    rh_env = humidity / jnp.maximum(qsat_env, 1e-12)
+    # Free-troposphere mask: ~700-300 hPa
+    free_trop_mask = jnp.logical_and(pressure < 70_000.0, pressure > 30_000.0)
+    has_moist_free_trop = jnp.any(
+        jnp.logical_and(free_trop_mask, rh_env > 0.90)
+    )
+
+    def select_active_conv_type():
+        # Deep convection if CAPE is strong
+        def deep_branch():
+            return jnp.array(1)
+        # Otherwise, mid-level if free-trop moist conditions met,
+        # else shallow.
+        def mid_or_shallow_branch():
+            return lax.cond(has_moist_free_trop, lambda: jnp.array(3),
+                            lambda: jnp.array(2))
+        return lax.cond(cape > 1000.0, deep_branch, mid_or_shallow_branch)
+
     conv_type = lax.cond(
-        jnp.logical_and(has_cloud_base, cape > 100.0),  # Minimum CAPE threshold
-        lambda: lax.cond(cape > 1000.0, lambda: 1, lambda: 2),  # Deep vs shallow
-        lambda: 0  # No convection
+        jnp.logical_and(has_cloud_base, cape > 100.0),
+        select_active_conv_type,
+        lambda: jnp.array(0),  # No convection
     )
     
     # Initialize tendencies to zero with explicit float32 dtype
@@ -550,16 +676,21 @@ def tiedtke_nordeng_convection(
     
     # Apply full convection scheme if active (with tracer transport)
     def apply_full_convection():
-        # Cloud-top scan ceiling. Deep convection in the tropics commonly
-        # reaches the tropopause (~12-15 km, ~15-20 levels above cloud
-        # base on the ICON 47-level grid); shallow convection peaks
-        # around 2-3 km. Set a generous scan range and let the updraft's
-        # dynamic termination (negative buoyancy or mfu < 1% of base —
-        # see ``calculate_updraft``) decide where the cloud actually
-        # ends. The previous values (6 for deep, 3 for shallow) capped
-        # deep convection at ~3 km so it could never properly transport
-        # heat / moisture through the troposphere.
-        cloud_depth = lax.cond(conv_type == 2, lambda: 5, lambda: 15)
+        # Cloud-top scan ceiling. The ceiling is a *maximum* depth, not
+        # the actual cloud top — actual termination is decided
+        # dynamically inside ``calculate_updraft`` (negative buoyancy or
+        # mfu < 1 % of mfb). Derive the ceiling from a target cloud-top
+        # PRESSURE rather than a fixed level count so the value is
+        # vertical-resolution-independent. Targets:
+        #   * Deep:    150 hPa (tropical Cb tops near the tropopause)
+        #   * Shallow: 700 hPa (trade-cumulus tops at ~3 km)
+        # See ``cloud_depth_for_target_top`` for the derivation and a
+        # detailed discussion of why a fixed level count is wrong.
+        cloud_depth = lax.cond(
+            conv_type == 2,
+            lambda: cloud_depth_for_target_top(pressure, cloud_base, 70_000.0),
+            lambda: cloud_depth_for_target_top(pressure, cloud_base, 15_000.0),
+        )
 
         # Handle level ordering properly
         pressure_increasing = pressure[0] < pressure[-1]
@@ -583,11 +714,16 @@ def tiedtke_nordeng_convection(
         # Calculate updraft
         updraft_state = calculate_updraft(
             temperature, humidity, pressure, layer_thickness, rho,
-            cloud_base, ktop, conv_type, mass_flux_base, config
+            cloud_base, ktop, conv_type, mass_flux_base, config,
+            land_fraction=land_fraction,
         )
         
         # Calculate precipitation from updraft
-        precip_rate = jnp.sum(updraft_state.lu * updraft_state.mfu) * config.cprcon
+        # Use the per-layer precip generated inside calculate_updraft (the
+        # ECHAM ``pdmfup`` accumulator) rather than the previous
+        # ``sum(lu*mfu)*cprcon`` estimator, which was ~60x too small on
+        # tropical RCE columns. See ``flux_tendencies.calculate_precipitation_rate``.
+        precip_rate = jnp.sum(updraft_state.pdmfup)
         
         # Calculate downdraft (now properly implemented)
         downdraft_state = calculate_downdraft(
@@ -626,13 +762,55 @@ def tiedtke_nordeng_convection(
         # remove any residual supersaturation via iterative saturation
         # adjustment (matches the post-convection `cuadjtq` call in the
         # ECHAM reference), then re-derive the tendencies that produce
-        # the adjusted state. Previously this step was missing — the
-        # `convective_adjustment` helper existed but was never called,
-        # leaving the post-convection state supersaturated.
+        # the adjusted state.
+        #
+        # Restrict the adjustment to the cloud column. ECHAM's `cuadjtq`
+        # is only called on the cloud levels processed by cuasc /
+        # cubase; running it across the whole column makes the
+        # saturation adjustment fire on every above-cloud-top level
+        # whose initial RH happens to exceed the JAX qsat cutoff
+        # (which differs slightly from the lookup-table values ECHAM
+        # uses), producing spurious heating tens of times larger than
+        # the actual convective flux divergence. See the harness
+        # comparison in fortran_harness/compare_cumastr.py for the
+        # diagnostic that surfaces this.
+        #
+        # The cloud column is delimited by the *actual* updraft extent
+        # (where mfu is still nonzero), not the scan ceiling ``ktop`` —
+        # using the ceiling lets the adjustment fire above the real
+        # cloud top, where the env can be supersaturated relative to
+        # JAX's qsat formula and the iteration explodes into spurious
+        # condensational heating. Derive the actual top from where the
+        # updraft mass flux extends.
+        _mfu_active_for_mask = updraft_state.mfu > config.cmfcmin
+        _has_active_for_mask = jnp.any(_mfu_active_for_mask)
+        _candidate_for_mask = jnp.where(
+            _mfu_active_for_mask, jnp.arange(nlev),
+            jnp.array(nlev, jnp.int32),
+        )
+        actual_top_for_mask = jnp.where(
+            _has_active_for_mask,
+            jnp.min(_candidate_for_mask).astype(jnp.int32),
+            ktop,
+        )
+        cloud_top = jnp.minimum(actual_top_for_mask, cloud_base)
+        cloud_bottom = jnp.maximum(actual_top_for_mask, cloud_base)
+        cloud_mask = (jnp.arange(nlev) >= cloud_top - 1) & (
+            jnp.arange(nlev) <= cloud_bottom
+        )
+        zero_outside = lambda arr: jnp.where(cloud_mask, arr, 0.0)
         t_adj, q_adj, qc_adj, qi_adj = convective_adjustment(
             temperature, humidity, pressure, qc, qi,
-            tendencies.dtedt, tendencies.dqdt, dqc_dt, dqi_dt, dt,
+            zero_outside(tendencies.dtedt), zero_outside(tendencies.dqdt),
+            zero_outside(dqc_dt), zero_outside(dqi_dt), dt,
         )
+        # Outside the cloud column, leave the original state untouched
+        # (no tendency, no condensation) regardless of what the
+        # saturation lookup said.
+        t_adj  = jnp.where(cloud_mask, t_adj,  temperature)
+        q_adj  = jnp.where(cloud_mask, q_adj,  humidity)
+        qc_adj = jnp.where(cloud_mask, qc_adj, qc)
+        qi_adj = jnp.where(cloud_mask, qi_adj, qi)
         inv_dt = 1.0 / jnp.maximum(dt, 1e-6)
         dtedt_adj = (t_adj - temperature) * inv_dt
         dqdt_adj = (q_adj - humidity) * inv_dt
@@ -653,6 +831,25 @@ def tiedtke_nordeng_convection(
             dqi_dt=dqi_dt_adj,
         )
         
+        # ECHAM-ICON convention: ktop is the smallest level index (highest
+        # altitude) where the updraft mass flux is still nonzero — i.e.
+        # where the dynamic termination in `calculate_updraft` last left
+        # a nonzero `mfu` before zeroing it above. The previous code wrote
+        # the *scan ceiling* ``ktop = kbase - cloud_depth``, which masks
+        # the actual cloud top whenever the updraft terminates early.
+        # Re-derive it from where ``updraft_state.mfu`` is still active.
+        mfu_active = updraft_state.mfu > config.cmfcmin
+        has_active = jnp.any(mfu_active)
+        candidate = jnp.where(
+            mfu_active, jnp.arange(nlev), jnp.array(nlev, jnp.int32),
+        )
+        # ``min(candidate)`` = topmost active level (smallest index in
+        # ECHAM ordering). If no level is active, fall back to the scan
+        # ceiling so downstream consumers don't see ``nlev``.
+        actual_ktop = jnp.where(
+            has_active, jnp.min(candidate).astype(jnp.int32), ktop,
+        )
+
         # Update state
         new_state = ConvectionState(
             tu=updraft_state.tu, qu=updraft_state.qu, lu=updraft_state.lu,
@@ -660,8 +857,8 @@ def tiedtke_nordeng_convection(
             td=downdraft_state.td, qd=downdraft_state.qd,
             ud=u_wind, vd=v_wind,  # Simplified
             mfu=updraft_state.mfu, mfd=downdraft_state.mfd,
-            ktype=jnp.array(conv_type), kbase=jnp.array(cloud_base), 
-            ktop=jnp.array(ktop), prate=enhanced_tendencies.precip_conv
+            ktype=jnp.array(conv_type), kbase=jnp.array(cloud_base),
+            ktop=actual_ktop, prate=enhanced_tendencies.precip_conv,
         )
         
         return enhanced_tendencies, new_state
