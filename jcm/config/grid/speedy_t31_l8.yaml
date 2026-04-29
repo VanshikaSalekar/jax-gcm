@@ -1,0 +1,5 @@
+# T31 / 8 sigma layers — the standard SPEEDY resolution.
+vertical: sigma
+layers: 8
+spectral_truncation: 31
+spmd_mesh: null
