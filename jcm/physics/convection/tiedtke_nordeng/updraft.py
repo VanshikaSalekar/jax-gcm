@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax import lax
 from typing import NamedTuple, Tuple
 
-from jcm.physics.icon.constants.physical_constants import (
+from jcm.constants import (
     grav, cp, alhc, tmelt, eps, rd
 )
 from .tiedtke_nordeng import (

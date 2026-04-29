@@ -6,7 +6,7 @@ including individual components and integrated behavior.
 
 import jax.numpy as jnp
 
-from jcm.physics.icon.constants.physical_constants import PhysicalConstants
+from jcm.constants import PhysicalConstants
 from .vertical_diffusion_types import VDiffParameters, VDiffState
 from .turbulence_coefficients import (
     compute_richardson_number, compute_mixing_length, compute_exchange_coefficients,

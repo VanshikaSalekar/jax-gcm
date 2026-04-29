@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from typing import Tuple
 
-from jcm.physics.icon.constants.physical_constants import PhysicalConstants
+from jcm.constants import PhysicalConstants
 from .vertical_diffusion_types import VDiffParameters, VDiffState, VDiffDiagnostics
 
 # Create constants instance
@@ -413,7 +413,7 @@ def compute_surface_fluxes(
         Tuple of (momentum_flux_u, momentum_flux_v, heat_flux, moisture_flux)
 
     """
-    from jcm.physics.icon.constants.physical_constants import grav, cp, karman_const
+    from jcm.constants import grav, cp, karman_const
     
     # Surface wind speed
     wind_u = state.u[:, -1]

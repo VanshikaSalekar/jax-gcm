@@ -362,7 +362,13 @@ class Model:
         diffuse_vor_q = self._make_diffusion_fn(
             self.diffusion.vor_q_timescale,
             self.diffusion.vor_q_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(vorticity=u_temp.vorticity,tracers={'specific_humidity': u_temp.tracers['specific_humidity']}),
+            # Apply the filter to vorticity and every tracer (specific_humidity + any
+            # extras like qc/qi/qnc). Keeping only specific_humidity silently zeros
+            # microphysics tracers over time.
+            replace_fn=lambda u_next, u_temp: u_next.replace(
+                vorticity=u_temp.vorticity,
+                tracers=dict(u_temp.tracers),
+            ),
             level_orders=self.diffusion.level_orders_vor_q,
         )
 
@@ -452,10 +458,12 @@ class Model:
         """
         from jcm.physics_interface import physics_state_to_dynamics_state
 
+        tracer_specs = {spec.name: spec for spec in self.physics.required_tracers()}
+
         # Either use the designated initial state, or generate one. The initial state to the dycore is a modal primitive_equations.State,
         # but the optional initial state from the user is a nodal PhysicsState
         if physics_state is not None:
-            state = physics_state_to_dynamics_state(physics_state, self.primitive)
+            state = physics_state_to_dynamics_state(physics_state, self.primitive, tracer_specs=tracer_specs)
         else:
             state = self.default_state_fn(jax.random.PRNGKey(random_seed))
             # For sigma coords, we want log(P_s / p0) so that `exp(log_sp)` gives
@@ -473,6 +481,17 @@ class Model:
             state.tracers = {
                 'specific_humidity': (1e-2 if humidity_perturbation else 0.0) * primitive_equations_states.gaussian_scalar(self.coords, self.physics_specs)
             }
+
+        # Seed modal tracers for every TracerSpec the physics declares so that the
+        # dynamics core advects them. Shape matches specific_humidity (modal).
+        for spec in tracer_specs.values():
+            if spec.name in state.tracers:
+                continue
+            state.tracers[spec.name] = (
+                spec.initial_value
+                * jnp.ones_like(state.tracers['specific_humidity'])
+            )
+
         return primitive_equations.State(**state.asdict(), sim_time=sim_time)
 
     def _date_from_sim_time(self, sim_time) -> DateData:
@@ -530,8 +549,9 @@ class Model:
         from jcm.physics_interface import verify_state
         jax.debug.callback(lambda t: logger.info("Post processing: %s simulated seconds", t), state.sim_time)
 
+        tracer_specs = {spec.name: spec for spec in self.physics.required_tracers()}
         predictions = Predictions(
-            dynamics=dynamics_state_to_physics_state(state, self.primitive),
+            dynamics=dynamics_state_to_physics_state(state, self.primitive, tracer_specs=tracer_specs),
             physics=None,
             times=None
         )
@@ -687,7 +707,8 @@ class Model:
 
         """
         if isinstance(initial_state, primitive_equations.State):
-            self.initial_nodal_state = dynamics_state_to_physics_state(initial_state, self.primitive)
+            tracer_specs = {spec.name: spec for spec in self.physics.required_tracers()}
+            self.initial_nodal_state = dynamics_state_to_physics_state(initial_state, self.primitive, tracer_specs=tracer_specs)
             self._final_modal_state = initial_state
         else:
             self.initial_nodal_state = initial_state
