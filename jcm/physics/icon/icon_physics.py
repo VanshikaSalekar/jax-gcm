@@ -140,8 +140,8 @@ def _radiation_with_caching(
     """
     nlev, ncols = state.temperature.shape
     interval = parameters.radiation.radiation_interval
-    dt = physics_data.date.dt_seconds
-    step = physics_data.date.model_step
+    dt = physics_data.dt_seconds
+    step = physics_data.model_step
 
     # interval <= 0 ⇒ compute every step (default)
     steps_per_call = jnp.where(
@@ -229,7 +229,10 @@ def _apply_radiation_inner(state: PhysicsState,
     latitudes, longitudes = lat.reshape(ncols), lon.reshape(ncols)
 
     # Get date information for solar calculations
-    date = physics_data.date.dt
+    # Solar geometry comes pre-baked on `forcing.solar` (populated by
+    # `Model._get_step_fn_factory` ↔ `ForcingData.select(date)`). The
+    # radiation scheme stays date-free.
+    solar = forcing.solar
     
     # Get cloud properties from tracers and previous physics
     cloud_water = state.tracers.get('qc', jnp.zeros_like(state.temperature))
@@ -272,7 +275,7 @@ def _apply_radiation_inner(state: PhysicsState,
       physics_data.diagnostics.air_density, cloud_water, cloud_ice, cloud_fraction,
       surface_temperature_col, surface_albedo_vis_col,
       surface_albedo_nir_col, surface_emissivity_col,
-      date, latitudes, longitudes,
+      solar, latitudes, longitudes,
       parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr)
     
     # Unpack structured results directly
@@ -344,7 +347,10 @@ def _apply_radiation_rrtmgp_inner(
     )
     latitudes, longitudes = lat.reshape(ncols), lon.reshape(ncols)
 
-    date = physics_data.date.dt
+    # Solar geometry comes pre-baked on `forcing.solar` (populated by
+    # `Model._get_step_fn_factory` ↔ `ForcingData.select(date)`). The
+    # radiation scheme stays date-free.
+    solar = forcing.solar
 
     cloud_water = state.tracers.get('qc', jnp.zeros_like(state.temperature))
     cloud_ice = state.tracers.get('qi', jnp.zeros_like(state.temperature))
@@ -389,7 +395,7 @@ def _apply_radiation_rrtmgp_inner(
         cloud_water, cloud_ice, cloud_fraction,
         surface_temperature_col, surface_albedo_vis_col,
         surface_albedo_nir_col, surface_emissivity_col,
-        date, latitudes, longitudes,
+        solar, latitudes, longitudes,
         parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr,
     )
 
@@ -454,7 +460,10 @@ def _apply_radiation_emulated_inner(
     )
     latitudes, longitudes = lat.reshape(ncols), lon.reshape(ncols)
 
-    date = physics_data.date.dt
+    # Solar geometry comes pre-baked on `forcing.solar` (populated by
+    # `Model._get_step_fn_factory` ↔ `ForcingData.select(date)`). The
+    # radiation scheme stays date-free.
+    solar = forcing.solar
 
     cloud_water = state.tracers.get('qc', jnp.zeros_like(state.temperature))
     cloud_ice = state.tracers.get('qi', jnp.zeros_like(state.temperature))
@@ -505,7 +514,7 @@ def _apply_radiation_emulated_inner(
         cloud_water, cloud_ice, cloud_fraction,
         surface_temperature_col, surface_albedo_vis_col,
         surface_albedo_nir_col, surface_emissivity_col,
-        date, latitudes, longitudes,
+        solar, latitudes, longitudes,
         parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr,
         emulator_weights, sw_scaling, lw_scaling,
     )
@@ -944,8 +953,7 @@ def apply_vertical_diffusion(
     # path sees consistent fractions.
     nsfc_type = 3  # water, ice, land
     land_fraction = terrain.fmask.reshape(ncols)
-    raw_ice = forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am
-    sea_ice_fraction = jnp.clip(raw_ice.reshape(ncols), 0.0, 1.0 - land_fraction)
+    sea_ice_fraction = jnp.clip(forcing.sice_am.reshape(ncols), 0.0, 1.0 - land_fraction)
     water_fraction = 1.0 - land_fraction - sea_ice_fraction
     surface_fraction = jnp.zeros((ncols, nsfc_type))
     surface_fraction = surface_fraction.at[:, 0].set(water_fraction)
@@ -956,8 +964,7 @@ def apply_vertical_diffusion(
     # freezing point ``ctfreez = 271.38 K`` (ECHAM ``iniphy.f90:71``)
     # capped by SST for ice, and ``forcing.stl_am`` for land.
     sst_col = physics_data.surface.surface_temperature.reshape(ncols)
-    land_temp_col = (forcing.stl_am[..., 0] if forcing.stl_am.ndim == 3
-                     else forcing.stl_am).reshape(ncols)
+    land_temp_col = forcing.stl_am.reshape(ncols)
     ctfreez = 271.38  # K, ECHAM ``iniphy.f90:71``
     ice_temp_col = jnp.where(sea_ice_fraction > 0.0,
                              jnp.minimum(sst_col, ctfreez),
@@ -1110,8 +1117,7 @@ def apply_surface(
     nsfc_type = 3
     surface_fractions = jnp.zeros((ncols, nsfc_type))
     land_fraction = terrain.fmask.reshape((ncols,))
-    raw_ice = forcing.sice_am[..., 0] if forcing.sice_am.ndim == 3 else forcing.sice_am
-    sea_ice_fraction = jnp.clip(raw_ice.reshape((ncols,)), 0.0, 1.0 - land_fraction)
+    sea_ice_fraction = jnp.clip(forcing.sice_am.reshape((ncols,)), 0.0, 1.0 - land_fraction)
     water_fraction = 1.0 - land_fraction - sea_ice_fraction
     surface_fractions = surface_fractions.at[:, 0].set(water_fraction)
     surface_fractions = surface_fractions.at[:, 1].set(sea_ice_fraction)
@@ -1124,8 +1130,7 @@ def apply_surface(
     # ice surface temperature physically.
     ocean_temp = surface_temp
     ctfreez = 271.38  # K, ECHAM ``iniphy.f90:71`` saline-water freezing
-    land_temp = (forcing.stl_am[..., 0] if forcing.stl_am.ndim == 3
-                 else forcing.stl_am).reshape(ncols)
+    land_temp = forcing.stl_am.reshape(ncols)
     ice_surface_temp = jnp.where(sea_ice_fraction > 0.0,
                                  jnp.minimum(surface_temp, ctfreez),
                                  surface_temp)

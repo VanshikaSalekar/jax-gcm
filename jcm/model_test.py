@@ -336,6 +336,41 @@ class TestModelUnit(unittest.TestCase):
             assert ((lower <= pred_ds_monthly[var]).all()) & ((pred_ds_monthly[var] <= upper).all())
 
 
+class TestCalendarDurations(unittest.TestCase):
+    """Calendar-string save_interval / total_time."""
 
+    def _build_held_suarez_model(self):
+        from jcm.physics.held_suarez.held_suarez_physics import held_suarez_physics
+        from jcm.model import Model
+        from jcm.terrain import TerrainData
+        from jcm.physics.held_suarez.utils import get_held_suarez_coords
+        coords = get_held_suarez_coords()
+        terrain = TerrainData.from_coords(coords)
+        return Model(coords=coords, terrain=terrain, time_step=180,
+                     physics=held_suarez_physics())
+
+    def test_run_with_calendar_strings(self):
+        """`save_interval='1 month'`, `total_time='2 months'` should yield 2 saves."""
+        model = self._build_held_suarez_model()
+        predictions = model.run(save_interval='1 month', total_time='2 months')
+        # Under the default 365_day calendar, '1 month' is 365/12 days,
+        # and total/save = 2 outer steps.
+        self.assertEqual(predictions.dynamics.temperature.shape[0], 2)
+
+    def test_xarray_resample_pattern(self):
+        """Calendar-aligned aggregation is exposed via xarray's standard
+        `resample` API on `to_xarray()` — no special model-level helper.
+        Pin the pattern as it's documented in `getting_started.rst`.
+        """
+        model = self._build_held_suarez_model()
+        # 90 days starting 2000-01-01 reaches the end of March, so the
+        # trajectory spans 3 calendar months.
+        predictions = model.run(save_interval='1 day', total_time='90 days')
+
+        ds = predictions.to_xarray()
+        self.assertEqual(ds.sizes['time'], 90)
+
+        monthly = ds.resample(time='1MS').mean()
+        self.assertEqual(monthly.sizes['time'], 3)
 
 

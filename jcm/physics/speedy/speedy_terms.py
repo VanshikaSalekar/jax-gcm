@@ -27,9 +27,7 @@ from jcm.physics.speedy.params import (
     ModRadConParameters,
     SurfaceFluxParameters,
     VerticalDiffusionParameters,
-    ForcingParameters,
 )
-from jcm.utils import tree_index_3d
 
 import jax.numpy as jnp
 from jcm.physics_interface import PhysicsState, PhysicsTendency
@@ -51,8 +49,7 @@ def set_physics_flags(
     sub-steps.
     """
     from jcm.physics.speedy.physical_constants import nstrad
-    model_step = physics_data.date.model_step
-    compute_shortwave = (jnp.mod(model_step, nstrad) == 0)
+    compute_shortwave = (jnp.mod(physics_data.model_step, nstrad) == 0)
     shortwave_data = physics_data.shortwave_rad.copy(
         compute_shortwave=compute_shortwave,
     )
@@ -75,7 +72,6 @@ def _params_with(**overrides) -> Parameters:
         mod_radcon=overrides.get("mod_radcon", p.mod_radcon),
         surface_flux=overrides.get("surface_flux", p.surface_flux),
         vertical_diffusion=overrides.get("vertical_diffusion", p.vertical_diffusion),
-        forcing=overrides.get("forcing", p.forcing),
     )
 
 
@@ -95,7 +91,12 @@ def _data_from_diagnostics(
     """
     date = diagnostics.get("_date", DateData.zeros())
 
-    data = PhysicsData.zeros(nodal_shape, num_levels, date=date, speedy_coords=coords)
+    data = PhysicsData.zeros(
+        nodal_shape, num_levels,
+        model_step=date.model_step,
+        dt_seconds=date.dt_seconds,
+        speedy_coords=coords,
+    )
 
     # Restore any previously populated sub-structs from the diagnostics
     if "_shortwave_rad" in diagnostics:
@@ -191,13 +192,9 @@ class SpeedyForcing(SpeedyTermBase):
     name: ClassVar[str] = "speedy_forcing"
     category: ClassVar[str] = "forcing"
 
-    def __init__(self, forcing_params=None, mod_radcon_params=None):
+    def __init__(self, mod_radcon_params=None):
         """Initialize SpeedyForcing."""
         super().__init__()
-        # ForcingParameters contains bools/ints — not differentiable, use Variable
-        self.forcing_params = nnx.Variable(
-            forcing_params or ForcingParameters.default()
-        )
         self.mod_radcon_params = nnx.Param(
             mod_radcon_params or ModRadConParameters.default()
         )
@@ -205,21 +202,16 @@ class SpeedyForcing(SpeedyTermBase):
     def __call__(self, state, diagnostics, forcing, terrain):
         data = self._build_data(diagnostics)
         params = _params_with(
-            forcing=self.forcing_params.get_value(),
             mod_radcon=self.mod_radcon_params.get_value(),
         )
 
-        # Slice forcing to current day of year
-        date = diagnostics.get("_date", DateData.zeros())
-        model_day_of_year = date.model_day()
-        forcing_2d = tree_index_3d(forcing, model_day_of_year)
-
         from jcm.physics.forcing.speedy_forcing import set_forcing
-        tend, data = set_forcing(state, data, params, forcing_2d, terrain)
+        tend, data = set_forcing(state, data, params, forcing, terrain)
 
         diagnostics = _diagnostics_from_data(diagnostics, data)
-        # Store the sliced forcing for downstream terms
-        diagnostics["_forcing_2d"] = forcing_2d
+        # Downstream terms read the current-step forcing slice off this
+        # diagnostic key.
+        diagnostics["_forcing_2d"] = forcing
         return tend, diagnostics
 
 
@@ -483,7 +475,6 @@ def speedy_physics(parameters: Parameters | None = None, checkpoint_terms: bool 
         terms=[
             SpeedyFlags(),
             SpeedyForcing(
-                forcing_params=p.forcing,
                 mod_radcon_params=p.mod_radcon,
             ),
             SpeedyHumidity(),

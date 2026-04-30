@@ -229,11 +229,9 @@ def get_zonal_average_fields(
 ) -> PhysicsData:
     """Calculate zonal average fields including solar radiation, ozone depth,
     and polar night cooling in the stratosphere using JAX.
-    
-    Parameters
-    ----------
-    tyear : float - physics_data.date.tyear
-        Time as fraction of year (0-1, 0 = 1 Jan)
+
+    Reads the fraction of year off ``forcing.solar.tyear`` (populated by
+    `Model._get_step_fn_factory` ↔ `ForcingData.select(date)`).
 
     Returns
     -------
@@ -251,8 +249,14 @@ def get_zonal_average_fields(
     """
     kx, ix, il = state.temperature.shape
 
+    # `forcing.solar` is precomputed by `Model._get_step_fn_factory` ↔
+    # `ForcingData.select(date)`, so this routine never has to read the
+    # date object directly. tyear here matches the SPEEDY convention used
+    # by the `solar` lookup below.
+    tyear = forcing.solar.tyear
+
     # Alpha = year phase (0 - 2pi, 0 = winter solstice = 22 Dec)
-    alpha = 4.0 * jnp.arcsin(1.0) * (physics_data.date.tyear + 10.0 / 365.0)
+    alpha = 4.0 * jnp.arcsin(1.0) * (tyear + 10.0 / 365.0)
     dalpha = 0.0
 
     coz1 = jnp.maximum(0.0, jnp.cos(alpha - dalpha))
@@ -267,7 +271,7 @@ def get_zonal_average_fields(
 
     # Solar radiation at the top
     topsr = jnp.zeros(il)
-    topsr = solar(physics_data.date.tyear,physics_data.speedy_coords,4*solc)
+    topsr = solar(tyear, physics_data.speedy_coords, 4*solc)
 
     def compute_fields(sia_j, coa_j, topsr_j):
         flat2 = 1.5 * sia_j ** 2 - 0.5

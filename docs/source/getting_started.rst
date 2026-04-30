@@ -107,11 +107,17 @@ For a more realistic simulation with orography and time-varying boundary conditi
    terrain_file = data_dir / "terrain.nc"
    terrain = TerrainData.from_file(terrain_file, coords=coords)
 
-   # Load realistic forcing data (SST, sea ice, soil moisture, etc.) interpolated to T31 grid
+   # Load realistic forcing data (SST, sea ice, soil moisture, etc.) interpolated to T31 grid.
+   # Time-varying variables are wrapped as `TimeSeries` leaves; the Model
+   # picks the right slice each step via `forcing.select(date)`. By default
+   # `from_file` auto-detects climatology vs date-aligned mode from the
+   # netCDF time axis (one-year files wrap, multi-year files align by date).
    forcing_file = data_dir / "forcing.nc"
    forcing = ForcingData.from_file(forcing_file, coords=coords)
 
-   # Create model with realistic configuration
+   # Create model with realistic configuration. SPEEDY assumes a 365-day
+   # no-leap calendar by construction; pass `calendar='gregorian'` if you
+   # want the model clock to advance against real Gregorian timestamps.
    model = Model(
       coords,
       time_step=30.0,
@@ -185,6 +191,74 @@ You can customize various aspects of the model:
        save_interval=1.0,
        total_time=10.0
    )
+
+
+Calendar-aware durations and resampling
+---------------------------------------
+
+``Model.run`` and ``Model.resume`` accept either a numeric day count or a
+calendar-string for ``save_interval`` and ``total_time``. Strings like
+``'1 month'`` and ``'1 year'`` are resolved against the model's calendar
+(``'365_day'`` by default; pass ``Model(calendar='gregorian')`` for the
+365.2425-day approximation). The integrator itself stays fixed-cadence —
+each "month" is a fixed 365/12-day chunk, not aligned to calendar month
+boundaries — so this is mostly an ergonomic shortcut.
+
+For *calendar-aligned* monthly / annual statistics, run the model at a
+daily ``save_interval`` and post-resample the trajectory using xarray's
+standard ``resample`` API. The trajectory's ``time`` coord is real
+``datetime64``, so xarray's resampler does the calendar bookkeeping:
+
+.. code-block:: python
+
+   predictions = model.run(save_interval='1 day', total_time='1 year')
+   ds = predictions.to_xarray()
+
+   # Calendar-aligned monthly means.
+   monthly = ds.resample(time='1MS').mean()
+
+   # Daily total precipitation summed into calendar months, etc.
+   monthly_precip = ds['precipitation'].resample(time='1MS').sum()
+
+The cost of this pattern is keeping daily output in memory for the
+duration of the run.
+
+Long forcing time-series and chunked runs
+-----------------------------------------
+
+For multi-year forcing files, it's often convenient to run the model one
+year at a time. This keeps memory bounded and lets you save output as you
+go. Use ``xarray.Dataset.groupby('time.year')`` to slice the forcing,
+then ``Model.run`` for the first year and ``Model.resume`` for subsequent
+years to continue from the previous state:
+
+.. code-block:: python
+
+   import xarray as xr
+   from jcm.forcing import ForcingData
+
+   ds = xr.open_dataset('era5_1980_2010.nc')
+   yearly_outputs = []
+
+   year_iter = iter(ds.groupby('time.year'))
+
+   year, year_ds = next(year_iter)
+   forcing = ForcingData.from_dataset(year_ds, coords=coords)
+   preds = model.run(forcing=forcing, save_interval='1 day',
+                     total_time='1 year')
+   yearly_outputs.append(preds.to_xarray())
+
+   for year, year_ds in year_iter:
+       forcing = ForcingData.from_dataset(year_ds, coords=coords)
+       preds = model.resume(forcing=forcing, save_interval='1 day',
+                            total_time='1 year')
+       yearly_outputs.append(preds.to_xarray())
+
+   trajectory = xr.concat(yearly_outputs, dim='time')
+
+xarray's lazy loading means each year's slice only pulls the data it
+actually needs from disk, so this stays memory-efficient even for very
+long forcing records.
 
 
 Multi-Device Parallelization

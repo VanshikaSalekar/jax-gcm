@@ -1,5 +1,5 @@
 import unittest
-from jcm.date import fraction_of_year_elapsed, DateData
+from jcm.date import fraction_of_year_elapsed, DateData, parse_duration_days
 from jcm.model import Model
 import jax_datetime as jdt
 import jax.numpy as jnp
@@ -43,9 +43,52 @@ class TestDateUnit(unittest.TestCase):
         self.assertAlmostEqual(d3.tyear, 0.25, places=2)
 
     def test_overflow(self):
-        model = Model(coords=get_speedy_coords(), start_date=jdt.to_datetime('1970-01-01'))
+        # Use gregorian calendar so the 365.2425-day-per-year arithmetic in
+        # this test matches the model's internal accounting; SPEEDY's 365-day
+        # default would accumulate the 0.2425-day mismatch across decades.
+        model = Model(
+            coords=get_speedy_coords(),
+            start_date=jdt.to_datetime('1970-01-01'),
+            calendar='gregorian',
+        )
         for i in range(6):
             year = 10**i
             date = model._date_from_sim_time((year+.5) * 365.2425 * 86400)
             self.assertEqual(date.model_year, jnp.round(1970 + year))
             self.assertTrue(jnp.isclose(date.tyear, 0.5, atol=1e-2))
+
+
+class TestParseDurationDays(unittest.TestCase):
+
+    def test_numeric_passthrough(self):
+        self.assertEqual(parse_duration_days(10), 10.0)
+        self.assertEqual(parse_duration_days(2.5), 2.5)
+
+    def test_fixed_units(self):
+        self.assertAlmostEqual(parse_duration_days('30 minutes'), 30 / 1440)
+        self.assertAlmostEqual(parse_duration_days('12 hours'), 0.5)
+        self.assertAlmostEqual(parse_duration_days('5 days'), 5.0)
+        self.assertAlmostEqual(parse_duration_days('2 weeks'), 14.0)
+
+    def test_unit_aliases(self):
+        # The same physical duration spelled differently should agree.
+        self.assertEqual(parse_duration_days('1 d'), parse_duration_days('1 day'))
+        self.assertEqual(parse_duration_days('1 day'), parse_duration_days('1 days'))
+        self.assertEqual(parse_duration_days('3 hr'), parse_duration_days('3 hours'))
+        self.assertEqual(parse_duration_days('1 mo'), parse_duration_days('1 month'))
+        self.assertEqual(parse_duration_days('1 yr'), parse_duration_days('1 year'))
+
+    def test_calendar_year(self):
+        self.assertAlmostEqual(parse_duration_days('1 year', calendar='365_day'), 365.0)
+        self.assertAlmostEqual(parse_duration_days('1 year', calendar='gregorian'), 365.2425)
+        self.assertAlmostEqual(parse_duration_days('5 years', calendar='365_day'), 1825.0)
+
+    def test_calendar_month(self):
+        self.assertAlmostEqual(parse_duration_days('1 month', calendar='365_day'), 365.0 / 12)
+        self.assertAlmostEqual(parse_duration_days('12 months', calendar='365_day'), 365.0)
+
+    def test_unknown_unit_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_duration_days('1 fortnight')
+        with self.assertRaises(ValueError):
+            parse_duration_days('not a duration')

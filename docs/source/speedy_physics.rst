@@ -424,24 +424,16 @@ Forcing and Boundary Conditions
 - Soil moisture
 - Surface albedo
 - Orographic parameters
+- CO₂ mixing ratio
 
-**CO₂ Forcing**: Optional increasing CO₂ concentration over time.
+All boundary conditions live on :py:class:`jcm.forcing.ForcingData`. They
+can be constant or time-varying — when a field varies in time, the model
+takes care of picking the right value for each step (see
+:py:class:`jcm.forcing.ForcingData` for details).
 
-**Configurable Parameters** (:py:class:`ForcingParameters`):
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 60 20
-
-   * - Parameter
-     - Description
-     - Default
-   * - ``increase_co2``
-     - Enable time-varying CO₂
-     - True
-   * - ``co2_year_ref``
-     - Reference year for CO₂
-     - 1950
+**CO₂ Forcing**: ``ForcingData.co2_vmr`` is the CO₂ mixing ratio in ppmv.
+Pass a scalar for a constant-CO₂ run, or a time series for a historical /
+scenario run. The default is 360 ppmv (SPEEDY's reference value).
 
 Using Custom Parameters
 -----------------------
@@ -585,9 +577,11 @@ Assumptions and Limitations
 
 **Forcing Data**:
 
-- Requires either daily climatological or constant boundary conditions
-- Assumes 365-day year for climatological forcing
-- SST and other boundary conditions are prescribed (not predicted)
+- One-year climatology files are reused on every simulated year. Multi-year
+  files are aligned by date.
+- SPEEDY uses a no-leap (365-day) year by default. Pass
+  ``Model(calendar='gregorian')`` if you need real Gregorian timestamps.
+- SST and other boundary conditions are prescribed (not predicted).
 
 **Domain**:
 
