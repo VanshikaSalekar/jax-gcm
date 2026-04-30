@@ -23,6 +23,8 @@ JAX-GCM (`jcm`) is a fully differentiable General Circulation Model (GCM) for at
 - **License:** Apache 2.0
 - **Status:** Alpha (v1.0.0)
 
+Note, the latest development work should target the `dev` branch. Clean, working releases are periodically merged into `main` and tagged. 
+
 ## Repository Structure
 
 ```
