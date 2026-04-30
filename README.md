@@ -113,7 +113,7 @@ python -m jcm.main --cfg job grid=icon_t85_l47_hybrid   # with overrides
 Config groups live under `jcm/config/` (`physics`, `grid`, `run`, `init`,
 `terrain`, `forcing`, `diffusion`).
 
-## Examples
+## Example notebooks
 
 Example notebooks are available in the `notebooks/` directory:
 
@@ -196,7 +196,7 @@ pytest -v
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Contributions are welcome! Please feel free to submit issues or pull requests. Note, the latest development work should target the `dev` branch. Clean, working releases are periodically merged into `main` and tagged. 
 
 ## Citation
 
