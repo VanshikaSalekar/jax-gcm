@@ -26,7 +26,9 @@ from jcm.physics.clouds.echam_1m import cloud_microphysics
 from jcm.physics.icon.parameters import Parameters
 from jcm.physics.surface.icon import surface_physics_step, initialize_surface_state
 from jcm.physics.surface.icon.surface_types import AtmosphericForcing
-from jcm.physics.gravity_waves.hines import gravity_wave_drag
+from jcm.physics.gravity_waves.hines import hines_gwd
+from jcm.physics.gravity_waves.simple import simple_gwd
+from jcm.physics.gravity_waves.sso import sso_drag
 from jcm.physics.chemistry import simple_chemistry
 from jcm.physics.icon.icon_physics_data import PhysicsData
 from jcm.physics.aerosol.spa import spa_activated_cdnc
@@ -1255,50 +1257,133 @@ def apply_surface(
     return physics_tendencies, updated_physics_data
 
 @jit
-def apply_gravity_waves(
+def apply_simple_gwd(
     state: PhysicsState,
     physics_data: PhysicsData,
     parameters: Parameters,
     forcing: ForcingData,
-    terrain: TerrainData
+    terrain: TerrainData,
 ) -> tuple[PhysicsTendency, PhysicsData]:
-    """Apply gravity wave drag"""
+    """Apply the simple monochromatic GWD scheme (cheap fallback)."""
+    diag = physics_data.diagnostics
     nlev, ncols = state.temperature.shape
     dt = parameters.convection.dt_conv
-    pressure_levels = physics_data.diagnostics.pressure_full
-    height_levels = physics_data.diagnostics.height_full
-    air_density = physics_data.diagnostics.air_density
-    
-    # Need orography standard deviation - use a placeholder for now
-    # In a real implementation, this would come from boundary data
-    h_std = jnp.ones(ncols) * 200.0  # 200m standard deviation
-    
-    gwd_results = jax.vmap(
-        gravity_wave_drag,
-        in_axes=(1, 1, 1,
-                 1, 1, 1,
-                 0, None, None),  # dt and config are scalars
-        out_axes=(0, 0)  # Returns (GWDTendencies, GWDState) per column
+
+    # Placeholder std-dev of sub-grid orography (200 m). The simple
+    # scheme keeps a single fixed value; the real Lott-Miller SSO
+    # scheme uses the per-column ``terrain.orostd`` instead.
+    h_std = jnp.ones(ncols) * 200.0
+
+    tend, _state = jax.vmap(
+        simple_gwd,
+        in_axes=(1, 1, 1, 1, 1, 1, 0, None, None),
+        out_axes=(0, 0),
     )(state.u_wind, state.v_wind, state.temperature,
-        pressure_levels, height_levels, air_density,
-        h_std, dt, parameters.gravity_waves)
-    
-    # Unpack structured results directly
-    gwd_tendencies_all, gwd_states_all = gwd_results
-    
+      diag.pressure_full, diag.height_full, diag.air_density,
+      h_std, dt, parameters.simple_gwd)
+
     physics_tendencies = PhysicsTendency(
-        u_wind=gwd_tendencies_all.dudt.T,
-        v_wind=gwd_tendencies_all.dvdt.T,
-        temperature=gwd_tendencies_all.dtedt.T,
+        u_wind=tend.dudt.T,
+        v_wind=tend.dvdt.T,
+        temperature=tend.dtedt.T,
         specific_humidity=jnp.zeros_like(state.specific_humidity),
-        tracers={}
+        tracers={},
     )
-    
-    # Update physics data
-    # Note: PhysicsData doesn't have a gravity_waves field, so no diagnostics storage for now
-    updated_physics_data = physics_data
-    
-    return physics_tendencies, updated_physics_data
+    return physics_tendencies, physics_data
+
+
+@jit
+def apply_hines(
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData,
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """Apply the Hines (1997) doppler-spread spectral non-orographic GWD."""
+    diag = physics_data.diagnostics
+    # Layer mass per unit area Δp / g, full-level array.
+    layer_mass = (diag.pressure_half[1:, :]
+                  - diag.pressure_half[:-1, :]) / physical_constants.grav
+
+    tend, _state = jax.vmap(
+        lambda *a: hines_gwd(*a, parameters.hines),
+        in_axes=(1, 1, 1, 1, 1, 1, 1, 1),
+        out_axes=(0, 0),
+    )(diag.pressure_half, diag.pressure_full, diag.height_half,
+      diag.air_density, layer_mass,
+      state.temperature, state.u_wind, state.v_wind)
+
+    # Convert energy dissipation (W/kg) to a temperature tendency.
+    dt_temperature = tend.dissip / physical_constants.cpd
+
+    physics_tendencies = PhysicsTendency(
+        u_wind=tend.dudt.T,
+        v_wind=tend.dvdt.T,
+        temperature=dt_temperature.T,
+        specific_humidity=jnp.zeros_like(state.specific_humidity),
+        tracers={},
+    )
+    return physics_tendencies, physics_data
+
+
+@jit
+def apply_sso(
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData,
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """Apply the Lott-Miller (1997) sub-grid orographic GW drag."""
+    diag = physics_data.diagnostics
+    nlev, ncols = state.temperature.shape
+    dt = parameters.convection.dt_conv
+    layer_mass = (diag.pressure_half[1:, :]
+                  - diag.pressure_half[:-1, :]) / physical_constants.grav
+
+    # Coriolis is only read by the (unported) mountain-lift branch.
+    coriolis = jnp.zeros((ncols,))
+
+    def _sso_one_col(pressure_full, pressure_half, layer_mass_col,
+                     temperature, u_wind, v_wind, height_full,
+                     surface_height, mean_orography, orography_std,
+                     orography_slope, orography_anisotropy,
+                     orography_orientation, peak_elevation,
+                     valley_elevation, coriolis_col, land_fraction):
+        return sso_drag(
+            jnp.asarray(dt), coriolis_col, height_full, surface_height,
+            pressure_half, pressure_full, layer_mass_col,
+            temperature, u_wind, v_wind,
+            mean_orography, orography_std, orography_slope,
+            orography_anisotropy, orography_orientation,
+            peak_elevation, valley_elevation,
+            land_fraction, parameters.sso,
+            nktopg=1, ntop=1,
+        )
+
+    tend, _state = jax.vmap(
+        _sso_one_col,
+        in_axes=(1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        out_axes=(0, 0),
+    )(diag.pressure_full, diag.pressure_half, layer_mass,
+      state.temperature, state.u_wind, state.v_wind, diag.height_full,
+      terrain.orog.reshape(-1), terrain.orog.reshape(-1),
+      terrain.orostd.reshape(-1), terrain.orosig.reshape(-1),
+      terrain.orogam.reshape(-1), terrain.orothe.reshape(-1),
+      terrain.oropic.reshape(-1), terrain.oroval.reshape(-1),
+      coriolis, terrain.fmask.reshape(-1))
+
+    dt_temperature = tend.dissip / physical_constants.cpd
+
+    physics_tendencies = PhysicsTendency(
+        u_wind=tend.dudt.T,
+        v_wind=tend.dvdt.T,
+        temperature=dt_temperature.T,
+        specific_humidity=jnp.zeros_like(state.specific_humidity),
+        tracers={},
+    )
+    return physics_tendencies, physics_data
 
 @jit
 def apply_chemistry(
