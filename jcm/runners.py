@@ -61,14 +61,14 @@ def build_coords(cfg: DictConfig):
         # ICON ships pre-tuned hybrid tables for 40 / 47 levels; for any
         # other count the user has to drop the table in by hand. Keep the
         # error chatty so the failure mode is obvious.
-        from jcm.physics.icon.icon_levels import get_icon_levels
+        from jcm.physics.echam.echam_levels import get_echam_levels
         try:
-            vert = get_icon_levels(layers)
+            vert = get_echam_levels(layers)
         except ValueError as exc:
             raise ValueError(
                 f"hybrid coords with {layers} levels are not pre-configured. "
                 "Use one of the supported counts (40, 47) or extend "
-                "jcm.physics.icon.icon_levels.get_icon_levels."
+                "jcm.physics.echam.echam_levels.get_echam_levels."
             ) from exc
         return get_coords(
             vertical_coords=vert,
@@ -90,7 +90,7 @@ def _apply_param_overrides(base, overrides: dict | None):
     Works for any ``tree_math.struct``-style container whose subgroups are
     themselves field-based dataclasses (which covers both
     ``jcm.physics.speedy.params.Parameters`` and
-    ``jcm.physics.icon.parameters.Parameters``). Unknown subgroups raise
+    ``jcm.physics.echam.parameters.Parameters``). Unknown subgroups raise
     ``ValueError`` so typos don't silently no-op.
     """
     if not overrides:
@@ -146,11 +146,11 @@ def build_physics(cfg: DictConfig):
             )
         from jcm.physics.held_suarez.held_suarez_physics import held_suarez_physics
         return held_suarez_physics()
-    if name == "icon":
-        from jcm.physics.icon.icon_terms import icon_physics
-        from jcm.physics.icon.parameters import Parameters as IconParameters
-        params = _apply_param_overrides(IconParameters.default(), overrides)
-        return icon_physics(
+    if name == "echam":
+        from jcm.physics.echam.echam_terms import echam_physics
+        from jcm.physics.echam.parameters import Parameters as EchamParameters
+        params = _apply_param_overrides(EchamParameters.default(), overrides)
+        return echam_physics(
             parameters=params,
             radiation_scheme=cfg.physics.radiation,
             cloud_scheme=cfg.physics.get("cloud_scheme", "1m"),
@@ -186,6 +186,12 @@ def build_terrain(cfg: DictConfig, coords) -> TerrainData:
             coords,
             terrain_file=terrain_cfg.file,
             interpolate=terrain_cfg.get("interpolate", True),
+        )
+    if kind == "from_file_enveloped":
+        return TerrainData.from_file(
+            terrain_cfg.file, coords=coords,
+            orog_envelope_wavenumber=terrain_cfg.get(
+                "orog_envelope_wavenumber", None),
         )
     raise ValueError(f"Unknown terrain.kind={kind!r}")
 
@@ -233,6 +239,42 @@ _T0_C = 273.15   # K, melting point reference
 
 # Tropopause cap above which we set RH = 0 in the JW humidity profile.
 _RH_CAP_PRESSURE_PA = 20000.0   # 200 hPa
+
+
+def inject_balanced_isothermal_profile(model: Model) -> None:
+    """Inject an isothermal-rest atmosphere with orography-balanced ``ps``.
+
+    Same ps-rebalance logic as :func:`inject_jw_profile` (so air doesn't
+    end up below ground over tall topography), but keeps the temperature
+    field at a uniform 288 K and humidity at zero. Useful as a robust
+    starting state for moist-physics runs over real terrain when the
+    full JW lapse-rate profile is unstable at the chosen resolution.
+
+    Mutates ``model._final_modal_state`` in place. Follow with
+    ``model.resume(...)`` rather than ``model.run(...)``.
+    """
+    from dinosaur.scales import units
+    from jcm.constants import grav, p0s1_bg, rd
+
+    model._final_modal_state = model._prepare_initial_modal_state(
+        physics_state=None, random_seed=0,
+    )
+    state = model._final_modal_state
+    p0_pa = p0s1_bg
+
+    orog = jnp.asarray(model.terrain.orog)
+    if jnp.any(orog > 1.0):
+        # Hydrostatic balance with the actual isothermal T (288 K), not
+        # ``_HYDROSTATIC_T_REF`` (260 K which is appropriate for the
+        # JW lapse-rate profile). Using the matching T avoids an
+        # initial-step pressure-temperature inconsistency.
+        ps_pa_nodal = p0_pa * jnp.exp(-grav * orog / (rd * _JW_T_SFC))
+        scale = float(model.physics_specs.nondimensionalize(1.0 * units.pascal))
+        log_ps_nodal = jnp.log(ps_pa_nodal * scale)
+        state.log_surface_pressure = model.coords.horizontal.to_modal(
+            log_ps_nodal[None, ...]
+        )
+    model._final_modal_state = state
 
 
 def inject_jw_profile(model: Model, rh: float = 0.6) -> None:
@@ -414,6 +456,14 @@ def _run_full(cfg: DictConfig, model: Model | None = None) -> ModelPredictions:
             total_time=cfg.run.total_time,
             output_averages=cfg.run.output_averages,
         )
+    if cfg.init.kind == "balanced_isothermal":
+        inject_balanced_isothermal_profile(model)
+        return model.resume(
+            forcing=forcing,
+            save_interval=cfg.run.save_interval,
+            total_time=cfg.run.total_time,
+            output_averages=cfg.run.output_averages,
+        )
     raise ValueError(f"Unknown init.kind={cfg.init.kind!r}")
 
 
@@ -556,6 +606,14 @@ def run_chunked(
         t0 = time.perf_counter()
         if i == 0 and cfg.init.kind == "jw":
             inject_jw_profile(model)
+            preds = model.resume(
+                forcing=forcing,
+                save_interval=save_interval,
+                total_time=cur_chunk,
+                output_averages=cfg.run.output_averages,
+            )
+        elif i == 0 and cfg.init.kind == "balanced_isothermal":
+            inject_balanced_isothermal_profile(model)
             preds = model.resume(
                 forcing=forcing,
                 save_interval=save_interval,

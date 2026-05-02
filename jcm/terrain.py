@@ -232,8 +232,10 @@ def get_terrain(orography: jnp.ndarray = None, fmask: jnp.ndarray = None, nodal_
             if target_resolution not in VALID_TRUNCATIONS:
                 raise ValueError(f"Invalid target resolution: {target_resolution}. Must be one of: {VALID_TRUNCATIONS}.")
             ds = upsample_terrain_ds(ds, grid=grid)
-        elif orography.shape not in VALID_NODAL_SHAPES:
-            raise ValueError(f"Invalid terrain data shape: {orography.shape}. Must be one of: {VALID_NODAL_SHAPES}.")
+        else:
+            file_shape = (ds.sizes["lon"], ds.sizes["lat"])
+            if file_shape not in VALID_NODAL_SHAPES:
+                raise ValueError(f"Invalid terrain data shape: {file_shape}. Must be one of: {VALID_NODAL_SHAPES}.")
 
         # set orography and fmask after upsampling happens
         orography, fmask = jnp.asarray(ds['orog']), jnp.asarray(ds['lsm'])
@@ -252,19 +254,22 @@ def get_terrain(orography: jnp.ndarray = None, fmask: jnp.ndarray = None, nodal_
     return orography, fmask
 
 
-def _load_sso_from_file(terrain_file):
-    """Load SSO descriptor fields from a terrain file if present.
+_SSO_NAMES = ("orostd", "orosig", "orogam", "orothe", "oropic", "oroval")
 
-    Returns a dict of the six SSO arrays, or ``None`` if the file lacks
-    any of them. Accepts the standard ECHAM-style names
-    (``orostd``/``orosig``/``orogam``/``orothe``/``oropic``/``oroval``).
+
+def _load_sso_from_file(terrain_file):
+    """Load SSO descriptor fields from a JCM-canonical terrain file if present.
+
+    Returns a dict of the six SSO arrays, or ``None`` if the file lacks any
+    of them. Use ``utils/convert_echam_bc.py`` to translate ECHAM-style
+    boundary files (uppercase ``OROSTD``/…, ``(lat, lon)``-ordered) into
+    the canonical JCM layout that this loader expects.
     """
     import xarray as xr
     ds = xr.open_dataset(terrain_file)
-    sso_names = ("orostd", "orosig", "orogam", "orothe", "oropic", "oroval")
-    if not all(name in ds for name in sso_names):
+    if not all(name in ds for name in _SSO_NAMES):
         return None
-    return {name: jnp.asarray(ds[name]) for name in sso_names}
+    return {name: jnp.asarray(ds[name]) for name in _SSO_NAMES}
 
 
 @tree_math.struct
@@ -384,8 +389,15 @@ class TerrainData:
                    lfluxland=jnp.bool_(lfluxland), **sso)
 
     @classmethod
-    def from_file(cls, terrain_file, coords: CoordinateSystem, lfluxland=True):
-        """Initialize TerrainData from a terrain file containing orog and lsm.
+    def from_file(cls, terrain_file, coords: CoordinateSystem, lfluxland=True,
+                  orog_envelope_wavenumber: int = None):
+        """Initialize TerrainData from a JCM-canonical terrain file.
+
+        Expects the canonical layout: lowercase variables (``orog``,
+        ``lsm``, optional ``orostd``/…), ``(lon, lat)`` axis order,
+        ascending latitudes. ECHAM-style files (uppercase ``OROMEA``,
+        ``(lat, lon)``-ordered) must be pre-converted with
+        ``utils/convert_echam_bc.py``.
 
         SSO descriptor handling, in order of precedence:
 
@@ -423,10 +435,7 @@ class TerrainData:
             src_lat = jnp.asarray(raw_ds["lat"].values)
             src_lon = jnp.asarray(raw_ds["lon"].values)
             src_orog = jnp.asarray(raw_ds["orog"].values)
-            src_has_sso = all(
-                name in raw_ds for name in
-                ("orostd", "orosig", "orogam", "orothe", "oropic", "oroval")
-            )
+            src_has_sso = all(name in raw_ds for name in _SSO_NAMES)
 
         # Load + interpolate orog/lsm onto the target grid (existing path).
         orography, fmask = get_terrain(terrain_file=terrain_file, grid=target_grid)
@@ -436,7 +445,20 @@ class TerrainData:
                 f"horizontal shape {target_shape}"
             )
         phi0 = grav * orography
-        phis0 = spectral_truncation(target_grid, phi0)
+        if orog_envelope_wavenumber is not None:
+            # Envelope orography: low-pass filter the orographic geopotential
+            # to a lower spectral wavenumber than the model truncation, to
+            # suppress Gibbs oscillations near sharp coast/mountain edges
+            # that would otherwise produce negative effective elevations.
+            modal = target_grid.to_modal(phi0)
+            nx, mx = modal.shape
+            n_idx, m_idx = jnp.meshgrid(jnp.arange(nx), jnp.arange(mx),
+                                        indexing='ij')
+            total_wn = m_idx + n_idx
+            modal = jnp.where(total_wn > orog_envelope_wavenumber, 0.0, modal)
+            phis0 = target_grid.to_nodal(modal)
+        else:
+            phis0 = spectral_truncation(target_grid, phi0)
 
         # Pick the best available SSO source.
         if src_has_sso:

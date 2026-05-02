@@ -205,6 +205,12 @@ class ForcingData:
             # FIXME: Consider validating lat/lon values here - would have to construct a coords object to get expected values though
         elif target_resolution not in VALID_TRUNCATIONS:
             raise ValueError(f"Invalid target resolution: {target_resolution}. Must be one of: {VALID_TRUNCATIONS}.")
+        elif ds["stl"].shape[:2] == coords.horizontal.nodal_shape:
+            # Source already at target resolution — skip the lat/lon interp
+            # pipeline (which can introduce NaN through pole padding when
+            # lat values match exactly). Only the time-axis interpolation
+            # is needed for monthly → daily.
+            ds = interpolate_to_daily(ds)
         else:
             ds = upsample_forcings_ds(interpolate_to_daily(ds), grid=coords.horizontal)
 
@@ -225,8 +231,11 @@ class ForcingData:
         # annual-mean surface albedo (no time axis)
         alb0 = jnp.asarray(ds["alb"])
 
-        # sea ice concentration
-        sice_am = _ts(ds["icec"])
+        # Sea-ice concentration. Clip to [0, 1] — spectral interpolation
+        # of a near-zero field can leave float-precision negatives (~1e-18),
+        # which downstream scheme guards (e.g. ``sqrt(1 - sice)``) treat
+        # as NaNs.
+        sice_am = _ts(jnp.clip(jnp.asarray(ds["icec"]), 0.0, 1.0))
 
         # snow depth (clip implausible values, same as before)
         snowc_raw = jnp.asarray(ds["snowc"])

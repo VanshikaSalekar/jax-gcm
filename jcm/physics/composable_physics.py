@@ -43,7 +43,7 @@ class ComposablePhysics(nnx.Module, Physics):
     When ``vectorize_columns=True``, the 3D state ``(nlev, nlon, nlat)`` is
     reshaped to column format ``(nlev, ncols)`` before iterating terms, and
     accumulated tendencies are reshaped back to 3D afterward. This is the
-    standard pattern for column-based physics schemes (ICON, and most
+    standard pattern for column-based physics schemes (ECHAM, and most
     comprehensive physics packages). SPEEDY operates directly on 3D arrays
     because its low resolution makes the reshape overhead not worthwhile.
 
@@ -65,7 +65,7 @@ class ComposablePhysics(nnx.Module, Physics):
                 efficiency during backpropagation (default True).
             vectorize_columns: Whether to reshape state from 3D to column
                 format before iterating terms. Use True for column-based
-                physics (ICON, etc.), False for grid-based (SPEEDY).
+                physics (ECHAM, etc.), False for grid-based (SPEEDY).
 
         """
         self.terms = nnx.List(terms)
@@ -237,8 +237,8 @@ class ComposablePhysics(nnx.Module, Physics):
     _INTERNAL_DIAGNOSTIC_KEYS: ClassVar[frozenset[str]] = frozenset({
         "_date",
         "_forcing_2d",
-        "_icon_params",
-        "_icon_coords",
+        "_echam_params",
+        "_echam_coords",
         "_speedy_coords",
     })
 
@@ -253,8 +253,8 @@ class ComposablePhysics(nnx.Module, Physics):
         - Typed sub-structs of arrays stashed under ``_<name>`` for inter-term
           communication (``_radiation``, ``_humidity``, ...) — flattened into
           ``<name>.<field>`` user-facing keys (matches the legacy SPEEDY /
-          ICON ``PhysicsData`` xarray layout).
-        - Infrastructure objects (``_date``, ``_icon_params``, ...) that are
+          ECHAM ``PhysicsData`` xarray layout).
+        - Infrastructure objects (``_date``, ``_echam_params``, ...) that are
           listed in :attr:`_INTERNAL_DIAGNOSTIC_KEYS` or that fail array-only
           flattening — silently dropped from user output.
         """
@@ -283,6 +283,29 @@ class ComposablePhysics(nnx.Module, Physics):
                 for sk, sv in sub.items():
                     items[f"{out_key}{sep}{sk}"] = sv
 
+        # Reshape column-vectorized diagnostics (a flattened ncols axis,
+        # produced when ``vectorize_columns=True``) back to ``(lon, lat)``
+        # before xarray sees them. The ``nodal_shape`` argument from
+        # ``Predictions.to_xarray`` may include leading non-spatial axes
+        # (level, time, ...); the spatial portion is the trailing pair.
+        if nodal_shape is not None and len(nodal_shape) >= 2:
+            spatial_shape = tuple(nodal_shape[-2:])
+            ncols = spatial_shape[0] * spatial_shape[1]
+            for k in list(items.keys()):
+                v = items[k]
+                if not isinstance(v, jax.Array):
+                    continue
+                if ncols not in v.shape:
+                    continue
+                # Find the (single) ncols axis and unflatten it.
+                ncols_axes = [i for i, n in enumerate(v.shape) if n == ncols]
+                if len(ncols_axes) != 1:
+                    continue
+                axis = ncols_axes[0]
+                new_shape = (v.shape[:axis] + spatial_shape
+                             + v.shape[axis + 1:])
+                items[k] = v.reshape(new_shape)
+
         # Expand multi-channel fields (trailing dim beyond nodal_shape)
         if nodal_shape is not None:
             original_keys = list(items.keys())
@@ -296,6 +319,8 @@ class ComposablePhysics(nnx.Module, Physics):
                     and s[1:-1] == nodal_shape
                     or len(s) == 4
                     and s[1:-1] == nodal_shape[1:]
+                    or len(s) == 3
+                    and s[:-1] == nodal_shape
                 ):
                     items.update(
                         {f"{k}{sep}{i}": v[..., i] for i in range(s[-1])}
