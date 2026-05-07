@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Tuple, Optional
 import warnings
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
@@ -39,6 +40,75 @@ import rrtmgp
 from rrtmgp.config import radiative_transfer
 from rrtmgp import stretched_grid_util
 from rrtmgp.rrtmgp import RRTMGP
+
+# ---------------------------------------------------------------------------
+# Chunked-vmap configuration
+# ---------------------------------------------------------------------------
+#
+# RRTMGP is ``vmap``'d over horizontal columns. Each column allocates
+# ~150 intermediate arrays of shape (ngpt, nlev) inside ``compute_heating_rate``
+# (gas-optics interpolation tables, planck source functions, optical depth,
+# tridiagonal flux solver working memory). Vmapping all columns at once
+# blows up GPU memory at high horizontal resolution, so we split the vmap
+# into sequential chunks via ``lax.map``: ``n_chunks`` smaller batches that
+# share the same JIT'd kernel.
+#
+# Empirical sweet spot on a single 80 GiB A100 (T63L47, ngpt=128, nlev=47):
+#
+#   chunk=18432 (1 chunk, no chunking): OOM at 67 GiB peak
+#   chunk= 9216 (2 chunks)            : ~8.7 s/step
+#   chunk= 4608 (4 chunks)            : ~15.2 s/step
+#
+# Two chunks is ~74 % faster than four because XLA has enough headroom
+# to skip rematerialization. The per-cell cost (~3.6 MB) scales linearly
+# with ``nlev``.
+#
+# ``chunk_budget(nlev)`` auto-detects the largest chunk that fits in the
+# device's HBM (via ``jax.devices()[0].memory_stats()['bytes_limit']``) at
+# 55 % of the budget — leaves room for XLA working memory. Override with
+# :func:`set_chunk_size` (e.g. on shared GPUs with reduced free memory or
+# to fix a chunk count for reproducible kernel launches).
+
+_CHUNK_SIZE_OVERRIDE = None  # int | None
+
+
+def set_chunk_size(chunk_size) -> None:
+    """Override the RRTMGP chunked-vmap chunk size (cells per chunk).
+
+    Set to a positive integer to fix the chunk count; pass ``None`` to
+    revert to auto-detection from device HBM. Must be called BEFORE the
+    first radiation call so the JIT'd radiation function picks up the
+    new value (changing it after a JIT compile triggers a recompile on
+    the next call).
+    """
+    global _CHUNK_SIZE_OVERRIDE
+    _CHUNK_SIZE_OVERRIDE = chunk_size
+
+
+def get_chunk_size_override():
+    """Return the current chunk-size override (``None`` for auto)."""
+    return _CHUNK_SIZE_OVERRIDE
+
+
+def chunk_budget(nlev: int) -> int:
+    """Return the RRTMGP chunk-size budget (cells/chunk) for this device.
+
+    Uses :data:`_CHUNK_SIZE_OVERRIDE` if set, else queries the JAX
+    device HBM and picks the largest chunk that fits at 55 % of the
+    XLA bytes_limit. Falls back to 9216 if the device doesn't report
+    HBM (e.g. CPU run).
+    """
+    if _CHUNK_SIZE_OVERRIDE is not None and _CHUNK_SIZE_OVERRIDE > 0:
+        return int(_CHUNK_SIZE_OVERRIDE)
+    bytes_per_cell = 3.6e6 * (nlev / 47.0)
+    try:
+        bytes_limit = jax.devices()[0].memory_stats().get('bytes_limit', 0)
+    except Exception:
+        bytes_limit = 0
+    if bytes_limit > 0:
+        return max(1, int(0.55 * bytes_limit / bytes_per_cell))
+    return 9216
+
 
 # ---------------------------------------------------------------------------
 # Module-level RRTMGP instance (created once at import time)
@@ -265,11 +335,19 @@ def prepare_icon_data(
     toa_sw_up = rrtmgp_data["toa_sw_flux_outgoing_2d_xy"][0, 0]
     toa_lw_up = rrtmgp_data["toa_lw_flux_outgoing_2d_xy"][0, 0]
 
-    # Full flux profiles (nlev+1 interfaces, ngpts bands)
-    sw_flux_up = rrtmgp_data["sw_flux_up_full"][0, :, :].transpose(1, 0)
-    sw_flux_down = rrtmgp_data["sw_flux_down_full"][0, :, :].transpose(1, 0)
-    lw_flux_up = rrtmgp_data["lw_flux_up_full"][0, :, :].transpose(1, 0)
-    lw_flux_down = rrtmgp_data["lw_flux_down_full"][0, :, :].transpose(1, 0)
+    # Full flux profiles. RRTMGP returns shape (1, ngpt, nlev+1); we sum
+    # over the ngpt (g-point) axis here — *before* the per-column vmap
+    # bundles the result — so the vmapped diagnostic stays at
+    # (ncols, nlev+1) instead of blowing up to (ncols, nlev+1, ngpt).
+    # ngpt is 128 (LW) / 112 (SW), so this is a ~120× memory saving on
+    # the radiation flux outputs. The downstream RadiationData consumer
+    # (`echam_physics._apply_radiation_rrtmgp_inner`) already calls
+    # `.sum(axis=-1)` on these, so the per-gpoint detail was being
+    # discarded immediately anyway.
+    sw_flux_up = rrtmgp_data["sw_flux_up_full"][0, :, :].sum(axis=0)
+    sw_flux_down = rrtmgp_data["sw_flux_down_full"][0, :, :].sum(axis=0)
+    lw_flux_up = rrtmgp_data["lw_flux_up_full"][0, :, :].sum(axis=0)
+    lw_flux_down = rrtmgp_data["lw_flux_down_full"][0, :, :].sum(axis=0)
 
     sw_flux_up = lax.cond(needs_reversal, flip, identity, sw_flux_up)
     sw_flux_down = lax.cond(needs_reversal, flip, identity, sw_flux_down)
@@ -277,10 +355,15 @@ def prepare_icon_data(
     lw_flux_down = lax.cond(needs_reversal, flip, identity, lw_flux_down)
 
     diagnostics = RadiationData(
-        cos_zenith=cos_zenith,
-        surface_albedo_vis=jnp.atleast_1d(surface_albedo_vis),
-        surface_albedo_nir=jnp.atleast_1d(surface_albedo_nir),
-        surface_emissivity=jnp.atleast_1d(surface_emissivity),
+        # Match the grey scheme's shape convention so the downstream
+        # vmap+squeeze(-1) in apply_radiation_rrtmgp resolves to (ncols,).
+        # Grey emits cos_zenith with a trailing newaxis but passes the
+        # surface scalars through bare; replicate exactly so the cached
+        # branch in `_radiation_with_caching` matches our shape.
+        cos_zenith=jnp.atleast_1d(cos_zenith),
+        surface_albedo_vis=surface_albedo_vis,
+        surface_albedo_nir=surface_albedo_nir,
+        surface_emissivity=surface_emissivity,
         sw_flux_up=sw_flux_up,
         sw_flux_down=sw_flux_down,
         sw_heating_rate=sw_heating,

@@ -452,50 +452,98 @@ def physics_tendency_to_dynamics_tendency(
     )
     return dynamics_tendency
 
+# Tracer names that are physically non-negative (mass mixing ratios,
+# number concentrations, fractions). Any tracer in this set gets clipped
+# to ``>= 0`` on its way into and out of physics. The clip is applied as
+# a positive-definite filter so that small negatives produced by the
+# horizontal-spectral round-trip of advected fields don't propagate into
+# downstream physics terms. We deliberately do NOT clip to an upper bound:
+# unphysically large values should surface as a visible regression rather
+# than be silently masked.
+_NON_NEGATIVE_TRACERS = frozenset({
+    "specific_humidity", "qc", "qi", "qr", "qs", "qnc", "qni",
+    "co2_vmr", "methane_vmr", "ozone_vmr",
+})
+
+
+def _clip_non_negative_tracers(tracers: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+    """Return a copy of ``tracers`` with positive-definite ones clamped to ``>= 0``."""
+    return {
+        name: (jnp.maximum(value, 0.0) if name in _NON_NEGATIVE_TRACERS else value)
+        for name, value in tracers.items()
+    }
+
+
 def verify_state(state: PhysicsState) -> PhysicsState:
     """Ensure the physical validity of the state variables.
 
-    Only enforces `specific_humidity >= 0` — we deliberately do NOT clip to
-    an upper bound. Aggressive caps hide bugs in the physics (particularly
-    convection) that should surface as unphysical q values rather than be
+    Clips ``specific_humidity`` and every positive-definite tracer (cloud
+    water, ice, rain, snow, droplet- and ice-number concentrations, GHG
+    volume mixing ratios) to ``>= 0``. We deliberately do NOT clip to an
+    upper bound — aggressive caps hide bugs in the physics (particularly
+    convection) that should surface as unphysical values rather than be
     silently masked. Individual physics routines apply local NaN-avoidance
-    guards on their own narrow scopes (e.g. the `q / (1-q)` conversion in
-    radiation).
+    guards on their own narrow scopes (e.g. the ``q / (1-q)`` conversion
+    in radiation).
+
+    The clip is the visible side of a positive-definite filter that
+    catches the small negatives the spectral horizontal-advection round-
+    trip leaves on advected scalars (see the q-ringing fix in PR #458 for
+    why this matters for the moisture cycle). It runs once at the start
+    of every physics step on the gridpoint state.
 
     Args:
-        state: The `PhysicsState` object.
+        state: The ``PhysicsState`` object.
 
     Returns:
-        The verified and potentially corrected `PhysicsState` object.
+        The verified and potentially corrected ``PhysicsState``.
 
     """
     qa = jnp.maximum(state.specific_humidity, 0.0)
-    updated_state = state.copy(specific_humidity=qa)
-    return updated_state
+    return state.copy(
+        specific_humidity=qa,
+        tracers=_clip_non_negative_tracers(state.tracers),
+    )
+
 
 def verify_tendencies(state: PhysicsState, tendencies: PhysicsTendency, time_step) -> PhysicsTendency:
     """Adjust tendencies to prevent the state from becoming physically invalid in the next time step.
-    
+
+    For every positive-definite scalar (``specific_humidity`` plus the
+    set of tracers in ``_NON_NEGATIVE_TRACERS``) we cap the negative part
+    of the tendency at ``-state / dt``, i.e. just enough to drive the
+    field to zero rather than below. This mirrors what an implicit step
+    on a linear sink would do for the same field.
+
     Args:
-        state: The current `PhysicsState`.
-        tendencies: The computed `PhysicsTendency`.
+        state: The current ``PhysicsState`` (already passed through
+            ``verify_state``).
+        tendencies: The physics tendencies.
         time_step: The model time step in seconds.
-    
+
     Returns:
-        The verified and potentially corrected `PhysicsTendency` object.
+        The verified ``PhysicsTendency``.
 
     """
-    # Only enforce `q_next >= 0` — we don't cap q at any upper bound because
-    # doing so masks convection/cloud scheme bugs (see audit of
-    # Tiedtke-Nordeng vs. ECHAM reference). If q wants to go unphysically
-    # high the model should tell us.
-    q_next = state.specific_humidity + time_step * tendencies.specific_humidity
-    clipped_dqdt = jnp.where(
-        q_next < 0,
-        -state.specific_humidity / time_step,
-        tendencies.specific_humidity,
+    def _cap_negative_tend(value, tend):
+        next_value = value + time_step * tend
+        return jnp.where(next_value < 0, -value / time_step, tend)
+
+    clipped_dqdt = _cap_negative_tend(
+        state.specific_humidity, tendencies.specific_humidity,
     )
-    return tendencies.copy(specific_humidity=clipped_dqdt)
+    clipped_tracer_tends = {
+        name: (
+            _cap_negative_tend(state.tracers[name], tend)
+            if name in _NON_NEGATIVE_TRACERS and name in state.tracers
+            else tend
+        )
+        for name, tend in tendencies.tracers.items()
+    }
+    return tendencies.copy(
+        specific_humidity=clipped_dqdt,
+        tracers=clipped_tracer_tends,
+    )
 
 def get_physical_tendencies(
     state: State,
@@ -572,21 +620,56 @@ def filter_tendencies(dynamics_tendency: State,
         Filtered dynamics tendencies in dinosaur.primitive_equations.State format
 
     """
-    tau = diffusion.div_timescale
-    order = diffusion.div_order
-    scale = time_step / (tau * abs(grid.laplacian_eigenvalues[-1]) ** order)
+    # Hyperdiffuse every spectral prognostic, with the timescale + order
+    # ECHAM uses for each (divergence shortest, vorticity / specific
+    # humidity intermediate, temperature longest). The previous version
+    # only filtered ``divergence`` — vorticity, T', log_ps and all tracers
+    # passed through unfiltered, so high-wavenumber spectral content from
+    # sharp gradients (in particular the surface-evap PBL profile)
+    # accumulated step after step. For ``specific_humidity`` on T63L47
+    # hybrid + real terrain that grew the round-off (~1e-24 g/kg) into a
+    # 1e-3 g/kg negative-q hole within ~20 steps, which drove the supersat
+    # / convective-heating runaway. Microphysics tracers (qc, qi, qr, qs,
+    # qnc, qni) are deliberately NOT filtered — they live on cloud bases /
+    # fronts and hyperdiffusion would over-smear them.
+    eig_max_abs = abs(grid.laplacian_eigenvalues[-1])
 
-    filter_fn = horizontal_diffusion_filter(grid, scale=scale, order=order)
-    filtered_div = filter_fn(dynamics_tendency)
+    div_scale = time_step / (
+        diffusion.div_timescale * eig_max_abs ** diffusion.div_order
+    )
+    div_filter = horizontal_diffusion_filter(
+        grid, scale=div_scale, order=int(diffusion.div_order),
+    )
+    vor_q_scale = time_step / (
+        diffusion.vor_q_timescale * eig_max_abs ** diffusion.vor_q_order
+    )
+    vor_q_filter = horizontal_diffusion_filter(
+        grid, scale=vor_q_scale, order=int(diffusion.vor_q_order),
+    )
+    temp_scale = time_step / (
+        diffusion.temp_timescale * eig_max_abs ** diffusion.temp_order
+    )
+    temp_filter = horizontal_diffusion_filter(
+        grid, scale=temp_scale, order=int(diffusion.temp_order),
+    )
+
+    # Each filter is a tree_map of `scale * x` over leaves with the matching
+    # spectral shape. We apply each to the appropriate variable explicitly,
+    # ignoring the filtered values for the other fields.
+    filtered_div = div_filter(dynamics_tendency).divergence
+    filtered_vor = vor_q_filter(dynamics_tendency).vorticity
+    filtered_temp = temp_filter(dynamics_tendency).temperature_variation
+
+    filtered_tracers = dict(dynamics_tendency.tracers)
+    if "specific_humidity" in filtered_tracers:
+        filtered_q = vor_q_filter(dynamics_tendency).tracers["specific_humidity"]
+        filtered_tracers["specific_humidity"] = filtered_q
 
     return State(
-        vorticity=dynamics_tendency.vorticity,
-        divergence=filtered_div.divergence,
-        temperature_variation=dynamics_tendency.temperature_variation,
+        vorticity=filtered_vor,
+        divergence=filtered_div,
+        temperature_variation=filtered_temp,
         log_surface_pressure=dynamics_tendency.log_surface_pressure,
         sim_time=dynamics_tendency.sim_time,
-        # Pass every tracer tendency through — the filter only modifies
-        # divergence. Dropping other tracer tendencies here silently zeros
-        # microphysics tracers (qc, qi, qnc, ...).
-        tracers=dict(dynamics_tendency.tracers),
+        tracers=filtered_tracers,
     )

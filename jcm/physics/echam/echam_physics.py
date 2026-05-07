@@ -303,9 +303,15 @@ def _apply_radiation_inner(state: PhysicsState,
         tracers={}
     )
     
-    # Reconstruct RadiationData from vmapped diagnostics. Scalar
-    # diagnostics are reshaped to [ncols] so compute/cache branches
-    # preserve identical shapes for single-column and global runs.
+    # Reconstruct RadiationData from vmapped diagnostics. The grey scheme
+    # keeps a per-band axis on the flux profiles (shape
+    # ``(ncols, nlev+1, n_bands)`` after vmap), so they need
+    # ``transpose(1, 0, 2).sum(axis=-1)`` here to collapse to
+    # ``(nlev+1, ncols)``. Scalar diagnostics are flattened to
+    # ``[ncols]`` via ``_column_vector(...)`` so the compute and cache
+    # branches preserve identical shapes for single-column and global
+    # runs (otherwise the radiation ``lax.cond`` at ``ncols=1`` errors
+    # on a shape mismatch).
     rad_out = RadiationData(
         cos_zenith=_column_vector(diagnostics_vmapped.cos_zenith, ncols),  # [ncols, 1] -> [ncols]
         surface_albedo_vis=_column_vector(diagnostics_vmapped.surface_albedo_vis, ncols),
@@ -325,7 +331,7 @@ def _apply_radiation_inner(state: PhysicsState,
         toa_lw_up=_column_vector(diagnostics_vmapped.toa_lw_up, ncols),
         toa_sw_down=_column_vector(diagnostics_vmapped.toa_sw_down, ncols)
     )
-    
+
     updated_physics_data = physics_data.copy(radiation=rad_out)
 
     return physics_tendencies, updated_physics_data
@@ -381,29 +387,132 @@ def _apply_radiation_rrtmgp_inner(
         angstrom=physics_data.aerosol.angstrom.reshape(ncols),
     )
 
-    radiation_results = jax.vmap(
-        radiation_scheme_rrtmgp,
-        in_axes=(
-            1, 1, 1, 1, 1,     # temperature..layer_thickness
-            1, 1, 1, 1,        # air_density..cloud_fraction
-            0, 0, 0, 0,        # surface scalars
-            None, 0, 0,        # date, lat, lon
-            None, 0, 1, None,  # parameters, aerosol, ozone, co2
-        ),
-        out_axes=(0, 0),
-        axis_size=ncols,
-    )(
-        state.temperature, state.specific_humidity,
-        physics_data.diagnostics.pressure_full,
-        physics_data.diagnostics.pressure_half,
-        physics_data.diagnostics.layer_thickness,
-        physics_data.diagnostics.air_density,
-        cloud_water, cloud_ice, cloud_fraction,
-        surface_temperature_col, surface_albedo_vis_col,
-        surface_albedo_nir_col, surface_emissivity_col,
-        solar, latitudes, longitudes,
-        parameters.radiation, aerosol_data_for_vmap, ozone_vmr, co2_vmr,
-    )
+    # Chunked vmap: RRTMGP allocates ~150 intermediate arrays of shape
+    # (ngpt, nlev) per column inside ``compute_heating_rate`` (gas
+    # optics interpolation tables, planck source functions, optical
+    # depth, working memory for the tridiagonal flux solver, etc.).
+    # At T63L47 with ngpt=128 (LW), nlev=47, ncols=18432, vmapping
+    # all columns at once costs ~67 GiB of peak memory and OOMs on
+    # an 80 GiB A100. Splitting the vmap into ``n_chunks`` smaller
+    # batches via ``lax.map`` linearises the work over chunks while
+    # keeping vmap parallelism inside each chunk; peak memory drops
+    # by roughly a factor of ``n_chunks``.
+    #
+    # Chunk-size sweep at T63L47 on a single 80 GiB A100:
+    #   chunk=18432 (1 chunk):  OOM at 67 GiB peak
+    #   chunk= 9216 (2 chunks): ~8.7 s/step (avg, 7200 s rad cache)
+    #   chunk= 4608 (4 chunks): ~15.2 s/step
+    # 2 chunks is ~74% faster than 4 because XLA needs less
+    # rematerialization at lower memory pressure.
+    #
+    # The chunk size is auto-detected from the device's HBM by default
+    # (``parameters.radiation.rrtmgp_chunk_size = 0``). The empirically-
+    # measured per-cell cost at the current g128/g112 config is ~3.6 MB
+    # at nlev=47 (linear in nlev for other resolutions). We use 50 % of
+    # the device memory budget so XLA has working room — the rest is
+    # rematerialisation buffers and other kernels' allocations. Override
+    # via ``RadiationParameters(rrtmgp_chunk_size=N)`` if the auto pick
+    # OOMs (e.g. shared GPUs) or if you want a fixed chunk count for
+    # reproducible kernel launches.
+    from jcm.physics.radiation.rrtmgp import chunk_budget as _rrtmgp_chunk_budget
+    chunk_budget = _rrtmgp_chunk_budget(nlev)
+    if ncols <= chunk_budget:
+        chunk_size = ncols
+    else:
+        # Pick the smallest n_chunks ≥ ncols / chunk_budget such that
+        # n_chunks divides ncols (so all chunks are equal size).
+        n_chunks = -(-ncols // chunk_budget)  # ceil-div
+        while ncols % n_chunks != 0:
+            n_chunks += 1
+        chunk_size = ncols // n_chunks
+    n_chunks = ncols // chunk_size
+
+    def _per_column_inputs():
+        """Pack all vmap inputs as (n_chunks, chunk_size, ...)."""
+        # ``(nz, ncols)`` arrays (where ``nz`` may be ``nlev`` or
+        # ``nlev+1`` depending on full vs half levels) → reshape to
+        # ``(nz, n_chunks, chunk_size)`` then transpose to
+        # ``(n_chunks, chunk_size, nz)`` so the leading axis is the
+        # chunk axis lax.map iterates over.
+        def split_lev_first(a):
+            nz = a.shape[0]
+            return a.reshape(nz, n_chunks, chunk_size).transpose(1, 2, 0)
+
+        def split_col(a):
+            return a.reshape(n_chunks, chunk_size, *a.shape[1:])
+
+        return dict(
+            temperature=split_lev_first(state.temperature),
+            specific_humidity=split_lev_first(state.specific_humidity),
+            pressure_full=split_lev_first(physics_data.diagnostics.pressure_full),
+            pressure_half=split_lev_first(physics_data.diagnostics.pressure_half),
+            layer_thickness=split_lev_first(physics_data.diagnostics.layer_thickness),
+            air_density=split_lev_first(physics_data.diagnostics.air_density),
+            cloud_water=split_lev_first(cloud_water),
+            cloud_ice=split_lev_first(cloud_ice),
+            cloud_fraction=split_lev_first(cloud_fraction),
+            surface_temperature=split_col(surface_temperature_col),
+            surface_albedo_vis=split_col(surface_albedo_vis_col),
+            surface_albedo_nir=split_col(surface_albedo_nir_col),
+            surface_emissivity=split_col(surface_emissivity_col),
+            latitudes=split_col(latitudes),
+            longitudes=split_col(longitudes),
+            ozone_vmr=split_lev_first(ozone_vmr),
+            aerosol=physics_data.aerosol.copy(
+                aod_profile=split_col(aerosol_data_for_vmap.aod_profile),
+                ssa_profile=split_col(aerosol_data_for_vmap.ssa_profile),
+                asy_profile=split_col(aerosol_data_for_vmap.asy_profile),
+                cdnc_factor=split_col(aerosol_data_for_vmap.cdnc_factor),
+                aod_total=split_col(aerosol_data_for_vmap.aod_total),
+                aod_anthropogenic=split_col(aerosol_data_for_vmap.aod_anthropogenic),
+                aod_background=split_col(aerosol_data_for_vmap.aod_background),
+                Nccn=split_col(physics_data.aerosol.Nccn.reshape(ncols)),
+                angstrom=split_col(aerosol_data_for_vmap.angstrom),
+            ),
+        )
+
+    chunked_inputs = _per_column_inputs()
+
+    def _vmap_one_chunk(chunk_inputs):
+        """Vmap radiation_scheme_rrtmgp across one chunk of `chunk_size` columns."""
+        return jax.vmap(
+            radiation_scheme_rrtmgp,
+            in_axes=(
+                # temperature..layer_thickness, air_density..cloud_fraction:
+                # all stored as (chunk_size, nlev) here, so column axis is 0
+                # and the per-column profile is handled inside the function.
+                0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+                0, 0, 0, 0,           # surface scalars
+                None, 0, 0,           # solar, lat, lon
+                None, 0, 0, None,     # parameters, aerosol, ozone, co2
+            ),
+            out_axes=(0, 0),
+            axis_size=chunk_size,
+        )(
+            chunk_inputs['temperature'], chunk_inputs['specific_humidity'],
+            chunk_inputs['pressure_full'], chunk_inputs['pressure_half'],
+            chunk_inputs['layer_thickness'], chunk_inputs['air_density'],
+            chunk_inputs['cloud_water'], chunk_inputs['cloud_ice'],
+            chunk_inputs['cloud_fraction'],
+            chunk_inputs['surface_temperature'], chunk_inputs['surface_albedo_vis'],
+            chunk_inputs['surface_albedo_nir'], chunk_inputs['surface_emissivity'],
+            solar, chunk_inputs['latitudes'], chunk_inputs['longitudes'],
+            parameters.radiation, chunk_inputs['aerosol'],
+            chunk_inputs['ozone_vmr'], co2_vmr,
+        )
+
+    # ``lax.map`` is sequential over the leading axis but JIT-compatible.
+    # Outputs come back stacked on the leading axis as (n_chunks, chunk_size, ...).
+    chunked_results = jax.lax.map(_vmap_one_chunk, chunked_inputs)
+    tendencies_chunked, diagnostics_chunked = chunked_results
+
+    # Re-merge chunk axis: (n_chunks, chunk_size, ...) → (ncols, ...).
+    def merge(a):
+        return a.reshape(ncols, *a.shape[2:])
+    tendencies_vmapped = jax.tree_util.tree_map(merge, tendencies_chunked)
+    diagnostics_vmapped = jax.tree_util.tree_map(merge, diagnostics_chunked)
+    radiation_results = (tendencies_vmapped, diagnostics_vmapped)
 
     tendencies_vmapped, diagnostics_vmapped = radiation_results
     temperature_tendency = tendencies_vmapped.temperature_tendency.T
@@ -416,16 +525,27 @@ def _apply_radiation_rrtmgp_inner(
         tracers={},
     )
 
+    # Per-gpoint flux profiles are summed over g-points inside the
+    # vmapped per-column compute (rrtmgp.py:268), so the diagnostic
+    # arrays here are shape (ncols, nlev+1) and need only a transpose
+    # to (nlev+1, ncols).
     rad_out = RadiationData(
+        # Use ``_column_vector(...)`` for scalars (handles single-column
+        # vs global shape consistency). Fluxes are already
+        # ``(ncols, nlev+1)`` here because the chunked-vmap RRTMGP path
+        # sums per-gpoint inside the per-column compute (rrtmgp.py:268),
+        # so a plain ``.T`` is enough — DO NOT add the ``transpose+sum``
+        # pattern from the grey path, the per-band axis no longer exists
+        # at this point.
         cos_zenith=_column_vector(diagnostics_vmapped.cos_zenith, ncols),
         surface_albedo_vis=_column_vector(diagnostics_vmapped.surface_albedo_vis, ncols),
         surface_albedo_nir=_column_vector(diagnostics_vmapped.surface_albedo_nir, ncols),
         surface_emissivity=_column_vector(diagnostics_vmapped.surface_emissivity, ncols),
-        sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2).sum(axis=-1),
-        sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2).sum(axis=-1),
+        sw_flux_up=diagnostics_vmapped.sw_flux_up.T,
+        sw_flux_down=diagnostics_vmapped.sw_flux_down.T,
         sw_heating_rate=tendencies_vmapped.shortwave_heating.T,
-        lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2).sum(axis=-1),
-        lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2).sum(axis=-1),
+        lw_flux_up=diagnostics_vmapped.lw_flux_up.T,
+        lw_flux_down=diagnostics_vmapped.lw_flux_down.T,
         lw_heating_rate=tendencies_vmapped.longwave_heating.T,
         surface_sw_down=_column_vector(diagnostics_vmapped.surface_sw_down, ncols),
         surface_lw_down=_column_vector(diagnostics_vmapped.surface_lw_down, ncols),
@@ -597,11 +717,26 @@ def apply_convection(
     
     # Unpack structured results directly (no tuple unpacking needed)
     conv_tendencies_all, conv_states_all = conv_results
-    
+
+    # Hard limit on the convective T tendency: 5 K / hr, applied symmetrically.
+    # Healthy deep convection over the warmest tropical SSTs gives ~1 K/hr at
+    # the most active level; the cap only fires when the column's parcel-vs-
+    # environment energy balance has gone pathological. The companion
+    # cloud-base mass-flux CFL cap in ``tiedtke_nordeng_convection`` (added
+    # in the same branch) bounds the column-integrated mass flux but does
+    # not contain per-level latent-heat spikes inside the updraft loop —
+    # ECHAM bounds those via the per-level moist-adjustment limits in
+    # ``mo_cuadjust.f90`` which we have not yet ported. Until that lands
+    # this cap is the safety net.
+    _DTDT_MAX = 5.0 / 3600.0  # K/s
+    dt_conv_capped = jnp.clip(
+        conv_tendencies_all.dtedt, -_DTDT_MAX, _DTDT_MAX,
+    )
+
     physics_tendencies = PhysicsTendency(
         u_wind=conv_tendencies_all.dudt.T,
-        v_wind=conv_tendencies_all.dvdt.T, 
-        temperature=conv_tendencies_all.dtedt.T,
+        v_wind=conv_tendencies_all.dvdt.T,
+        temperature=dt_conv_capped.T,
         specific_humidity=conv_tendencies_all.dqdt.T,
         tracers={
             'qc': conv_tendencies_all.dqc_dt.T,
@@ -748,6 +883,18 @@ def apply_microphysics_1m(
     cdnc_m3 = jnp.ones_like(state.temperature) * base_cdnc * cdnc_factor[jnp.newaxis, :]
     droplet_number_per_kg = cdnc_m3 / air_density
 
+    # Reverted from cloud_microphysics_column_sweep — that scheme's
+    # Rotstayn rain evaporation creates a positive-feedback loop
+    # (rain evaporates → moistens dry layer → Sundqvist condenses →
+    # latent heat release → drives convection → more rain) that the
+    # surface bisect identified as the dominant amplifier of the
+    # day-7 NaN on T63L47 + real terrain. The per-level
+    # `cloud_microphysics` discards rain each step (no propagating
+    # flux, no inter-level evap coupling), which breaks the feedback
+    # at the cost of microphysics fidelity. Tracked as follow-up
+    # work — needs either ICON's RH-hysteresis bound on the evap
+    # source or a tighter Newton solve so the evap stays bounded
+    # under coupling with Sundqvist.
     micro_tend_all, micro_state_all = jax.vmap(
         cloud_microphysics,
         in_axes=(1, 1, 1, 1, 1, 1, 1, 1, 1, None, None),
@@ -1123,9 +1270,10 @@ def apply_surface(
     nlev, ncols = state.temperature.shape
     dt = parameters.convection.dt_conv
     pressure_levels = physics_data.diagnostics.pressure_full
-    # Get surface properties from boundaries (now guaranteed to be present)
-    # Reshape boundary fields to column format
-    surface_temp = physics_data.surface.surface_temperature.reshape(ncols)
+    # Per-tile surface temperatures are read directly from forcing below
+    # (``ocean_temp``, ``land_temp``, ``ice_surface_temp``); the upstream-
+    # blended ``physics_data.surface.surface_temperature`` is no longer
+    # consulted here — see comment by ``ocean_temp`` for the reason.
 
     # Surface tile fractions: water (0), sea ice (1), land (2).
     # Sea ice fraction is taken from prescribed boundary conditions and
@@ -1144,12 +1292,25 @@ def apply_surface(
     # capped by SST for sea ice, and ``forcing.stl_am`` for land. Sea
     # ice uses min(SST, ctfreez) because the underlying ocean caps the
     # ice surface temperature physically.
-    ocean_temp = surface_temp
+    #
+    # Read ``ocean_temp`` and ``land_temp`` straight from the forcing rather
+    # than the upstream-blended ``physics_data.surface.surface_temperature``,
+    # which is snapped to one-or-the-other via ``where(fmask>0.5)`` in
+    # ``EchamForcing`` and would feed the wrong T into the minority tile
+    # (e.g. the 40% ocean fraction of a fmask=0.6 cell would otherwise
+    # use ``stl_am`` instead of ``sst``).
+    ocean_temp = forcing.sea_surface_temperature.reshape(ncols)
     ctfreez = 271.38  # K, ECHAM ``iniphy.f90:71`` saline-water freezing
+    # ``stl_am`` is the JSBACH land surface temperature climatology
+    # (``surf_temp`` from ``ic_land_soil_T63GR15_*.nc``), already at the
+    # model's orography — no lapse correction needed. (An earlier workaround
+    # subtracted 6.5 K/km · orog because the bundled BCs used ``stl ≈ sst``
+    # extrapolated over land — see ``utils/convert_echam_bc.py`` for the
+    # path that picks the right field.)
     land_temp = forcing.stl_am.reshape(ncols)
     ice_surface_temp = jnp.where(sea_ice_fraction > 0.0,
-                                 jnp.minimum(surface_temp, ctfreez),
-                                 surface_temp)
+                                 jnp.minimum(ocean_temp, ctfreez),
+                                 ocean_temp)
     ice_temp = jnp.repeat(ice_surface_temp[:, jnp.newaxis], 2, axis=1)  # 2 ice layers
     soil_temp = jnp.repeat(land_temp[:, jnp.newaxis], 4, axis=1)         # 4 soil layers
     
@@ -1207,17 +1368,40 @@ def apply_surface(
     
     # Air density at surface
     rho_sfc = pressure_levels[-1, :] / (physical_constants.rd * state.temperature[-1, :])
-    
+
     # Layer thickness at surface (approximate, clamp to minimum 50m to avoid
     # enormous tendencies from thin uniform sigma layers)
     dp_sfc = pressure_levels[-1, :] - pressure_levels[-2, :]
     dz_sfc = jnp.maximum(dp_sfc / (rho_sfc * physical_constants.grav), 50.0)
-    
-    # Surface flux tendencies (applied to lowest level only)
-    temp_tend_sfc = sensible_heat / (rho_sfc * physical_constants.cp * dz_sfc)
-    qv_tend_sfc = evaporation / (rho_sfc * dz_sfc)
-    u_tend_sfc = -tau_u / (rho_sfc * dz_sfc)
-    v_tend_sfc = -tau_v / (rho_sfc * dz_sfc)
+
+    # The surface-flux divergence at the bottom level is a linear relaxation
+    # toward the surface value with timescale ``dz_sfc / K`` (K = exchange
+    # velocity in m/s). An *explicit* time step of size ``dt`` is unstable
+    # whenever ``K * dt / dz_sfc > 2`` — and over rough terrain at the
+    # ECHAM-tuned exchange coefficients this CFL is easily violated, with
+    # the wind flipping sign each step until the column blows up. ECHAM
+    # itself avoids this by handling the surface as an implicit BC of the
+    # vdiff tridiagonal solve. JCM's explicit pipeline can't do that
+    # directly, but we can damp each explicit tendency by the same factor
+    # an implicit Euler step would — ``1 / (1 + K*dt/dz_sfc)``. This is
+    # exact for the simple linear-relaxation form, recovers the explicit
+    # tendency in the small-K*dt limit, and is unconditionally stable.
+    #
+    # ``surface_fractions`` and ``exchange_coeff_*`` are per-tile (ocean,
+    # ice, land); the grid-box-mean exchange velocity is the area-weighted
+    # sum.
+    ch_grid = jnp.sum(surface_fractions * exchange_coeff_heat, axis=1)
+    cm_grid = jnp.sum(surface_fractions * exchange_coeff_momentum, axis=1)
+    ce_grid = jnp.sum(surface_fractions * exchange_coeff_moisture, axis=1)
+    imp_heat = 1.0 / (1.0 + ch_grid * dt / dz_sfc)
+    imp_mom = 1.0 / (1.0 + cm_grid * dt / dz_sfc)
+    imp_moist = 1.0 / (1.0 + ce_grid * dt / dz_sfc)
+
+    # Surface flux tendencies (applied to lowest level only).
+    temp_tend_sfc = imp_heat * sensible_heat / (rho_sfc * physical_constants.cp * dz_sfc)
+    qv_tend_sfc = imp_moist * evaporation / (rho_sfc * dz_sfc)
+    u_tend_sfc = imp_mom * (-tau_u) / (rho_sfc * dz_sfc)
+    v_tend_sfc = imp_mom * (-tau_v) / (rho_sfc * dz_sfc)
     
     # Initialize tendencies (only surface level affected)
     temp_tend = jnp.zeros_like(state.temperature)
