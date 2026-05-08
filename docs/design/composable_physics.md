@@ -579,3 +579,95 @@ output (written to xarray); keys prefixed with `_` (e.g. `_radiation`,
 `_convection`, `_chemistry`) are internal inter-term state and are
 filtered out of the user-facing output by `data_struct_to_dict`.
 
+---
+
+## Scheme-named terms
+
+Each ECHAM parameterisation is a self-contained ``PhysicsTerm``
+living next to its underlying numerical implementation, named for the
+scheme rather than the host model. ``echam_physics()`` is the factory
+that wires a validated ordering of those terms together.
+
+```python
+# jcm/physics/convection/tiedtke_nordeng/tiedtke_nordeng.py
+class TiedtkeConvection(PhysicsTerm):
+    name = "tiedtke_convection"
+    category = "convection"
+    requires = ("pressure_full", "layer_thickness", "air_density")
+    provides = ("convection",)
+
+    def __init__(self, params: ConvectionParameters | None = None):
+        self.params = nnx.Param(
+            params or ConvectionParameters.default(),
+        )
+
+    def __call__(self, state, diagnostics, forcing, terrain):
+        dt = diagnostics["_date"].dt_seconds
+        # vmap over columns lives HERE
+        ...
+        return tendency, {**diagnostics, "convection": ConvectionData(...)}
+```
+
+Properties of this layout:
+
+- **Scheme-named.** ``TiedtkeConvection`` lives in
+  ``jcm/physics/convection/tiedtke_nordeng/`` alongside the column
+  implementation. SPEEDY can drop the same class into its physics
+  package without depending on the ECHAM tree, provided the
+  composition also includes a ``MoistAirColumnState`` term upstream
+  to provide the moist-air diagnostics it reads.
+- **One layer.** The vmap, unit conversions, per-column reshapes,
+  and any safety clips all live in the term's ``__call__``. There is
+  no separate ``apply_*`` wrapper.
+- **Per-term parameters.** Each term holds its own scheme-native
+  parameters struct as ``nnx.Param``, so gradients flow through them
+  and per-scheme optimisation works without surgery on a monolithic
+  parameters object.
+- **Per-term data.** Each term writes a typed sub-struct
+  (``ConvectionData``, ``RadiationData``, …) under a public key in
+  the diagnostics dict — no leading underscore, so it flows directly
+  through to ``model.run().to_xarray()`` as ``convection.<field>``.
+- **One container.** ``ComposablePhysics(vectorize_columns=...)`` is
+  the only physics class; the dt-of-the-step is read from
+  ``diagnostics["_date"].dt_seconds`` by terms that need it.
+- **Init-time validation.** ``_validate_ordering`` checks each
+  term's ``requires`` against the union of upstream ``provides`` and
+  flags two terms claiming the same ``provides`` key, so misconfigured
+  compositions fail at construction rather than at runtime.
+
+### Plugin contract
+
+A third-party scheme is a single-file drop-in:
+
+```python
+# my_package/my_scheme.py
+from flax import nnx
+from jcm.physics.physics_term import PhysicsTerm
+
+class MyScheme(PhysicsTerm):
+    name = "my_scheme"
+    category = "convection"        # categories partition the term list
+    requires = ("pressure_full",)  # diagnostics keys read from upstream
+    provides = ("my_scheme",)      # diagnostics keys written
+
+    def __init__(self, params=None):
+        self.params = nnx.Param(params or MySchemeParameters.default())
+
+    def __call__(self, state, diagnostics, forcing, terrain):
+        ...
+        return tendency, {**diagnostics, "my_scheme": ...}
+```
+
+```python
+# user code
+from jcm.physics.echam.echam_terms import echam_physics
+from my_package.my_scheme import MyScheme
+
+physics = echam_physics().replace("convection", MyScheme())
+```
+
+``ComposablePhysics`` validates the new term list at construction
+time: every ``requires`` has an upstream ``provides``; no key is
+provided twice; ``required_tracers()`` are seeded into the initial
+state by ``Model``.
+

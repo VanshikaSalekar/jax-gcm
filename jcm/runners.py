@@ -10,6 +10,7 @@ Hydra's CLI machinery.
 from __future__ import annotations
 
 import logging
+import types
 from pathlib import Path
 from typing import Any
 
@@ -84,79 +85,144 @@ def build_coords(cfg: DictConfig):
 # Physics
 # ---------------------------------------------------------------------------
 
-def _apply_param_overrides(base, overrides: dict | None):
-    """Apply a ``{subgroup: {field: value}}`` override dict to a Parameters-like object.
+def _parameters_specs_from_init(term_cls) -> dict[str, type]:
+    """Discover Parameters-typed kwargs on a term's ``__init__``.
 
-    Works for any ``tree_math.struct``-style container whose subgroups are
-    themselves field-based dataclasses (which covers both
-    ``jcm.physics.speedy.params.Parameters`` and
-    ``jcm.physics.echam.parameters.Parameters``). Unknown subgroups raise
-    ``ValueError`` so typos don't silently no-op.
+    Returns a mapping from ``__init__`` kwarg name to the
+    Parameters-like class declared as its (possibly ``Optional``) type
+    annotation. A class is considered Parameters-like if it exposes a
+    ``default`` classmethod — the structural marker used uniformly by
+    every scheme (``ConvectionParameters.default()``,
+    ``ModRadConParameters.default()``, …).
+
+    The runner uses this mapping to decide which YAML blocks should be
+    interpreted as Parameters field-override dicts (defaulted via
+    ``ParamsCls.default()``) versus plain pass-through kwargs.
     """
-    if not overrides:
-        return base
-    base_fields = dict(base.__dict__)
-    for subgroup, subdict in overrides.items():
-        if subgroup not in base_fields:
-            raise ValueError(
-                f"Unknown physics parameter subgroup {subgroup!r}; "
-                f"choices: {sorted(base_fields)}"
-            )
-        sub = base_fields[subgroup]
-        base_fields[subgroup] = sub.__class__(**{**sub.__dict__, **dict(subdict)})
-    return base.__class__(**base_fields)
+    import inspect
+    import typing
 
-
-def _physics_param_overrides(cfg: DictConfig) -> dict:
-    """Pull ``cfg.physics.params`` out of OmegaConf into a plain nested dict."""
-    raw = cfg.physics.get("params", None)
-    if raw is None:
+    try:
+        hints = typing.get_type_hints(term_cls.__init__)
+    except (NameError, TypeError):
+        # Forward refs that fail to resolve, or no annotations: treat
+        # everything as plain kwargs.
         return {}
-    from omegaconf import OmegaConf
-    return OmegaConf.to_container(raw, resolve=True) or {}
+
+    sig_params = inspect.signature(term_cls.__init__).parameters
+    specs: dict[str, type] = {}
+    for kwarg_name in sig_params:
+        if kwarg_name == "self":
+            continue
+        annot = hints.get(kwarg_name)
+        if annot is None:
+            continue
+        # Strip Optional[X] / Union[X, None] / X | None.
+        origin = typing.get_origin(annot)
+        if origin in (typing.Union, types.UnionType):
+            non_none = [a for a in typing.get_args(annot) if a is not type(None)]
+            if len(non_none) != 1:
+                continue
+            annot = non_none[0]
+        # Structural test: anything with a ``default`` classmethod is a
+        # Parameters dataclass for our purposes.
+        if isinstance(annot, type) and callable(getattr(annot, "default", None)):
+            specs[kwarg_name] = annot
+    return specs
+
+
+def _build_term(term_name: str, term_entry: dict):
+    """Instantiate a single ``PhysicsTerm`` from a YAML term entry.
+
+    Each ``cfg.physics.terms.<name>`` block names a term class via
+    ``_target_`` plus optional kwargs. The runner introspects the
+    term's ``__init__`` annotations: kwargs typed with a Parameters
+    class (``ConvectionParameters | None``, …) are treated as
+    field-override dicts — defaults come from ``ParamsCls.default()``,
+    the user only has to supply the fields they want to tune. Any
+    other kwargs are passed through as plain ``__init__`` arguments
+    (used by terms like ``UpperSponge`` that take primitive values
+    rather than Parameters dataclasses).
+    """
+    from hydra.utils import get_class
+
+    if not isinstance(term_entry, dict) or "_target_" not in term_entry:
+        raise ValueError(
+            f"physics.terms.{term_name!r} must be a dict containing "
+            f"'_target_'; got {term_entry!r}"
+        )
+    entry = dict(term_entry)
+    target = entry.pop("_target_")
+    term_cls = get_class(target)
+
+    init_kwargs: dict = {}
+    for kwarg_name, params_cls in _parameters_specs_from_init(term_cls).items():
+        overrides = entry.pop(kwarg_name, None) or {}
+        base = params_cls.default()
+        init_kwargs[kwarg_name] = base.__class__(
+            **{**base.__dict__, **dict(overrides)}
+        )
+
+    # Anything left is a plain-kwarg pass-through (e.g. UpperSponge's
+    # n_sponge_levels, sponge_timescale_s).
+    init_kwargs.update(entry)
+    return term_cls(**init_kwargs)
 
 
 def build_physics(cfg: DictConfig):
-    """Build the physics package from ``cfg.physics``.
+    r"""Build a ``ComposablePhysics`` from ``cfg.physics.terms``.
 
-    Each package's own ``Parameters.default()`` is the source of truth for
-    tunables. ``cfg.physics.params`` (a free-form nested dict) is walked at
-    build time and applied via ``_apply_param_overrides``, so users can
-    poke individual fields from the CLI without having to mirror the
-    Parameters structure in YAML, e.g.::
+    ``cfg.physics.terms`` is an ordered mapping from term name to a
+    Hydra-style entry::
 
-        python -m jcm.main physics.params.convection.entrpen=4e-4
+        physics:
+          checkpoint_terms: true
+          vectorize_columns: true
+          terms:
+            tiedtke_convection:
+              _target_: jcm.physics.convection.tiedtke_nordeng.TiedtkeConvection
+              params:
+                entrpen: 4.0e-4
+            grey_two_stream_radiation:
+              _target_: jcm.physics.radiation.grey_two_stream.GreyTwoStreamRadiation
+
+    Override individual fields from the CLI without editing YAML, e.g.::
+
+        python -m jcm.main physics=echam \
+            physics.terms.tiedtke_convection.params.entrpen=4e-4
+
+    Swap a term for an alternative by overriding its ``_target_`` (and
+    optionally its kwargs) at the CLI, or by composing a preset YAML
+    that pulls in ``physics: echam`` via ``defaults`` and then
+    overrides individual term entries.
     """
-    name = cfg.physics.name
-    overrides = _physics_param_overrides(cfg)
+    from omegaconf import OmegaConf
 
-    if name == "speedy":
-        from jcm.physics.speedy.params import Parameters as SpeedyParameters
-        from jcm.physics.speedy.speedy_terms import speedy_physics
-        params = _apply_param_overrides(SpeedyParameters.default(), overrides)
-        return speedy_physics(
-            parameters=params,
-            checkpoint_terms=cfg.physics.get("checkpoint_terms", True),
+    from jcm.physics.composable_physics import ComposablePhysics
+
+    physics_cfg = cfg.physics
+    terms_raw = physics_cfg.get("terms", None)
+    if terms_raw is None:
+        raise ValueError(
+            "cfg.physics.terms is required. Each entry must declare a "
+            "_target_ pointing at a PhysicsTerm subclass."
         )
-    if name == "held_suarez":
-        if overrides:
-            raise ValueError(
-                "Held-Suarez has no Parameters object; cfg.physics.params "
-                "must be empty."
-            )
-        from jcm.physics.held_suarez.held_suarez_physics import held_suarez_physics
-        return held_suarez_physics()
-    if name == "echam":
-        from jcm.physics.echam.echam_terms import echam_physics
-        from jcm.physics.echam.parameters import Parameters as EchamParameters
-        params = _apply_param_overrides(EchamParameters.default(), overrides)
-        return echam_physics(
-            parameters=params,
-            radiation_scheme=cfg.physics.radiation,
-            cloud_scheme=cfg.physics.get("cloud_scheme", "1m"),
-            checkpoint_terms=cfg.physics.get("checkpoint_terms", True),
-        )
-    raise ValueError(f"Unknown physics.name={name!r}")
+    terms_cfg = OmegaConf.to_container(terms_raw, resolve=True) or {}
+
+    terms = []
+    for term_name, term_entry in terms_cfg.items():
+        if term_entry is None:
+            # Allow turning a term off via Hydra's `~` removal idiom or
+            # an explicit ``null`` in the YAML — useful when inheriting
+            # a default term list and dropping a term in the override.
+            continue
+        terms.append(_build_term(term_name, term_entry))
+
+    return ComposablePhysics(
+        terms=terms,
+        checkpoint_terms=physics_cfg.get("checkpoint_terms", True),
+        vectorize_columns=physics_cfg.get("vectorize_columns", False),
+    )
 
 
 def maybe_add_sponge(physics, cfg: DictConfig):

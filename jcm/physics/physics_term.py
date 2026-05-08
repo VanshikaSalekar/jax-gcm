@@ -58,6 +58,13 @@ class PhysicsTerm(nnx.Module):
     Subclasses must:
       - Declare ``name``, ``category``, ``requires``, ``provides`` as
         ``ClassVar`` — static metadata, not pytree leaves.
+      - Type-annotate any Parameters-dataclass kwargs on ``__init__``
+        (e.g. ``params: ConvectionParameters | None = None``). The
+        Hydra-driven ``runners.build_physics`` introspects these
+        annotations to resolve YAML overrides into ``Parameters``
+        instances before calling ``__init__``. Plain primitive kwargs
+        (timescales, level counts, …) need no annotation — they are
+        passed through verbatim from the YAML.
       - Store tunable parameters as ``nnx.Param`` attributes so that
         gradients flow through them.
       - Store coordinate-dependent caches as ``nnx.Variable`` attributes

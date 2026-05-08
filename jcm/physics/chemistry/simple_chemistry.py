@@ -64,11 +64,76 @@ class ChemistryState(NamedTuple):
 
 class ChemistryTendencies(NamedTuple):
     """Tendencies from chemistry processes"""
-    
+
     # Trace gas tendencies (mixing ratio per second)
     ozone_tend: jnp.ndarray         # Ozone tendency (ppbv/s)
     methane_tend: jnp.ndarray       # Methane tendency (ppbv/s)
     co2_tend: jnp.ndarray          # CO2 tendency (ppmv/s)
+
+
+@tree_math.struct
+class ChemistryData:
+    """Diagnostic sub-struct for the chemistry diagnostic-dict slot.
+
+    Seeded by ``EchamBoundaryConditions`` (which fills CO2/CH4/O3 VMRs
+    from forcing) and consumed by the radiation terms; the
+    ``SimpleChemistry`` term also writes its production/loss diagnostics
+    here. Lives next to the chemistry scheme so a future replacement
+    chemistry term can extend or replace this struct without reaching
+    into the ECHAM tree.
+    """
+
+    # Gas concentrations (volume mixing ratios)
+    ozone_vmr: jnp.ndarray           # Ozone VMR [ppbv] (nlev, ncols)
+    methane_vmr: jnp.ndarray         # Methane VMR [ppbv] (nlev, ncols)
+    co2_vmr: jnp.ndarray            # CO2 VMR [ppmv] (nlev, ncols)
+
+    # Production/loss rates
+    ozone_production: jnp.ndarray    # Ozone production rate [ppbv/s] (nlev, ncols)
+    ozone_loss: jnp.ndarray         # Ozone loss rate [ppbv/s] (nlev, ncols)
+    methane_loss: jnp.ndarray       # Methane loss rate [ppbv/s] (nlev, ncols)
+
+    # Surface emissions/deposition
+    methane_surface_flux: jnp.ndarray  # Surface methane flux [ppbv m/s] (ncols,)
+    ozone_dry_deposition: jnp.ndarray  # Ozone dry deposition velocity [m/s] (ncols,)
+
+    @classmethod
+    def zeros(cls, nodal_shape, nlev):
+        # Chemistry fields should be in column format (nlev, ncols)
+        # where ncols = nlat * nlon.
+        if len(nodal_shape) == 2:
+            nlat, nlon = nodal_shape
+            ncols = nlat * nlon
+            column_shape = (nlev, ncols)
+            surface_shape = (ncols,)
+        else:
+            column_shape = (nlev,) + nodal_shape
+            surface_shape = nodal_shape
+
+        return cls(
+            ozone_vmr=jnp.zeros(column_shape),
+            methane_vmr=jnp.zeros(column_shape),
+            co2_vmr=jnp.zeros(column_shape),
+            ozone_production=jnp.zeros(column_shape),
+            ozone_loss=jnp.zeros(column_shape),
+            methane_loss=jnp.zeros(column_shape),
+            methane_surface_flux=jnp.zeros(surface_shape),
+            ozone_dry_deposition=jnp.zeros(surface_shape),
+        )
+
+    def copy(self, **kwargs):
+        new_data = {
+            'ozone_vmr': self.ozone_vmr,
+            'methane_vmr': self.methane_vmr,
+            'co2_vmr': self.co2_vmr,
+            'ozone_production': self.ozone_production,
+            'ozone_loss': self.ozone_loss,
+            'methane_loss': self.methane_loss,
+            'methane_surface_flux': self.methane_surface_flux,
+            'ozone_dry_deposition': self.ozone_dry_deposition,
+        }
+        new_data.update(kwargs)
+        return ChemistryData(**new_data)
 
 
 def compute_height_from_pressure(
@@ -283,7 +348,7 @@ def initialize_chemistry_tracers(
     
     # Initialize CO2 as constant
     co2_vmr = jnp.ones((nlev, ncols)) * config.co2_vmr
-    
+
     return ChemistryState(
         ozone_vmr=ozone_vmr,
         methane_vmr=methane_vmr,
@@ -292,3 +357,80 @@ def initialize_chemistry_tracers(
         ozone_loss=jnp.zeros((nlev, ncols)),
         methane_loss=jnp.zeros((nlev, ncols))
     )
+
+
+# ---------------------------------------------------------------------------
+# Composable physics term wrapper
+# ---------------------------------------------------------------------------
+
+from typing import ClassVar  # noqa: E402
+
+from flax import nnx  # noqa: E402
+
+from jcm.forcing import ForcingData  # noqa: E402
+from jcm.physics.physics_term import PhysicsTerm  # noqa: E402
+from jcm.physics_interface import PhysicsState, PhysicsTendency  # noqa: E402
+from jcm.terrain import TerrainData  # noqa: E402
+
+
+class SimpleChemistry(PhysicsTerm):
+    """Simple chemistry as a composable PhysicsTerm.
+
+    Wraps :func:`simple_chemistry`. Reads the current chemistry typed
+    sub-struct from ``diagnostics["chemistry"]`` (initialised by
+    :class:`~jcm.physics.forcing.echam_boundary_conditions.EchamBoundaryConditions`
+    each step), computes the relaxation-to-climatology / linear-decay
+    update, and writes the new ``ChemistryState`` back to the same public
+    key. Returns zero atmospheric tendency — chemistry doesn't directly
+    perturb the dynamics here (its ozone/CO2 fields are consumed by the
+    radiation term to influence heating rates).
+
+    Reads ``pressure_full`` and ``surface_pressure`` from the moist-air
+    diagnostics dict and the model timestep from
+    ``diagnostics["_date"].dt_seconds``.
+    """
+
+    name: ClassVar[str] = "simple_chemistry"
+    category: ClassVar[str] = "chemistry"
+    requires: ClassVar[tuple[str, ...]] = (
+        "pressure_full", "surface_pressure", "chemistry",
+    )
+    provides: ClassVar[tuple[str, ...]] = ("chemistry",)
+
+    def __init__(self, params: ChemistryParameters | None = None):
+        """Hold the scheme-native :class:`ChemistryParameters`."""
+        self.params = nnx.Param(params or ChemistryParameters.default())
+
+    def __call__(
+        self,
+        state: PhysicsState,
+        diagnostics: dict,
+        forcing: ForcingData,
+        terrain: TerrainData,
+    ) -> tuple[PhysicsTendency, dict]:
+        """Update chemistry sub-struct from the previous step's values."""
+        params = self.params.get_value()
+        dt = diagnostics["_date"].dt_seconds
+
+        chemistry = diagnostics["chemistry"]
+        _tend, new_state = simple_chemistry(
+            pressure=diagnostics["pressure_full"],
+            surface_pressure=diagnostics["surface_pressure"],
+            temperature=state.temperature,
+            current_ozone=chemistry.ozone_vmr,
+            current_methane=chemistry.methane_vmr,
+            dt=dt,
+            config=params,
+        )
+
+        chemistry = chemistry.copy(
+            ozone_vmr=new_state.ozone_vmr,
+            methane_vmr=new_state.methane_vmr,
+            co2_vmr=new_state.co2_vmr,
+            ozone_production=new_state.ozone_production,
+            ozone_loss=new_state.ozone_loss,
+            methane_loss=new_state.methane_loss,
+        )
+
+        zero_tendencies = PhysicsTendency.zeros(state.temperature.shape)
+        return zero_tendencies, {**diagnostics, "chemistry": chemistry}

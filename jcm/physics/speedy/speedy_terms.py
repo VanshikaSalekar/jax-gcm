@@ -192,7 +192,9 @@ class SpeedyForcing(SpeedyTermBase):
     name: ClassVar[str] = "speedy_forcing"
     category: ClassVar[str] = "forcing"
 
-    def __init__(self, mod_radcon_params=None):
+    def __init__(
+        self, mod_radcon_params: ModRadConParameters | None = None,
+    ):
         """Initialize SpeedyForcing."""
         super().__init__()
         self.mod_radcon_params = nnx.Param(
@@ -239,7 +241,9 @@ class SpeedyConvection(SpeedyTermBase):
     name: ClassVar[str] = "speedy_convection"
     category: ClassVar[str] = "convection"
 
-    def __init__(self, convection_params=None):
+    def __init__(
+        self, convection_params: ConvectionParameters | None = None,
+    ):
         """Initialize SpeedyConvection."""
         super().__init__()
         self.params = nnx.Param(convection_params or ConvectionParameters.default())
@@ -261,7 +265,9 @@ class SpeedyLargeScaleCondensation(SpeedyTermBase):
     name: ClassVar[str] = "speedy_large_scale_condensation"
     category: ClassVar[str] = "condensation"
 
-    def __init__(self, condensation_params=None):
+    def __init__(
+        self, condensation_params: CondensationParameters | None = None,
+    ):
         """Initialize SpeedyLargeScaleCondensation."""
         super().__init__()
         self.params = nnx.Param(condensation_params or CondensationParameters.default())
@@ -287,7 +293,9 @@ class SpeedyClouds(SpeedyTermBase):
     name: ClassVar[str] = "speedy_clouds"
     category: ClassVar[str] = "clouds"
 
-    def __init__(self, sw_params=None):
+    def __init__(
+        self, sw_params: ShortwaveRadiationParameters | None = None,
+    ):
         """Initialize SpeedyClouds."""
         super().__init__()
         self.params = nnx.Param(sw_params or ShortwaveRadiationParameters.default())
@@ -309,7 +317,11 @@ class SpeedyShortwaveRadiation(SpeedyTermBase):
     name: ClassVar[str] = "speedy_shortwave_radiation"
     category: ClassVar[str] = "radiation_sw"
 
-    def __init__(self, sw_params=None, mod_radcon_params=None):
+    def __init__(
+        self,
+        sw_params: ShortwaveRadiationParameters | None = None,
+        mod_radcon_params: ModRadConParameters | None = None,
+    ):
         """Initialize SpeedyShortwaveRadiation."""
         super().__init__()
         self.sw_params = nnx.Param(
@@ -341,7 +353,9 @@ class SpeedyDownwardLongwaveRadiation(SpeedyTermBase):
     name: ClassVar[str] = "speedy_downward_longwave"
     category: ClassVar[str] = "radiation_lw_down"
 
-    def __init__(self, mod_radcon_params=None):
+    def __init__(
+        self, mod_radcon_params: ModRadConParameters | None = None,
+    ):
         """Initialize SpeedyDownwardLongwaveRadiation."""
         super().__init__()
         self.mod_radcon_params = nnx.Param(
@@ -371,7 +385,11 @@ class SpeedySurfaceFlux(SpeedyTermBase):
     name: ClassVar[str] = "speedy_surface_flux"
     category: ClassVar[str] = "surface"
 
-    def __init__(self, surface_params=None, mod_radcon_params=None):
+    def __init__(
+        self,
+        surface_params: SurfaceFluxParameters | None = None,
+        mod_radcon_params: ModRadConParameters | None = None,
+    ):
         """Initialize SpeedySurfaceFlux."""
         super().__init__()
         # SurfaceFluxParameters contains bools — use Variable
@@ -406,7 +424,9 @@ class SpeedyUpwardLongwaveRadiation(SpeedyTermBase):
     name: ClassVar[str] = "speedy_upward_longwave"
     category: ClassVar[str] = "radiation_lw_up"
 
-    def __init__(self, mod_radcon_params=None):
+    def __init__(
+        self, mod_radcon_params: ModRadConParameters | None = None,
+    ):
         """Initialize SpeedyUpwardLongwaveRadiation."""
         super().__init__()
         self.mod_radcon_params = nnx.Param(
@@ -436,7 +456,9 @@ class SpeedyVerticalDiffusion(SpeedyTermBase):
     name: ClassVar[str] = "speedy_vertical_diffusion"
     category: ClassVar[str] = "vertical_diffusion"
 
-    def __init__(self, vdiff_params=None):
+    def __init__(
+        self, vdiff_params: VerticalDiffusionParameters | None = None,
+    ):
         """Initialize SpeedyVerticalDiffusion."""
         super().__init__()
         self.params = nnx.Param(vdiff_params or VerticalDiffusionParameters.default())

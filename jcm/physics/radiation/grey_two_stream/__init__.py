@@ -6,11 +6,13 @@ for the main entry point.
 """
 
 from .radiation_scheme import (
-    radiation_scheme,
+    GreyTwoStreamRadiation,
     prepare_radiation_state,
+    radiation_scheme,
 )
 
 __all__ = [
-    'radiation_scheme',
+    'GreyTwoStreamRadiation',
     'prepare_radiation_state',
+    'radiation_scheme',
 ]

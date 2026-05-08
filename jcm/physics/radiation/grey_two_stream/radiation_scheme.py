@@ -10,12 +10,12 @@ import jax.numpy as jnp
 from typing import Tuple, Optional
 
 from ..radiation_types import (
-    RadiationParameters, 
+    RadiationParameters,
     RadiationState,
     RadiationTendencies,
-    OpticalProperties
+    OpticalProperties,
+    RadiationData,
 )
-from jcm.physics.echam.echam_physics_data import RadiationData
 
 from jax_solar import radiation_flux, get_solar_sin_altitude, OrbitalTime
 from jcm.forcing import SolarGeometry
@@ -479,5 +479,227 @@ def radiation_scheme(
         surface_lw_down=surface_lw_down,
         surface_lw_up=surface_lw_up,
     )
-    
+
     return tendencies, diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Composable physics term wrapper
+# ---------------------------------------------------------------------------
+
+from typing import ClassVar  # noqa: E402
+
+import jax  # noqa: E402
+from flax import nnx  # noqa: E402
+
+from jcm.forcing import ForcingData  # noqa: E402
+from jcm.physics.radiation.radiation_types import RadiationData  # noqa: E402
+from jcm.physics.physics_term import PhysicsTerm  # noqa: E402
+from jcm.physics.radiation import (  # noqa: E402
+    cached_radiation_tendency,
+    radiation_should_compute,
+)
+from jcm.physics.radiation.radiation_types import RadiationParameters  # noqa: E402
+from jcm.physics_interface import PhysicsState, PhysicsTendency  # noqa: E402
+from jcm.terrain import TerrainData  # noqa: E402
+
+
+def _column_vector(value: jnp.ndarray, ncols: int) -> jnp.ndarray:
+    """Return a vmapped scalar diagnostic as one value per column."""
+    return jnp.reshape(value, (ncols,))
+
+
+class GreyTwoStreamRadiation(PhysicsTerm):
+    """Grey two-stream radiation as a composable PhysicsTerm.
+
+    Wraps :func:`radiation_scheme`. Reads pressure / height / density
+    from the moist-air diagnostics dict; reads cloud water / ice from
+    state tracers and cloud fraction from the public ``"clouds"`` key;
+    reads ozone / CO2 from ``"chemistry"``; reads aerosol optical
+    properties from ``"aerosol"``; reads surface temperature from
+    ``"surface"`` (still legacy until the surface migration) and
+    surface albedos / emissivity from ``"radiation"`` (set by
+    :class:`~jcm.physics.forcing.echam_boundary_conditions.EchamBoundaryConditions`).
+
+    Caches its own heating-rate output across radiation sub-steps
+    (when ``parameters.radiation_interval > 0``) by reading the
+    previous-step ``RadiationData`` from ``diagnostics["radiation"]``
+    and re-emitting it instead of re-running the scheme.
+    """
+
+    name: ClassVar[str] = "grey_two_stream_radiation"
+    category: ClassVar[str] = "radiation"
+    # ``clouds`` is intentionally NOT in ``requires``: the cloud-fraction
+    # term runs *after* radiation in the default ECHAM ordering, so this
+    # term reads the previous step's cloud_fraction (or zeros on step 1)
+    # — same behaviour the legacy ``apply_radiation`` had.
+    requires: ClassVar[tuple[str, ...]] = (
+        "pressure_full", "pressure_half", "layer_thickness",
+        "air_density", "chemistry", "aerosol",
+        "radiation", "surface",
+    )
+    provides: ClassVar[tuple[str, ...]] = ("radiation",)
+
+    def __init__(self, params: RadiationParameters | None = None):
+        """Hold the scheme-native :class:`RadiationParameters`."""
+        self.params = nnx.Param(params or RadiationParameters.default())
+        self._coords_cached = False
+
+    def cache_coords(self, coords) -> None:
+        """Cache per-column lat/lon (deg) for the radiation scheme."""
+        lat_deg = jnp.asarray(coords.horizontal.latitudes) * 180.0 / jnp.pi
+        lon_deg = jnp.asarray(coords.horizontal.longitudes) * 180.0 / jnp.pi
+        lat_2d, lon_2d = jnp.meshgrid(lat_deg, lon_deg)
+        self._lats = nnx.Variable(lat_2d.reshape(-1))
+        self._lons = nnx.Variable(lon_2d.reshape(-1))
+        self._coords_cached = True
+
+    def __call__(
+        self,
+        state: PhysicsState,
+        diagnostics: dict,
+        forcing: ForcingData,
+        terrain: TerrainData,
+    ) -> tuple[PhysicsTendency, dict]:
+        """Compute or reuse cached radiative heating rates."""
+        nlev, ncols = state.temperature.shape
+        params = self.params.get_value()
+        radiation = diagnostics["radiation"]
+
+        def _compute():
+            return self._compute_full(state, diagnostics, forcing, params)
+
+        def _use_cached():
+            return cached_radiation_tendency(
+                radiation, state.temperature.shape,
+            ), radiation
+
+        tendency, new_radiation = jax.lax.cond(
+            radiation_should_compute(diagnostics, params),
+            _compute, _use_cached,
+        )
+        return tendency, {**diagnostics, "radiation": new_radiation}
+
+    def _compute_full(
+        self, state, diagnostics, forcing, params,
+    ):
+        """Run the full grey two-stream scheme, return (tendency, RadiationData)."""
+        nlev, ncols = state.temperature.shape
+
+        latitudes = self._lats.get_value()
+        longitudes = self._lons.get_value()
+        solar = forcing.solar
+
+        cloud_water = state.tracers.get(
+            "qc", jnp.zeros_like(state.temperature),
+        )
+        cloud_ice = state.tracers.get(
+            "qi", jnp.zeros_like(state.temperature),
+        )
+        # Fall back to a zero cloud_fraction on step 1 (before any
+        # cloud-fraction term has run) — matches the legacy
+        # ``physics_data.clouds.cloud_fraction`` zero-init behaviour.
+        if "clouds" in diagnostics:
+            cloud_fraction = diagnostics["clouds"].cloud_fraction
+        else:
+            cloud_fraction = jnp.zeros_like(state.temperature)
+
+        chemistry = diagnostics["chemistry"]
+        # Convert ppmv → VMR. CO2 is well-mixed; pass as scalar.
+        ozone_vmr = chemistry.ozone_vmr * 1e-6
+        co2_vmr = jnp.mean(chemistry.co2_vmr) * 1e-6
+
+        # Surface temperature still lives in the legacy "surface" key
+        # (until the EchamSurface migration); the radiation surface
+        # albedo / emissivity is on the "radiation" sub-struct.
+        surface_temperature = diagnostics["surface"].surface_temperature.reshape(ncols)
+        radiation = diagnostics["radiation"]
+        surface_albedo_vis = radiation.surface_albedo_vis.reshape(ncols)
+        surface_albedo_nir = radiation.surface_albedo_nir.reshape(ncols)
+        surface_emissivity = radiation.surface_emissivity.reshape(ncols)
+
+        # Reshape aerosol fields so column is the leading (mapped) axis.
+        aerosol_in = diagnostics["aerosol"]
+        aerosol_for_vmap = aerosol_in.copy(
+            aod_profile=aerosol_in.aod_profile.reshape(nlev, ncols).T,
+            ssa_profile=aerosol_in.ssa_profile.reshape(nlev, ncols).T,
+            asy_profile=aerosol_in.asy_profile.reshape(nlev, ncols).T,
+            cdnc_factor=aerosol_in.cdnc_factor.reshape(ncols),
+            aod_total=aerosol_in.aod_total.reshape(ncols),
+            aod_anthropogenic=aerosol_in.aod_anthropogenic.reshape(ncols),
+            aod_background=aerosol_in.aod_background.reshape(ncols),
+            angstrom=aerosol_in.angstrom.reshape(ncols),
+        )
+
+        tendencies_vmapped, diagnostics_vmapped = jax.vmap(
+            radiation_scheme,
+            # T, q, p_full, p_half, dz on axis 1
+            in_axes=(
+                1, 1, 1, 1, 1,
+                1, 1, 1, 1,
+                # surface scalars on axis 0
+                0, 0, 0, 0,
+                # solar None, lat/lon on axis 0
+                None, 0, 0,
+                # parameters None, aerosol per-col, ozone on axis 1, co2 None
+                None, 0, 1, None,
+            ),
+            out_axes=(0, 0),
+            axis_size=ncols,
+        )(
+            state.temperature, state.specific_humidity,
+            diagnostics["pressure_full"], diagnostics["pressure_half"],
+            diagnostics["layer_thickness"], diagnostics["air_density"],
+            cloud_water, cloud_ice, cloud_fraction,
+            surface_temperature, surface_albedo_vis,
+            surface_albedo_nir, surface_emissivity,
+            solar, latitudes, longitudes,
+            params, aerosol_for_vmap, ozone_vmr, co2_vmr,
+        )
+
+        # Grey scheme keeps a per-band axis on the flux profiles; sum it
+        # out and transpose back to (nlev+1, ncols).
+        rad_out = RadiationData(
+            cos_zenith=_column_vector(diagnostics_vmapped.cos_zenith, ncols),
+            surface_albedo_vis=_column_vector(
+                diagnostics_vmapped.surface_albedo_vis, ncols,
+            ),
+            surface_albedo_nir=_column_vector(
+                diagnostics_vmapped.surface_albedo_nir, ncols,
+            ),
+            surface_emissivity=_column_vector(
+                diagnostics_vmapped.surface_emissivity, ncols,
+            ),
+            sw_flux_up=diagnostics_vmapped.sw_flux_up.transpose(1, 0, 2).sum(axis=-1),
+            sw_flux_down=diagnostics_vmapped.sw_flux_down.transpose(1, 0, 2).sum(axis=-1),
+            sw_heating_rate=tendencies_vmapped.shortwave_heating.T,
+            lw_flux_up=diagnostics_vmapped.lw_flux_up.transpose(1, 0, 2).sum(axis=-1),
+            lw_flux_down=diagnostics_vmapped.lw_flux_down.transpose(1, 0, 2).sum(axis=-1),
+            lw_heating_rate=tendencies_vmapped.longwave_heating.T,
+            surface_sw_down=_column_vector(
+                diagnostics_vmapped.surface_sw_down, ncols,
+            ),
+            surface_lw_down=_column_vector(
+                diagnostics_vmapped.surface_lw_down, ncols,
+            ),
+            surface_sw_up=_column_vector(
+                diagnostics_vmapped.surface_sw_up, ncols,
+            ),
+            surface_lw_up=_column_vector(
+                diagnostics_vmapped.surface_lw_up, ncols,
+            ),
+            toa_sw_up=_column_vector(diagnostics_vmapped.toa_sw_up, ncols),
+            toa_lw_up=_column_vector(diagnostics_vmapped.toa_lw_up, ncols),
+            toa_sw_down=_column_vector(
+                diagnostics_vmapped.toa_sw_down, ncols,
+            ),
+        )
+
+        tendency = PhysicsTendency(
+            u_wind=jnp.zeros((nlev, ncols)),
+            v_wind=jnp.zeros((nlev, ncols)),
+            temperature=tendencies_vmapped.temperature_tendency.T,
+            specific_humidity=jnp.zeros((nlev, ncols)),
+            tracers={},
+        )
+        return tendency, rad_out
