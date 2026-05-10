@@ -163,6 +163,12 @@ def radiation_scheme_emulated(
         toa_sw_up=sw_flux_up[0],
         toa_lw_up=lw_flux_up[0],
         toa_sw_down=toa_sw_down,
+        # NN emulator returns only all-sky fluxes; running it twice
+        # (with and without cloud condensate) for clear-sky CRE values
+        # is a follow-up. Zeros for now so downstream consumers don't
+        # see stale data in the diagnostic key.
+        toa_sw_up_clear=jnp.zeros_like(sw_flux_up[0]),
+        toa_lw_up_clear=jnp.zeros_like(lw_flux_up[0]),
     )
 
     return tendencies, diagnostics
@@ -205,15 +211,12 @@ class NNEmulatorRadiation(PhysicsTerm):
 
     name: ClassVar[str] = "nn_emulator_radiation"
     category: ClassVar[str] = "radiation"
-    # ``clouds`` is intentionally not in ``requires``: the cloud-fraction
-    # term runs *after* radiation in the default ECHAM ordering, so this
-    # term reads the previous step's cloud_fraction (or zeros on step 1).
     requires: ClassVar[tuple[str, ...]] = (
         "pressure_full", "pressure_half", "layer_thickness",
         "air_density", "chemistry", "aerosol",
-        "radiation", "surface",
+        "radiation", "surface", "clouds",
     )
-    provides: ClassVar[tuple[str, ...]] = ("radiation",)
+    provides: ClassVar[tuple[str, ...]] = ("radiation", "clouds")
 
     def __init__(self, params: RadiationParameters | None = None):
         """Hold the scheme-native :class:`RadiationParameters` (with NN weights)."""
@@ -252,7 +255,19 @@ class NNEmulatorRadiation(PhysicsTerm):
             radiation_should_compute(diagnostics, params),
             _compute, _use_cached,
         )
-        return tendency, {**diagnostics, "radiation": new_radiation}
+        # Mirror TOA fluxes onto the clouds sub-struct for CRE
+        # diagnostics. The emulator only produces all-sky values, so
+        # the clear-sky fields stay at zero until the 2-call clear-sky
+        # extension is wired (follow-up).
+        clouds = diagnostics["clouds"].copy(
+            toa_sw_up_all=new_radiation.toa_sw_up,
+            toa_sw_up_clear=new_radiation.toa_sw_up_clear,
+            toa_lw_up_all=new_radiation.toa_lw_up,
+            toa_lw_up_clear=new_radiation.toa_lw_up_clear,
+        )
+        return tendency, {
+            **diagnostics, "radiation": new_radiation, "clouds": clouds,
+        }
 
     def _compute_full(
         self, state, diagnostics, forcing, params,
@@ -270,10 +285,7 @@ class NNEmulatorRadiation(PhysicsTerm):
         cloud_ice = state.tracers.get(
             "qi", jnp.zeros_like(state.temperature),
         )
-        if "clouds" in diagnostics:
-            cloud_fraction = diagnostics["clouds"].cloud_fraction
-        else:
-            cloud_fraction = jnp.zeros_like(state.temperature)
+        cloud_fraction = diagnostics["clouds"].cloud_fraction
 
         chemistry = diagnostics["chemistry"]
         ozone_vmr = chemistry.ozone_vmr * 1e-6
@@ -366,6 +378,12 @@ class NNEmulatorRadiation(PhysicsTerm):
             ),
             toa_sw_down=_column_vector_emulated(
                 diagnostics_vmapped.toa_sw_down, ncols,
+            ),
+            toa_sw_up_clear=_column_vector_emulated(
+                diagnostics_vmapped.toa_sw_up_clear, ncols,
+            ),
+            toa_lw_up_clear=_column_vector_emulated(
+                diagnostics_vmapped.toa_lw_up_clear, ncols,
             ),
         )
 

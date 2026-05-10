@@ -54,6 +54,14 @@ class RadiationParameters:
     cld_tau_min: float       # Minimum cloud optical depth
     cld_frac_min: float      # Minimum cloud fraction
 
+    # Cloud overlap selector for partial-cloud radiation. 0 = random,
+    # 1 = maximum_random (Geleyn-Hollingsworth), 2 = exponential
+    # (generalised, matches ECHAM6's PSRAD setting). The string forms
+    # are exposed as module-level constants for readability; the
+    # struct stores the int code so it is JAX-traceable.
+    cloud_overlap: int
+    cloud_decorrelation_km: float  # decorrelation length for overlap=2
+
     # Neural-network emulator (only used when radiation_scheme="emulated")
     emulator_weights: Optional[object] = None  # EmulatorWeights pytree
     sw_scaling: Optional[object] = None        # InputScaling for SW network
@@ -68,6 +76,7 @@ class RadiationParameters:
                  co2_vmr=400e-6, ch4_vmr=1.8e-6, n2o_vmr=0.32e-6,
                  min_cos_zenith=0.035, flux_epsilon=1e-6,
                  cld_tau_min=1e-6, cld_frac_min=1e-3,
+                 cloud_overlap=2, cloud_decorrelation_km=2.0,
                  emulator_weights=None, sw_scaling=None,
                  lw_scaling=None) -> 'RadiationParameters':
         """Return default radiation parameters"""
@@ -85,10 +94,35 @@ class RadiationParameters:
             flux_epsilon=jnp.array(flux_epsilon),
             cld_tau_min=jnp.array(cld_tau_min),
             cld_frac_min=jnp.array(cld_frac_min),
+            cloud_overlap=jnp.asarray(cloud_overlap),
+            cloud_decorrelation_km=jnp.asarray(cloud_decorrelation_km),
             emulator_weights=emulator_weights,
             sw_scaling=sw_scaling,
             lw_scaling=lw_scaling,
         )
+
+
+# Cloud-overlap rule integer codes (JAX-friendly; see ``RadiationParameters``).
+CLOUD_OVERLAP_RANDOM: int = 0
+CLOUD_OVERLAP_MAXIMUM_RANDOM: int = 1
+CLOUD_OVERLAP_EXPONENTIAL: int = 2
+
+_CLOUD_OVERLAP_NAMES = {
+    CLOUD_OVERLAP_RANDOM: "random",
+    CLOUD_OVERLAP_MAXIMUM_RANDOM: "maximum_random",
+    CLOUD_OVERLAP_EXPONENTIAL: "exponential",
+}
+
+
+def cloud_overlap_name(code: int) -> str:
+    """Return the string overlap name corresponding to an int code."""
+    name = _CLOUD_OVERLAP_NAMES.get(int(code))
+    if name is None:
+        raise ValueError(
+            f"Unknown cloud_overlap code {code!r}; valid codes: "
+            f"{sorted(_CLOUD_OVERLAP_NAMES)}."
+        )
+    return name
 
 
 @tree_math.struct
@@ -131,6 +165,13 @@ class RadiationData:
     toa_lw_up: jnp.ndarray           # TOA upward LW (OLR) [W/m²] (ncols,)
     toa_sw_down: jnp.ndarray         # TOA downward SW [W/m²] (ncols,)
 
+    # Clear-sky TOA outgoing fluxes from the partial-cloud beam-split.
+    # Used to compute the cloud radiative effect (CRE_SW = clear - all,
+    # CRE_LW = clear - all, both at TOA). The radiation term copies these
+    # onto the ``"clouds"`` diagnostic key for downstream consumers.
+    toa_sw_up_clear: jnp.ndarray     # Clear-sky TOA upward SW [W/m²] (ncols,)
+    toa_lw_up_clear: jnp.ndarray     # Clear-sky TOA OLR [W/m²] (ncols,)
+
     @classmethod
     def zeros(cls, nodal_shape, nlev):
         return cls(
@@ -151,6 +192,8 @@ class RadiationData:
             toa_sw_up=jnp.zeros(nodal_shape),
             toa_lw_up=jnp.zeros(nodal_shape),
             toa_sw_down=jnp.zeros(nodal_shape),
+            toa_sw_up_clear=jnp.zeros(nodal_shape),
+            toa_lw_up_clear=jnp.zeros(nodal_shape),
         )
 
     def copy(self, **kwargs):
@@ -172,6 +215,8 @@ class RadiationData:
             'toa_sw_up': self.toa_sw_up,
             'toa_lw_up': self.toa_lw_up,
             'toa_sw_down': self.toa_sw_down,
+            'toa_sw_up_clear': self.toa_sw_up_clear,
+            'toa_lw_up_clear': self.toa_lw_up_clear,
         }
         new_data.update(kwargs)
         return RadiationData(**new_data)

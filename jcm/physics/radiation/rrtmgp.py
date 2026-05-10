@@ -30,6 +30,12 @@ from jcm.physics.radiation.radiation_types import (
     RadiationData,
 )
 from jcm.physics.radiation.grey_two_stream.radiation_scheme import prepare_radiation_state
+from jcm.physics.radiation.mcica import (
+    column_key,
+    generate_subcolumns,
+    in_cloud_path,
+)
+from jcm.physics.radiation.radiation_types import cloud_overlap_name
 from jcm.physics.radiation.cloud_optics import (
     effective_radius_liquid,
     effective_radius_ice,
@@ -196,6 +202,25 @@ def _to_3d_with_filled_halo(
     arr_3d = arr_3d.at[0, 0, 0].set(arr_1d[0])  # bottom halo
     arr_3d = arr_3d.at[0, 0, -1].set(arr_1d[-1])  # top halo
     return arr_3d
+
+
+def _to_4d_per_gpoint(
+    per_gpt_2d: jnp.ndarray, nlev: int, halo: int = 1,
+) -> jnp.ndarray:
+    """Halo-pad ``[n_gpt, nlev]`` → ``[n_gpt, 1, 1, nlev + 2*halo]``.
+
+    Per-gpoint analogue of :func:`_to_3d_with_filled_halo` for the McICA
+    cloud-path inputs to the rrtmgp library: edge-fill the halo by
+    repeating the closest interior value. The library indexes into the
+    leading g-point axis inside its g-point loop.
+    """
+    n_gpt = per_gpt_2d.shape[0]
+    nzh = nlev + 2 * halo
+    out = jnp.zeros((n_gpt, 1, 1, nzh), dtype=per_gpt_2d.dtype)
+    out = out.at[:, 0, 0, halo : halo + nlev].set(per_gpt_2d)
+    out = out.at[:, 0, 0, 0].set(per_gpt_2d[:, 0])
+    out = out.at[:, 0, 0, -1].set(per_gpt_2d[:, -1])
+    return out
 
 
 def _reverse_if_needed(pressure: jnp.ndarray) -> jnp.ndarray:
@@ -377,6 +402,14 @@ def prepare_icon_data(
         toa_sw_up=toa_sw_up,
         toa_lw_up=toa_lw_up,
         toa_sw_down=toa_sw_down,
+        # The all-sky values come from the blended rrtmgp_data dict;
+        # the caller (``radiation_scheme_rrtmgp``) overwrites the
+        # clear-sky fields below with the actual clear-beam values via
+        # ``.copy(...)``. Zero placeholders here keep the tree-shape
+        # consistent in case someone calls ``prepare_icon_data``
+        # outside the beam-split context.
+        toa_sw_up_clear=jnp.zeros_like(toa_sw_up),
+        toa_lw_up_clear=jnp.zeros_like(toa_lw_up),
     )
     return tendencies, diagnostics
 
@@ -422,13 +455,42 @@ def radiation_scheme_rrtmgp(
     longitude: float,
     parameters: RadiationParameters,
     aerosol_data,
+    column_index: jnp.ndarray = jnp.int32(0),
+    model_step: jnp.ndarray = jnp.int32(0),
+    base_seed: int = 0,
+    compute_cre: bool = True,
     ozone_vmr: Optional[jnp.ndarray] = None,
     co2_vmr: float = 400e-6,
 ) -> Tuple[RadiationTendencies, RadiationData]:
-    """RRTMGP radiation scheme -- drop-in replacement for ``radiation_scheme``.
+    """RRTMGP radiation scheme — canonical McICA partial-cloud treatment.
 
-    Has the identical call signature so it can be used interchangeably with
-    the grey/simplified radiation scheme.
+    Partial-cloud handling: full McICA via the per-g-point cloud-path
+    hook in the upstream rrtmgp library. ``mcica.generate_subcolumns``
+    builds one stochastic binary cloud profile per g-point (LW and SW
+    treated separately because their g-point counts differ); each
+    g-point's RRTMGP solve sees only that sub-column's cloud condensate.
+    Averaging across g-points naturally recovers the overlap-aware
+    fluxes — at one RRTMGP call per radiation step rather than the
+    previous 2-call beam-split's two.
+
+    When ``compute_cre`` is True an extra clear-sky RRTMGP call (with
+    zero condensate everywhere) populates ``toa_{sw,lw}_up_clear`` for
+    the cloud radiative effect diagnostic. Costs 2× a McICA call;
+    disable it (e.g. for production runs that only need the all-sky
+    fluxes) for the 1× option.
+
+    Args (additions over the previous beam-split signature):
+        column_index: integer global index of the column being computed,
+            used to seed the stochastic sub-column generator
+            deterministically. Vmapped over the column axis upstream.
+        model_step: scalar integer model step, also folded into the
+            McICA seed so reruns are bit-exact reproducible.
+        base_seed: term-level Python integer seed that the column +
+            step indices fold into.
+        compute_cre: if True, run an additional clear-sky RRTMGP call
+            and populate ``toa_{sw,lw}_up_clear`` on the returned
+            ``RadiationData``.
+
     """
     # CDNC factor from aerosol data
     if aerosol_data.cdnc_factor.ndim == 0:
@@ -446,7 +508,12 @@ def radiation_scheme_rrtmgp(
     sin_altitude = get_solar_sin_altitude(orbital_time, longitude, latitude)
     cos_zenith = sin_altitude  # cos(zenith) = sin(altitude)
 
-    # Prepare ICON radiation state (shared with grey scheme)
+    # In-cloud condensate (grid-mean / cf) is what each cloudy
+    # sub-column sees; the binary McICA mask then re-imposes a
+    # cloud-or-clear partitioning per g-point.
+    cloud_water_in_cloud = in_cloud_path(cloud_water, cloud_fraction)
+    cloud_ice_in_cloud = in_cloud_path(cloud_ice, cloud_fraction)
+
     icon_state = prepare_radiation_state(
         temperature=temperature,
         specific_humidity=specific_humidity,
@@ -454,32 +521,128 @@ def radiation_scheme_rrtmgp(
         pressure_interfaces=pressure_interfaces,
         layer_thickness=layer_thickness,
         air_density=air_density,
-        cloud_water=cloud_water,
-        cloud_ice=cloud_ice,
+        cloud_water=cloud_water_in_cloud,
+        cloud_ice=cloud_ice_in_cloud,
         cloud_fraction=cloud_fraction,
         cos_zenith=cos_zenith,
         ozone_vmr=ozone_vmr,
     )
 
-    # Convert to RRTMGP input format
+    # Stochastic sub-column generation (LW / SW use separate keys
+    # because their g-point counts and resulting masks differ).
+    rrtmgp_instance = _ensure_rrtmgp()
+    n_gpt_lw = rrtmgp_instance.optics_lib.n_gpt_lw
+    n_gpt_sw = rrtmgp_instance.optics_lib.n_gpt_sw
+
+    col_key = column_key(
+        jax.random.PRNGKey(base_seed),
+        model_step=model_step, column_index=column_index,
+    )
+    key_lw, key_sw = jax.random.split(col_key)
+    overlap_str = cloud_overlap_name(int(parameters.cloud_overlap))
+    decorrelation_km = float(parameters.cloud_decorrelation_km)
+
+    masks_lw = generate_subcolumns(
+        cloud_fraction, layer_thickness,
+        n_subcols=n_gpt_lw, overlap=overlap_str,
+        decorrelation_km=decorrelation_km, key=key_lw,
+    )    # [n_gpt_lw, nlev], TOA-first
+    masks_sw = generate_subcolumns(
+        cloud_fraction, layer_thickness,
+        n_subcols=n_gpt_sw, overlap=overlap_str,
+        decorrelation_km=decorrelation_km, key=key_sw,
+    )    # [n_gpt_sw, nlev], TOA-first
+
+    # Per-gpoint cloud paths in surface-first convention (the library's
+    # internal expectation, see the flip in ``prepare_rrtmgp_data``).
+    needs_reversal = _reverse_if_needed(icon_state.pressure)
+    flip_per_gpt = lambda a: a[:, ::-1]  # noqa: E731
+    identity = lambda a: a  # noqa: E731
+
+    masks_lw_lib = lax.cond(
+        needs_reversal, flip_per_gpt, identity, masks_lw,
+    )
+    masks_sw_lib = lax.cond(
+        needs_reversal, flip_per_gpt, identity, masks_sw,
+    )
+    in_cloud_lwp_lib = lax.cond(
+        needs_reversal, lambda a: a[::-1], identity,
+        icon_state.cloud_water_path,
+    )
+    in_cloud_ipath_lib = lax.cond(
+        needs_reversal, lambda a: a[::-1], identity,
+        icon_state.cloud_ice_path,
+    )
+
+    nlev = icon_state.temperature.shape[0]
+    halo = 1
+    cpl_lw_4d = _to_4d_per_gpoint(
+        masks_lw_lib * in_cloud_lwp_lib[jnp.newaxis, :], nlev, halo,
+    )
+    cpi_lw_4d = _to_4d_per_gpoint(
+        masks_lw_lib * in_cloud_ipath_lib[jnp.newaxis, :], nlev, halo,
+    )
+    cpl_sw_4d = _to_4d_per_gpoint(
+        masks_sw_lib * in_cloud_lwp_lib[jnp.newaxis, :], nlev, halo,
+    )
+    cpi_sw_4d = _to_4d_per_gpoint(
+        masks_sw_lib * in_cloud_ipath_lib[jnp.newaxis, :], nlev, halo,
+    )
+
     rrtmgp_input = prepare_rrtmgp_data(
-        icon_state,
-        layer_thickness,
-        cdnc_factor,
-        surface_temperature,
+        icon_state, layer_thickness, cdnc_factor, surface_temperature,
+    )
+    # The broadcast q_liq / q_ice are shadowed by the per-gpoint
+    # arrays inside the g-point loop, so set them to zero. The clear-
+    # sky branch (no per-gpoint args, just q_liq=0/q_ice=0) gives the
+    # all-clear fluxes used for CRE.
+    zero_3d = jnp.zeros_like(rrtmgp_input["q_liq"])
+    rrtmgp_input["q_liq"] = zero_3d
+    rrtmgp_input["q_ice"] = zero_3d
+    rrtmgp_input["q_c"] = zero_3d
+
+    zenith_angle = jnp.arccos(jnp.clip(cos_zenith, 0.0, 1.0))
+    irrad_val = jnp.maximum(toa_flux, 0.0)
+
+    rrtmgp_output = rrtmgp_instance.compute_heating_rate(
+        zenith=zenith_angle, irrad=irrad_val,
+        cloud_path_liq_lw_per_gpt=cpl_lw_4d,
+        cloud_path_ice_lw_per_gpt=cpi_lw_4d,
+        cloud_path_liq_sw_per_gpt=cpl_sw_4d,
+        cloud_path_ice_sw_per_gpt=cpi_sw_4d,
+        **rrtmgp_input,
     )
 
-    # Run RRTMGP radiative transfer
-    rrtmgp_output = radiation_scheme_rrtmgp_fn(rrtmgp_input, toa_flux, cos_zenith)
+    # Optional clear-sky call for the cloud radiative effect. With the
+    # broadcast q_liq / q_ice already zero and no per-gpoint cloud
+    # paths supplied, this collapses to a clear-sky calculation.
+    if compute_cre:
+        rrtmgp_output_clear = rrtmgp_instance.compute_heating_rate(
+            zenith=zenith_angle, irrad=irrad_val, **rrtmgp_input,
+        )
+        toa_sw_up_clear = (
+            rrtmgp_output_clear["toa_sw_flux_outgoing_2d_xy"][0, 0]
+        )
+        toa_lw_up_clear = (
+            rrtmgp_output_clear["toa_lw_flux_outgoing_2d_xy"][0, 0]
+        )
+    else:
+        toa_sw_up_clear = jnp.zeros_like(
+            rrtmgp_output["toa_sw_flux_outgoing_2d_xy"][0, 0],
+        )
+        toa_lw_up_clear = jnp.zeros_like(
+            rrtmgp_output["toa_lw_flux_outgoing_2d_xy"][0, 0],
+        )
 
-    # Convert outputs back to ICON format
-    return prepare_icon_data(
-        rrtmgp_output,
-        icon_state,
-        surface_albedo_vis,
-        surface_albedo_nir,
-        surface_emissivity,
+    tendencies, diagnostics = prepare_icon_data(
+        rrtmgp_output, icon_state,
+        surface_albedo_vis, surface_albedo_nir, surface_emissivity,
     )
+    diagnostics = diagnostics.copy(
+        toa_sw_up_clear=toa_sw_up_clear,
+        toa_lw_up_clear=toa_lw_up_clear,
+    )
+    return tendencies, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -525,19 +688,40 @@ class RRTMGPRadiation(PhysicsTerm):
 
     name: ClassVar[str] = "rrtmgp_radiation"
     category: ClassVar[str] = "radiation"
-    # ``clouds`` is intentionally not in ``requires``: the cloud-fraction
-    # term runs *after* radiation in the default ECHAM ordering, so this
-    # term reads the previous step's cloud_fraction (or zeros on step 1).
     requires: ClassVar[tuple[str, ...]] = (
         "pressure_full", "pressure_half", "layer_thickness",
         "air_density", "chemistry", "aerosol",
-        "radiation", "surface",
+        "radiation", "surface", "clouds",
     )
-    provides: ClassVar[tuple[str, ...]] = ("radiation",)
+    provides: ClassVar[tuple[str, ...]] = ("radiation", "clouds")
 
-    def __init__(self, params: RadiationParameters | None = None):
-        """Hold the scheme-native :class:`RadiationParameters`."""
+    def __init__(
+        self,
+        params: RadiationParameters | None = None,
+        base_seed: int = 0,
+        compute_cre: bool = True,
+    ):
+        """Hold the scheme-native :class:`RadiationParameters`.
+
+        Args:
+            params: scheme-native ``RadiationParameters``.
+            base_seed: McICA PRNG base seed. The generator folds this
+                with ``model_step`` and the per-column index, so the
+                same ``base_seed`` always produces the same stochastic
+                sub-columns for a given run — bit-exact reruns.
+            compute_cre: if True (default), do an extra clear-sky
+                RRTMGP call per radiation step and populate
+                ``toa_{sw,lw}_up_clear`` for the cloud radiative
+                effect diagnostic. Set False for the 1× McICA-only
+                cost when CRE isn't needed.
+
+        """
         self.params = nnx.Param(params or RadiationParameters.default())
+        # Plain Python attributes — these are static-at-trace-time so
+        # the McICA seeding and the CRE branch fold into ``__call__``
+        # without an extra pytree leaf.
+        self._base_seed = int(base_seed)
+        self._compute_cre = bool(compute_cre)
         self._coords_cached = False
 
     def cache_coords(self, coords) -> None:
@@ -572,7 +756,17 @@ class RRTMGPRadiation(PhysicsTerm):
             radiation_should_compute(diagnostics, params),
             _compute, _use_cached,
         )
-        return tendency, {**diagnostics, "radiation": new_radiation}
+        # Mirror the all-sky and clear-sky TOA fluxes onto the
+        # ``"clouds"`` sub-struct for cloud-radiative-effect diagnostics.
+        clouds = diagnostics["clouds"].copy(
+            toa_sw_up_all=new_radiation.toa_sw_up,
+            toa_sw_up_clear=new_radiation.toa_sw_up_clear,
+            toa_lw_up_all=new_radiation.toa_lw_up,
+            toa_lw_up_clear=new_radiation.toa_lw_up_clear,
+        )
+        return tendency, {
+            **diagnostics, "radiation": new_radiation, "clouds": clouds,
+        }
 
     def _compute_full(
         self, state, diagnostics, forcing, params,
@@ -583,6 +777,10 @@ class RRTMGPRadiation(PhysicsTerm):
         latitudes = self._lats.get_value()
         longitudes = self._lons.get_value()
         solar = forcing.solar
+        # Scalar model step + per-column index drive the McICA seed
+        # via ``mcica.column_key`` inside ``radiation_scheme_rrtmgp``.
+        model_step = diagnostics["_date"].model_step
+        column_indices = jnp.arange(ncols, dtype=jnp.int32)
 
         cloud_water = state.tracers.get(
             "qc", jnp.zeros_like(state.temperature),
@@ -590,10 +788,7 @@ class RRTMGPRadiation(PhysicsTerm):
         cloud_ice = state.tracers.get(
             "qi", jnp.zeros_like(state.temperature),
         )
-        if "clouds" in diagnostics:
-            cloud_fraction = diagnostics["clouds"].cloud_fraction
-        else:
-            cloud_fraction = jnp.zeros_like(state.temperature)
+        cloud_fraction = diagnostics["clouds"].cloud_fraction
 
         chemistry = diagnostics["chemistry"]
         ozone_vmr = chemistry.ozone_vmr * 1e-6
@@ -655,6 +850,7 @@ class RRTMGPRadiation(PhysicsTerm):
             surface_emissivity=split_col(surface_emissivity_col),
             latitudes=split_col(latitudes),
             longitudes=split_col(longitudes),
+            column_indices=split_col(column_indices),
             ozone_vmr=split_lev_first(ozone_vmr),
             aerosol=aerosol_for_vmap.copy(
                 aod_profile=split_col(aerosol_for_vmap.aod_profile),
@@ -669,6 +865,9 @@ class RRTMGPRadiation(PhysicsTerm):
             ),
         )
 
+        base_seed = self._base_seed
+        compute_cre = self._compute_cre
+
         def _vmap_one_chunk(chunk_inputs):
             return jax.vmap(
                 radiation_scheme_rrtmgp,
@@ -677,7 +876,9 @@ class RRTMGPRadiation(PhysicsTerm):
                     0, 0, 0, 0,
                     0, 0, 0, 0,
                     None, 0, 0,
-                    None, 0, 0, None,
+                    None, 0,
+                    0, None, None, None,    # column_index, model_step, base_seed, compute_cre
+                    0, None,                # ozone_vmr, co2_vmr
                 ),
                 out_axes=(0, 0),
                 axis_size=chunk_size,
@@ -693,6 +894,8 @@ class RRTMGPRadiation(PhysicsTerm):
                 chunk_inputs['surface_emissivity'],
                 solar, chunk_inputs['latitudes'], chunk_inputs['longitudes'],
                 params, chunk_inputs['aerosol'],
+                chunk_inputs['column_indices'],
+                model_step, base_seed, compute_cre,
                 chunk_inputs['ozone_vmr'], co2_vmr,
             )
 
@@ -742,6 +945,12 @@ class RRTMGPRadiation(PhysicsTerm):
             toa_lw_up=_column_vector_rrtmgp(diagnostics_vmapped.toa_lw_up, ncols),
             toa_sw_down=_column_vector_rrtmgp(
                 diagnostics_vmapped.toa_sw_down, ncols,
+            ),
+            toa_sw_up_clear=_column_vector_rrtmgp(
+                diagnostics_vmapped.toa_sw_up_clear, ncols,
+            ),
+            toa_lw_up_clear=_column_vector_rrtmgp(
+                diagnostics_vmapped.toa_lw_up_clear, ncols,
             ),
         )
 
