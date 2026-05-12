@@ -433,6 +433,11 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
         "surface",
     )
     provides: ClassVar[tuple[str, ...]] = ("vertical_diffusion",)
+    # The structural shape comes from the declarative slot; the TKE
+    # field gets a non-zero seed in :meth:`initial_carry_state` below.
+    carry_slots: ClassVar[dict[str, type]] = {
+        "vertical_diffusion": VerticalDiffusionData,
+    }
 
     def __init__(self, params: VDiffParameters | None = None):
         """Hold the scheme-native :class:`VDiffParameters`."""
@@ -445,6 +450,24 @@ class TteTkeVerticalDiffusion(PhysicsTerm):
             TracerSpec("qc", units="kg/kg"),
             TracerSpec("qi", units="kg/kg"),
         )
+
+    def initial_carry_state(self, coords) -> dict:
+        """Seed the previous-step TKE at the ECHAM floor (0.01 m²/s²).
+
+        ``compute_mixing_length`` and the TKE budget update use the
+        carried TKE on every step. Starting from zero would let the
+        first step's diffusion coefficients fall to floor everywhere
+        and overshoot once turbulence reactivates. Setting the seed at
+        the ECHAM lower bound matches the in-loop clamp and gives the
+        spin-up step a starting reservoir that the analytic source
+        update can build on.
+        """
+        carry = super().initial_carry_state(coords)
+        nlev, ncols = carry["vertical_diffusion"].tke.shape
+        carry["vertical_diffusion"] = carry["vertical_diffusion"].copy(
+            tke=jnp.full((nlev, ncols), 0.01),
+        )
+        return carry
 
     def __call__(
         self,

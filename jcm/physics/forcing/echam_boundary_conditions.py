@@ -90,6 +90,15 @@ class EchamBoundaryConditions(PhysicsTerm):
     provides: ClassVar[tuple[str, ...]] = (
         "radiation", "surface", "chemistry",
     )
+    # Carry seeded as zeros by the base class. The first
+    # ``compute_tendencies`` call overwrites every boundary field from
+    # ``ForcingData`` at the top of the term loop, so the zero seed
+    # never leaks into downstream physics.
+    carry_slots: ClassVar[dict[str, type]] = {
+        "radiation": RadiationData,
+        "surface": SurfaceData,
+        "chemistry": ChemistryData,
+    }
 
     def __init__(self):
         """No tunables; nothing to initialise."""

@@ -515,6 +515,12 @@ class SundqvistCloudFraction(PhysicsTerm):
         "pressure_full", "surface_pressure",
     )
     provides: ClassVar[tuple[str, ...]] = ("clouds", "relative_humidity")
+    # Carry seeded as zeros; cloud fraction / qc / qi are rebuilt every
+    # step from RH and the dynamics tracers, so the zero seed is
+    # overwritten on the first compute call. Downstream microphysics
+    # terms write ``precip_*`` / TOA-flux fields on the same key so the
+    # carry shape stays stable after step 1.
+    carry_slots: ClassVar[dict[str, type]] = {"clouds": CloudData}
 
     def __init__(self, params: CloudParameters | None = None):
         """Hold the scheme-native :class:`CloudParameters`."""

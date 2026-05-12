@@ -396,6 +396,10 @@ class Macv2SpAerosol(PhysicsTerm):
     category: ClassVar[str] = "aerosol"
     requires: ClassVar[tuple[str, ...]] = ("height_full",)
     provides: ClassVar[tuple[str, ...]] = ("aerosol",)
+    # Carry seeded as zeros; ``get_simple_aerosol`` rebuilds
+    # AOD/SSA/asymmetry from the plume parameterisation every step
+    # using the slot only as a shape source.
+    carry_slots: ClassVar[dict[str, type]] = {"aerosol": AerosolData}
 
     def __init__(self, params: AerosolParameters | None = None):
         """Hold the scheme-native :class:`AerosolParameters`."""
