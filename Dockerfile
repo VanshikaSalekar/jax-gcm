@@ -1,14 +1,23 @@
-# GPU build of the JCM image. Uses an NVIDIA CUDA runtime base and JAX's
-# bundled CUDA 12 wheels. JAX falls back to CPU if no GPU is visible at
-# runtime, so the same image works on hosts without `--gpus all`, just
-# without acceleration.
+# GPU build of the JCM image. Uses the slim `cuda:base` image (just the
+# driver-compat shim and CUDA repo metadata, no preinstalled CUDA/cuDNN
+# libs) and lets `jax[cuda12]` pull its own bundled NVIDIA wheels —
+# cuBLAS, cuDNN, NCCL, etc. live under `nvidia-*-cu12` in pip and JAX
+# loads them from there at import time. Going from `cudnn-runtime` to
+# `base` cuts the compressed registry size from ~6.0 GiB to ~3.8 GiB
+# (about 36%, measured 2026-05-12). Savings are smaller than you might
+# expect because JAX detects system-installed CUDA libs and skips its
+# bundled wheels when they're available — so the old base wasn't pure
+# overhead, it was substituting for the wheels.
+#
+# JAX falls back to CPU if no GPU is visible at runtime, so the same
+# image works on hosts without `--gpus all`, just without acceleration.
 #
 # Build:
 #     docker build -t jcm .
 #
 # Run on a GPU host:
 #     docker run --rm --gpus all jcm physics=icon run.total_time=2
-FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.3-base-ubuntu22.04
 
 # Ubuntu 22.04 ships Python 3.10; pull 3.11 from deadsnakes to satisfy
 # JCM's >=3.11 requirement. DEBIAN_FRONTEND=noninteractive prevents tzdata
