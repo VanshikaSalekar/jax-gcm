@@ -90,3 +90,18 @@ class CloudData:
         }
         new_data.update(kwargs)
         return CloudData(**new_data)
+
+
+def radiation_cloud_fields(state, diagnostics):
+    """Return ECHAM-ordered cloud fields for radiation.
+
+    ECHAM ``physc`` calls ``cover`` before radiation, then passes the
+    diagnosed cloud fraction plus the pre-cloud-step ``xlm1`` / ``xim1``
+    condensate fields into radiation. Large-scale cloud microphysics runs
+    later. Mirror that here: fresh cloud fraction comes from
+    ``diagnostics["clouds"]``, while condensate comes from state tracers.
+    """
+    clouds = diagnostics["clouds"]
+    cloud_water = state.tracers.get("qc", jnp.zeros_like(state.temperature))
+    cloud_ice = state.tracers.get("qi", jnp.zeros_like(state.temperature))
+    return cloud_water, cloud_ice, clouds.cloud_fraction

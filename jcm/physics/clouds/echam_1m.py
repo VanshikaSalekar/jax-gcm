@@ -743,11 +743,17 @@ def cloud_microphysics(
     # Humidity: gains from evaporation/sublimation
     dqdt = rain_evap + snow_sublim
     
-    # Temperature: latent heat effects
+    # Temperature: latent heat effects. ECHAM's thermodynamic tendency does
+    # not include rain/snow production from autoconversion or aggregation;
+    # those are phase-preserving condensate-to-precip conversions. Only
+    # evaporation/sublimation, melt/freeze, and liquid riming by snow change
+    # phase enthalpy here.
     dtedt = (
-        - alhc / cp * (rain_evap - qc_auto - qc_accr)  # Liquid phase changes
-        - alhs / cp * (snow_sublim - qi_auto - qi_aggr - qc_rime)  # Ice phase changes  
-        - alhf / cp * (snow_melt - rain_freeze)  # Melting/freezing
+        - alhc / cp * rain_evap
+        - alhs / cp * snow_sublim
+        - alhf / cp * snow_melt
+        + alhf / cp * rain_freeze
+        + alhf / cp * qc_rime
     )
     
     # 6. Sedimentation (using simple approach for now)
@@ -792,10 +798,11 @@ def cloud_microphysics(
     # where pmref = air_density * layer_thickness (layer mass per unit area)
     layer_mass = air_density * layer_thickness  # kg/m²
 
-    # Rain production per level: autoconversion + accretion + snow melting
-    rain_prod = (qc_auto + qc_accr + snow_melt) * cloud_fraction
-    # Snow production per level: ice autoconversion + aggregation + riming + rain freezing
-    snow_prod = (qi_auto + qi_aggr + qc_rime + rain_freeze) * cloud_fraction
+    # Rain/snow production rates are already grid-mean kg/kg/s. The
+    # autoconversion/accretion helpers convert from in-cloud to grid-mean
+    # internally, and melt/freeze rates operate on grid-mean precip stores.
+    rain_prod = qc_auto + qc_accr + snow_melt
+    snow_prod = qi_auto + qi_aggr + qc_rime + rain_freeze
 
     # Column-integrated surface flux (kg/m²/s)
     precip_rain = jnp.sum(rain_prod * layer_mass)
