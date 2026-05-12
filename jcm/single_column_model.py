@@ -29,13 +29,11 @@ from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
-import jax_datetime as jdt
 import numpy as np
 import tree_math
 from jax import lax
 from jax.tree_util import tree_map
 
-from jcm.date import DateData
 from jcm.forcing import ForcingData
 from jcm.physics_interface import (
     Physics,
@@ -61,7 +59,7 @@ class SCMPredictions:
             empty when no relaxation is configured).
         tendencies: Physics tendencies at each step (1-D).
         physics_data: Per-step diagnostics dict from the physics package.
-        times: Times in days since ``start_date``.
+        times: Times in days since the start of the run.
 
     """
 
@@ -187,7 +185,6 @@ class SingleColumnModel:
             defaults to ``TerrainData.single_column()`` (flat, all ocean).
         forcing: Optional single-column ``ForcingData`` (shape ``(1, 1)``);
             defaults to ``ForcingData.zeros((1, 1))``.
-        start_date: Starting date for the time series (default 2000-01-01).
         dt_seconds: Physics timestep in seconds (default 1800).
         apply_tracer_tendencies: When ``False`` tracers are reported
             diagnostically but not advanced.
@@ -207,7 +204,6 @@ class SingleColumnModel:
         lon_deg: float = 0.0,
         terrain: TerrainData | None = None,
         forcing: ForcingData | None = None,
-        start_date: jdt.Datetime = jdt.to_datetime("2000-01-01"),
         dt_seconds: float = 1800.0,
         apply_tracer_tendencies: bool = True,
         relaxation_timescales: dict[str, float] | None = None,
@@ -217,7 +213,6 @@ class SingleColumnModel:
         self.vertical = vertical
         self.lat_deg = float(lat_deg)
         self.lon_deg = float(lon_deg)
-        self.start_date = start_date
         self.dt_seconds = float(dt_seconds)
         self.apply_tracer_tendencies = apply_tracer_tendencies
         self.relaxation_timescales = dict(relaxation_timescales or {})
@@ -227,19 +222,15 @@ class SingleColumnModel:
         self.forcing = forcing if forcing is not None else ForcingData.zeros((1, 1))
 
         self.physics.cache_coords(self.coords)
+        # Hand the SCM's timestep down to the composable-physics container so
+        # its terms read a single ``dt`` source (the same plumbing the full
+        # ``Model`` uses).
+        if hasattr(self.physics, "dt_seconds"):
+            self.physics.dt_seconds = self.dt_seconds
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _date(self, time_idx) -> DateData:
-        sim_time_seconds = time_idx * self.dt_seconds
-        seconds_int = jnp.round(sim_time_seconds).astype(jnp.int32)
-        return DateData.set_date(
-            model_time=self.start_date + jdt.Timedelta(seconds=seconds_int),
-            model_step=jnp.asarray(time_idx).astype(jnp.int32),
-            dt_seconds=self.dt_seconds,
-        )
 
     @staticmethod
     def _stack_states(states: list[PhysicsState]) -> PhysicsState:
@@ -256,16 +247,6 @@ class SingleColumnModel:
         terrain = self.terrain
         nlev = self.coords.nodal_shape[0]
         dt_seconds = self.dt_seconds
-        start_date = self.start_date
-
-        def compute_date(time_idx):
-            sim_time_seconds = time_idx * dt_seconds
-            seconds_int = jnp.round(sim_time_seconds).astype(jnp.int32)
-            return DateData.set_date(
-                model_time=start_date + jdt.Timedelta(seconds=seconds_int),
-                model_step=jnp.asarray(time_idx).astype(jnp.int32),
-                dt_seconds=dt_seconds,
-            )
 
         def step_fn(prescribed_column, tracers, relaxed_vars, physics_data, time_idx):
             full_state_args = prescribed_column.asdict()
@@ -278,7 +259,7 @@ class SingleColumnModel:
             grid_state = _column_state_to_grid(column_state, nlev)
             clamped = verify_state(grid_state)
             tendencies_grid, new_physics_data = physics.compute_tendencies(
-                clamped, forcing, terrain, compute_date(time_idx),
+                clamped, forcing, terrain,
                 prev_physics_data=physics_data,
             )
             tendencies = _squeeze_tendency(tendencies_grid)
@@ -361,21 +342,27 @@ class SingleColumnModel:
                 for name, _ in relaxed_var_params
             }
 
-        # Bootstrap the diagnostics-dict pytree shape by running one step.
+        # Seed the diagnostics-dict carry the same way ``Model`` does:
+        # the structural template comes from
+        # :meth:`ComposablePhysics.get_empty_data` (a zero-filled
+        # snapshot of the post-step output pytree) unioned with the
+        # declarative cross-step carry slots from
+        # :meth:`ComposablePhysics.initial_carry_state` (e.g. TKE
+        # floored at ECHAM's 0.01 m²/s² lower bound). Using a
+        # live ``compute_tendencies`` result here was the architectural
+        # bug `#470 <https://github.com/climate-analytics-lab/jax-gcm/issues/470>`_
+        # tracks — among other things, the radiation carry's ``step``
+        # counter gets advanced before the first real scan step, which
+        # shifts the sub-stepping cadence by one under ``nstrad > 1``.
         if initial_physics_data is None:
-            first_state = tree_map(lambda x: x[0], prescribed_states)
-            state_args = first_state.asdict()
-            state_args.pop("tracers", None)
-            for name, val in initial_relaxed_vars.items():
-                state_args[name] = val
-            state_args["tracers"] = initial_tracers
-            first_state_combined = type(first_state)(**state_args)
-            nlev = self.coords.nodal_shape[0]
-            grid_state = _column_state_to_grid(first_state_combined, nlev)
-            clamped = verify_state(grid_state)
-            _, initial_physics_data = self.physics.compute_tendencies(
-                clamped, forcing, self.terrain, self._date(0),
-            )
+            template = self.physics.get_empty_data(self.coords)
+            initial_carry = self.physics.initial_carry_state(self.coords)
+            if isinstance(initial_carry, dict) and isinstance(template, dict):
+                initial_physics_data = {**template, **initial_carry}
+            else:
+                initial_physics_data = (
+                    template if initial_carry is None else initial_carry
+                )
 
         if times is None:
             times = jnp.arange(n_times) * (self.dt_seconds / 86400.0)

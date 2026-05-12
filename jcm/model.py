@@ -390,6 +390,13 @@ class Model:
         
         self.physics = physics or speedy_physics()
         self.physics.cache_coords(self.coords)
+        # Hand the model's timestep to the physics. ``ComposablePhysics``
+        # injects it into the diagnostics dict every step under
+        # ``"_dt_seconds"`` so any term that integrates by ``dt``
+        # (chemistry, microphysics, vertical diffusion, …) reads a
+        # single source of truth instead of going through date plumbing.
+        if hasattr(self.physics, "dt_seconds"):
+            self.physics.dt_seconds = float(self.dt_si.m)
 
         self.diffusion = diffusion or DiffusionFilter.default()
 
@@ -656,7 +663,6 @@ class Model:
                 physics=self.physics,
                 forcing=forcing_now,
                 terrain=self.terrain,
-                date=date,
                 physics_state=physics_state,
             )
             # Forward-Euler add of the physics dynamics tendency. The
