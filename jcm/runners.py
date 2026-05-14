@@ -222,7 +222,28 @@ def build_physics(cfg: DictConfig):
         terms=terms,
         checkpoint_terms=physics_cfg.get("checkpoint_terms", True),
         vectorize_columns=physics_cfg.get("vectorize_columns", False),
+        band_config=_band_config_for_terms(terms),
     )
+
+
+def _band_config_for_terms(terms):
+    """Pick a ``RadiationBandConfig`` to match the active radiation backend.
+
+    Walks the term list for an ``RRTMGPRadiation`` instance and reads its
+    band centers; otherwise returns the broadband (single 550 nm SW band)
+    fallback. Centralised here so every wavelength-dependent term — not
+    just the aerosol scheme — sees the same band structure as whatever
+    radiation backend is actually running. The band config is owned by
+    ``ComposablePhysics`` and injected into ``diagnostics["_band_config"]``
+    each step (same pattern as ``_dt_seconds``).
+    """
+    from jcm.physics.radiation.band_config import RadiationBandConfig
+    from jcm.physics.radiation.rrtmgp import RRTMGPRadiation, _ensure_rrtmgp
+
+    for t in terms:
+        if isinstance(t, RRTMGPRadiation):
+            return RadiationBandConfig.from_rrtmgp(_ensure_rrtmgp())
+    return RadiationBandConfig.broadband()
 
 
 def maybe_add_sponge(physics, cfg: DictConfig):
@@ -460,14 +481,57 @@ def build_forcing(cfg: DictConfig, coords):
     ``kind: default`` returns ``None`` — ``Model.run`` then falls back to the
     aquaplanet ``default_forcing(coords.horizontal)``. ``kind: from_file``
     loads a netCDF boundary file via ``ForcingData.from_file``.
+
+    Optionally attaches an ozone climatology if ``cfg.forcing.ozone_file``
+    is set; the file must be on the same horizontal grid as the model
+    (CMIP6-style ``(time, plev, lat, lon)`` mole/mole netCDF).
     """
     forcing_cfg = cfg.get("forcing", None)
     if forcing_cfg is None or forcing_cfg.kind == "default":
-        return None
+        return _attach_ozone(None, forcing_cfg, coords)
     if forcing_cfg.kind == "from_file":
         from jcm.forcing import ForcingData
-        return ForcingData.from_file(forcing_cfg.file, coords=coords)
+        forcing = ForcingData.from_file(forcing_cfg.file, coords=coords)
+        return _attach_ozone(forcing, forcing_cfg, coords)
     raise ValueError(f"Unknown forcing.kind={forcing_cfg.kind!r}")
+
+
+def _attach_ozone(forcing, forcing_cfg, coords):
+    """Load the ozone climatology and attach to ``forcing``.
+
+    No-op when the cfg has no ``ozone_file`` or the path is null. When
+    ``forcing`` is ``None`` (``kind: default``) and an ozone file IS
+    given, build the parent struct via ``default_forcing(...)`` so the
+    aquaplanet cos²-latitude SST climatology is preserved — using
+    ``ForcingData.zeros`` here would silently swap it for the uniform
+    288.15 K placeholder, materially changing the boundary conditions
+    for any run configured with only ``ozone_file``.
+    """
+    if forcing_cfg is None:
+        return forcing
+    ozone_file = forcing_cfg.get("ozone_file", None)
+    if ozone_file in (None, "", "null"):
+        return forcing
+    import numpy as np
+
+    from jcm.forcing import default_forcing
+    from jcm.ozone_climatology import OzoneClimatology
+    nlon, nlat = coords.horizontal.nodal_shape
+    nlev = coords.nodal_shape[0]
+    # Pass the model's lat/lon (degrees) so the loader catches files
+    # with the right shape but flipped/shifted grids — same N points,
+    # wrong column mapping, would otherwise wire ozone into the wrong
+    # latitudes silently. Dinosaur stores both in radians.
+    lat_deg = np.asarray(coords.horizontal.latitudes) * 180.0 / np.pi
+    lon_deg = np.asarray(coords.horizontal.longitudes) * 180.0 / np.pi
+    climatology = OzoneClimatology.from_file(
+        ozone_file,
+        nlon=int(nlon), nlat=int(nlat), nlev=int(nlev),
+        lat_deg=lat_deg, lon_deg=lon_deg,
+    )
+    if forcing is None:
+        forcing = default_forcing(coords.horizontal)
+    return forcing.copy(ozone_climatology=climatology)
 
 
 # ---------------------------------------------------------------------------
