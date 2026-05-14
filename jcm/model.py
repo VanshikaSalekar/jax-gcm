@@ -642,9 +642,9 @@ class Model:
 
         Order: ``state -> physics_tendency -> apply forward-Euler ->
         IMEX-RK dynamics -> filters``. This is the structure described
-        in ``docs/design/operator_split_physics.md`` §1 (Lie split (a))
-        and mirrors ECHAM6's ``physc`` → ``sccd``/``scctp`` →
-        ``hdiff`` chain (`stepon.f90:271,280,309`).
+        in ``docs/design/operator_split_physics.md`` and mirrors
+        ECHAM6's ``physc`` → ``sccd``/``scctp`` → ``hdiff`` chain
+        (`stepon.f90:271,280,309`).
 
         ``physics_state`` is the cross-step carry — the dict returned
         by the previous step's :meth:`ComposablePhysics.compute_tendencies`
