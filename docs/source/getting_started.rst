@@ -326,40 +326,40 @@ respond:
 .. code-block:: python
 
    import xarray as xr
+   from jcm.forcing import ForcingData
    from jcm.model import Model
-   from jcm.nudging import Nudging, NudgingTarget, NudgingConfig
+   from jcm.nudging import NudgingTarget, NudgingConfig, with_nudging
 
-   ref_ds = xr.open_dataset('era5_2010.nc')   # u, v, T, ps on (time, lev, lat, lon)
+   ref_ds = xr.open_dataset('era5_2010.nc')   # u, v, T on (time, lev, lat, lon)
 
-   # Build a temporary Model so we can pull `reference_temperature` and
-   # `physics_specs` (both needed to align the target with the dycore's
-   # internal representation).
-   probe = Model(coords=coords, terrain=terrain, physics=physics)
-   target = NudgingTarget.from_dataset(
-       ref_ds, coords,
-       reference_temperature=probe.primitive.reference_temperature,
-       physics_specs=probe.primitive.physics_specs,
-   )
+   # The target is loaded straight off the netCDF in gridpoint space and
+   # attached to forcing — it's just another per-step input. The Model
+   # slices it inside ``forcing.select(date, calendar)`` like every other
+   # time-varying leaf, so the nudging term never sees the date.
+   target = NudgingTarget.from_dataset(ref_ds)
+   forcing = ForcingData.from_file('boundary_conditions.nc', coords=coords)
+   forcing = forcing.replace(nudging_target=target)
+
    config = NudgingConfig.winds_only(
        nlev=coords.vertical.layers,
        tau_seconds=21600.0,        # 6 h relaxation
        pbl_levels=2,               # leave the bottom 2 levels free
-       physics_specs=probe.primitive.physics_specs,
    )
 
-   nudged = Model(
-       coords=coords, terrain=terrain, physics=physics,
-       nudging=Nudging(target, config),
-   )
-   predictions = nudged.run(save_interval='1 day', total_time='1 month')
+   nudged_physics = with_nudging(physics, config)
+   nudged = Model(coords=coords, terrain=terrain, physics=nudged_physics)
+   predictions = nudged.run(forcing=forcing, save_interval='1 day', total_time='1 month')
 
 The reference data can be a single climatology (passed with
 ``time_var=None``) or a multi-year time series; the latter aligns
 against the model's calendar through the same machinery the regular
 forcing uses.
 
-Nudging is physics-agnostic — it acts on the dynamical core state, so
-the same setup works under SPEEDY, ECHAM, or any other physics package.
+Nudging is dycore-agnostic — it's just another :class:`PhysicsTerm`,
+producing a gridpoint :class:`PhysicsTendency` that the dycore consumes
+through the standard physics-coupling path. The same setup works under
+SPEEDY, ECHAM, or any other physics package, on any
+:class:`DynamicalCore` backend.
 
 Multi-Device Parallelization
 -----------------------------

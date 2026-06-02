@@ -141,7 +141,9 @@ class ComposablePhysics(nnx.Module, Physics):
 
         Args:
             state: Current atmospheric state.
-            forcing: Boundary condition forcing data.
+            forcing: Boundary condition forcing data. The Model pre-slices
+                every time-varying leaf (SST, ozone, nudging target, …)
+                before calling this; terms see static-for-this-step arrays.
             terrain: Terrain boundary conditions.
             prev_physics_data: Previous step's diagnostics dict for caching
                 expensive computations (e.g. radiation sub-stepping).
