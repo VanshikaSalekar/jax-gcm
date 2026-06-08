@@ -28,22 +28,6 @@ class ConvectionParameters:
     def isnan(self):
         return tree_util.tree_map(jnp.isnan, self)
 
-@tree_math.struct
-class ForcingParameters:
-    increase_co2: jnp.bool # Whether to increase CO2 concentration over time
-    co2_year_ref: jnp.int32 # Reference year for CO2 concentration
-
-    @classmethod
-    def default(cls):
-        return cls(
-            increase_co2 = False,
-            co2_year_ref = 1950,
-        )
-
-    def isnan(self):
-        self.increase_co2 = 0
-        self.co2_year_ref = 0
-        return tree_util.tree_map(jnp.isnan, self)
 
 @tree_math.struct
 class CondensationParameters:
@@ -238,7 +222,6 @@ class Parameters:
     mod_radcon: ModRadConParameters
     surface_flux: SurfaceFluxParameters
     vertical_diffusion: VerticalDiffusionParameters
-    forcing: ForcingParameters
 
     @classmethod
     def default(cls):
@@ -249,7 +232,6 @@ class Parameters:
             mod_radcon = ModRadConParameters.default(),
             surface_flux = SurfaceFluxParameters.default(),
             vertical_diffusion = VerticalDiffusionParameters.default(),
-            forcing = ForcingParameters.default()
         )
 
     def isnan(self):
@@ -260,7 +242,6 @@ class Parameters:
             mod_radcon = self.mod_radcon.isnan(),
             surface_flux = self.surface_flux.isnan(),
             vertical_diffusion = self.vertical_diffusion.isnan(),
-            forcing = self.forcing.isnan()
         )
 
     def any_true(self):

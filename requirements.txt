@@ -1,5 +1,5 @@
-dinosaur
-flax
+dinosaur @ git+https://github.com/neuralgcm/dinosaur@main
+flax>=0.12.0
 jax-datetime
 tree-math
 hydra-core
@@ -9,8 +9,13 @@ xarray[io, parallel]
 
 # Testing requirements
 pytest-cov
+pytest-xdist
 
-#Sphinx
+# Sphinx
 sphinx
 furo
+myst-parser  # Markdown source for design/* docs
 
+# Radiation scheme
+jax-solar  # Requires Python 3.11+
+jax-rrtmgp @ git+https://github.com/climate-analytics-lab/jax-rrtmgp@main

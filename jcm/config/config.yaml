@@ -1,7 +1,20 @@
 defaults:
   - _self_
-  - model: default
+  - physics: speedy
+  - grid: speedy_t31_l8
+  - run: default
+  - init: isothermal
+  - terrain: aquaplanet
+  - forcing: default
+  - diffusion: default
   - override hydra/help: custom_help
+
+# Optional physical-constant overrides applied (process-globally) before the
+# model is built — e.g. for a different planet or a sensitivity study. Only
+# *base* fields of jcm.constants.PhysicalConstants may be set; derived constants
+# (rd, cvd, rgrav, vtmpc*) follow automatically. Example:
+#   python -m jcm.main +constants.grav=9.80665 +constants.rearth=6.4e6
+constants: {}
 
 hydra:
   run:

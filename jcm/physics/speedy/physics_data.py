@@ -1,8 +1,17 @@
+import jax
 import jax.numpy as jnp
 import tree_math
-from jcm.date import DateData
 from jcm.physics.speedy.speedy_coords import SpeedyCoords
 from jax import tree_util
+
+
+def _safe_isnan(x):
+    """Check for NaN, handling integer and float0 dtypes that lack NaN representation."""
+    if hasattr(x, 'dtype') and (x.dtype == jax.dtypes.float0
+                                or jnp.issubdtype(x.dtype, jnp.integer)
+                                or jnp.issubdtype(x.dtype, jnp.bool_)):
+        return False
+    return jnp.isnan(x)
 
 ablco2_ref = 6.0
 
@@ -59,24 +68,30 @@ class SWRadiationData:
     compute_shortwave: Flag to compute shortwave radiation
     """
 
-    qcloud: jnp.ndarray  
-    fsol: jnp.ndarray  
-    rsds: jnp.ndarray   
-    rsns: jnp.ndarray  
-    ozone: jnp.ndarray 
+    qcloud: jnp.ndarray
+    fsol: jnp.ndarray
+    rsds: jnp.ndarray
+    rsns: jnp.ndarray
+    ozone: jnp.ndarray
     ozupp: jnp.ndarray
-    zenit: jnp.ndarray 
-    stratz: jnp.ndarray 
-    gse: jnp.ndarray 
+    zenit: jnp.ndarray
+    stratz: jnp.ndarray
+    gse: jnp.ndarray
     icltop: jnp.ndarray
-    cloudc: jnp.ndarray 
-    cloudstr: jnp.ndarray 
-    ftop: jnp.ndarray  
-    dfabs: jnp.ndarray 
+    cloudc: jnp.ndarray
+    cloudstr: jnp.ndarray
+    ftop: jnp.ndarray
+    dfabs: jnp.ndarray
     compute_shortwave: jnp.bool
+    # SPEEDY's shortwave sub-stepping counter (every `nstrad` calls).
+    # `set_physics_flags` reads it, computes ``compute_shortwave``, then
+    # writes ``step+1`` back so the next step sees the advanced value.
+    # Threaded as part of the carry slot for ``_shortwave_rad`` — no
+    # model-wide step counter / date plumbing needed.
+    step: jnp.int32
 
     @classmethod
-    def zeros(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None):
+    def zeros(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
         return cls(
             qcloud = qcloud if qcloud is not None else jnp.zeros(nodal_shape),
             fsol = fsol if fsol is not None else jnp.zeros(nodal_shape),
@@ -92,11 +107,12 @@ class SWRadiationData:
             cloudstr = cloudstr if cloudstr is not None else jnp.zeros(nodal_shape),
             ftop = ftop if ftop is not None else jnp.zeros(nodal_shape),
             dfabs = dfabs if dfabs is not None else jnp.zeros((num_levels,)+nodal_shape),
-            compute_shortwave = compute_shortwave if compute_shortwave is not None else False
+            compute_shortwave = compute_shortwave if compute_shortwave is not None else False,
+            step = step if step is not None else jnp.int32(0),
         )
-    
+
     @classmethod
-    def ones(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None):
+    def ones(cls, nodal_shape, num_levels, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
         return cls(
             qcloud = qcloud if qcloud is not None else jnp.ones(nodal_shape),
             fsol = fsol if fsol is not None else jnp.ones(nodal_shape),
@@ -112,10 +128,11 @@ class SWRadiationData:
             cloudstr = cloudstr if cloudstr is not None else jnp.ones(nodal_shape),
             ftop = ftop if ftop is not None else jnp.ones(nodal_shape),
             dfabs = dfabs if dfabs is not None else jnp.ones((num_levels,)+nodal_shape),
-            compute_shortwave = compute_shortwave if compute_shortwave is not None else True
+            compute_shortwave = compute_shortwave if compute_shortwave is not None else True,
+            step = step if step is not None else jnp.int32(1),
         )
 
-    def copy(self, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None):
+    def copy(self, qcloud=None, fsol=None, rsds=None, rsns=None, ozone=None, ozupp=None, zenit=None, stratz=None, gse=None, icltop=None, cloudc=None, cloudstr=None, ftop=None, dfabs=None, compute_shortwave=None, step=None):
         return SWRadiationData(
             qcloud=qcloud if qcloud is not None else self.qcloud,
             fsol=fsol if fsol is not None else self.fsol,
@@ -131,13 +148,12 @@ class SWRadiationData:
             cloudstr=cloudstr if cloudstr is not None else self.cloudstr,
             ftop=ftop if ftop is not None else self.ftop,
             dfabs=dfabs if dfabs is not None else self.dfabs,
-            compute_shortwave=compute_shortwave if compute_shortwave is not None else self.compute_shortwave
+            compute_shortwave=compute_shortwave if compute_shortwave is not None else self.compute_shortwave,
+            step=step if step is not None else self.step,
         )
     
     def isnan(self):
-        self.icltop = jnp.zeros_like(self.icltop, dtype=float)
-        self.compute_shortwave = jnp.zeros_like(self.compute_shortwave, dtype=float)
-        return tree_util.tree_map(jnp.isnan, self)
+        return tree_util.tree_map(_safe_isnan, self)
     
 @tree_math.struct
 class ModRadConData:
@@ -297,12 +313,8 @@ class ConvectionData:
             precnv=precnv if precnv is not None else self.precnv
         )
     
-    # Isnan function to check if any elements of ConvectionData are NaN. This function is used after getting the gradient of something with respect to
-    # a ConvectionData input object, to check if the gradient is valid. We skip the check on iptop because it is an integer and the gradient is not meaningful
-    # or intended to be used.
     def isnan(self):
-        self.iptop = jnp.zeros_like(self.iptop, dtype=float)
-        return tree_util.tree_map(jnp.isnan, self)
+        return tree_util.tree_map(_safe_isnan, self)
 
 @tree_math.struct
 class HumidityData:
@@ -463,12 +475,19 @@ class PhysicsData:
     humidity: HumidityData
     condensation: CondensationData
     surface_flux: SurfaceFluxData
-    date: DateData
+    # Model timestep in seconds. Sourced from
+    # ``ComposablePhysics.dt_seconds`` each step via the
+    # ``diagnostics["_dt_seconds"]`` plumbing; consumed by
+    # ``speedy_orographic`` to translate the SPEEDY instantaneous
+    # T/q corrections into per-step tendencies. The shortwave
+    # sub-stepping counter (`mod nstrad`) lives on
+    # :attr:`SWRadiationData.step` and rides the radiation carry slot.
+    dt_seconds: float
     land_model: LandModelData
     speedy_coords: SpeedyCoords
 
     @classmethod
-    def zeros(cls, nodal_shape, num_levels, shortwave_rad=None,longwave_rad=None, convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, date=None, land_model=None, speedy_coords=None):
+    def zeros(cls, nodal_shape, num_levels, shortwave_rad=None,longwave_rad=None, convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, dt_seconds=None, land_model=None, speedy_coords=None):
         return cls(
             longwave_rad = longwave_rad if longwave_rad is not None else LWRadiationData.zeros(nodal_shape, num_levels),
             shortwave_rad = shortwave_rad if shortwave_rad is not None else SWRadiationData.zeros(nodal_shape, num_levels),
@@ -477,13 +496,13 @@ class PhysicsData:
             humidity = humidity if humidity is not None else HumidityData.zeros(nodal_shape, num_levels),
             condensation = condensation if condensation is not None else CondensationData.zeros(nodal_shape, num_levels),
             surface_flux = surface_flux if surface_flux is not None else SurfaceFluxData.zeros(nodal_shape),
-            date = date if date is not None else DateData.zeros(),
+            dt_seconds = dt_seconds if dt_seconds is not None else 1800.0,
             land_model = land_model if land_model is not None else LandModelData.zeros(nodal_shape),
             speedy_coords = speedy_coords,
         )
-    
+
     @classmethod
-    def ones(cls, nodal_shape, num_levels, shortwave_rad=None, longwave_rad=None, convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, date=None, land_model=None, speedy_coords=None):
+    def ones(cls, nodal_shape, num_levels, shortwave_rad=None, longwave_rad=None, convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, dt_seconds=None, land_model=None, speedy_coords=None):
         return cls(
             longwave_rad = longwave_rad if longwave_rad is not None else LWRadiationData.ones(nodal_shape, num_levels),
             shortwave_rad = shortwave_rad if shortwave_rad is not None else SWRadiationData.ones(nodal_shape, num_levels),
@@ -492,12 +511,12 @@ class PhysicsData:
             humidity = humidity if humidity is not None else HumidityData.ones(nodal_shape, num_levels),
             condensation = condensation if condensation is not None else CondensationData.ones(nodal_shape, num_levels),
             surface_flux = surface_flux if surface_flux is not None else SurfaceFluxData.ones(nodal_shape),
-            date = date if date is not None else DateData.ones(),
+            dt_seconds = dt_seconds if dt_seconds is not None else 1800.0,
             land_model = land_model if land_model is not None else LandModelData.ones(nodal_shape),
             speedy_coords = speedy_coords,
         )
 
-    def copy(self, shortwave_rad=None,longwave_rad=None,convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, date=None, land_model=None, speedy_coords=None):
+    def copy(self, shortwave_rad=None,longwave_rad=None,convection=None, mod_radcon=None, humidity=None, condensation=None, surface_flux=None, dt_seconds=None, land_model=None, speedy_coords=None):
         return PhysicsData(
             shortwave_rad=shortwave_rad if shortwave_rad is not None else self.shortwave_rad,
             longwave_rad=longwave_rad if longwave_rad is not None else self.longwave_rad,
@@ -506,15 +525,16 @@ class PhysicsData:
             humidity=humidity if humidity is not None else self.humidity,
             condensation=condensation if condensation is not None else self.condensation,
             surface_flux=surface_flux if surface_flux is not None else self.surface_flux,
-            date=date if date is not None else self.date,
+            dt_seconds=dt_seconds if dt_seconds is not None else self.dt_seconds,
             land_model=land_model if land_model is not None else self.land_model,
             speedy_coords=speedy_coords if speedy_coords is not None else self.speedy_coords
         )
 
     # Isnan function to check if any elements of PhysicsData are NaN. This function is used after getting the gradient of something with respect to
-    # a PhysicsData input object, to check if the gradient is valid. We skip the check on the date because the gradient returns NaN in
-    # valid scenarios (due to the use of arccos() in the solar() function) and we would otherwise fail this check in those cases.
-    # We also skip the check on speedy_coords because it's a constant coordinate cache that should not have gradients.
+    # a PhysicsData input object, to check if the gradient is valid. We skip
+    # `dt_seconds` because it is a float scalar that is non-differentiable.
+    # We also skip the check on speedy_coords because it's a constant
+    # coordinate cache that should not have gradients.
     def isnan(self):
         return PhysicsData(
             shortwave_rad=self.shortwave_rad.isnan(),
@@ -524,7 +544,7 @@ class PhysicsData:
             humidity=self.humidity.isnan(),
             condensation=self.condensation.isnan(),
             surface_flux=self.surface_flux.isnan(),
-            date=0,
+            dt_seconds=0,
             land_model=self.land_model.isnan(),
             speedy_coords=0
         )

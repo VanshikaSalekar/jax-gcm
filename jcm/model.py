@@ -1,562 +1,742 @@
+"""User-facing :class:`Model` class.
+
+The :class:`Model` orchestrates a simulation: forcing, run/resume/run_from_state,
+chunked op-split scan, post-processing, and xarray conversion. The two
+component contracts it routes between are:
+
+* the :class:`DynamicalCore` (state initialisation, the per-``dt`` step,
+  the gridpoint↔native bridge) — see :mod:`jcm.dycore`;
+* the :class:`Physics` (parameterizations producing gridpoint
+  :class:`PhysicsTendency` from a :class:`PhysicsState`) — see
+  :mod:`jcm.physics`.
+
+The Model itself owns nothing dynamics- or physics-specific; it just
+threads the cross-step physics carry through the scan, handles the
+sim-time / date bookkeeping, and produces an xarray trajectory.
+"""
+
 import jax
 import jax.numpy as jnp
 from jax.tree_util import tree_map
-import tree_math
-from packaging import version
-from flax import __version__ as flax_version
-from flax import nnx
 import jax_datetime as jdt
 from numpy import timedelta64
-import dinosaur
 from typing import Callable, Any
-from dinosaur import typing
-from dinosaur.scales import SI_SCALE, units
-from dinosaur.time_integration import ExplicitODE
-from dinosaur import primitive_equations, primitive_equations_states
-from dinosaur.coordinate_systems import CoordinateSystem
-from jcm.constants import p0
-from jcm.terrain import TerrainData
-from jcm.date import DateData
-from jcm.forcing import ForcingData, default_forcing
-from jcm.physics_interface import PhysicsState, Physics, get_physical_tendencies, dynamics_state_to_physics_state
-from jcm.physics.speedy.speedy_physics import SpeedyPhysics
-from jcm.utils import DYNAMICS_UNITS_TABLE_CSV_PATH
-from jcm.diffusion import DiffusionFilter
+from dinosaur.scales import units
 import pandas as pd
 from functools import partial
 import logging
 
-# logging.basicConfig(format='%(name)s: %(asctime)s %(levelname)s: %(message)s')
+from jcm.date import DateData, parse_duration_days
+from jcm.forcing import ForcingData, default_forcing
+from jcm.physics_interface import (
+    PhysicsState, Physics, compute_physics_step_gridpoint, verify_state,
+)
+from jcm.physics.speedy.speedy_terms import speedy_physics
+from jcm.terrain import TerrainData
+from jcm.utils import DYNAMICS_UNITS_TABLE_CSV_PATH
+from jcm.dycore.base import DynamicalCore, Predictions
+from jcm.dycore.dinosaur.dycore import DinosaurDycore
+
+
 logger = logging.getLogger(__name__)
 
-_LEGACY_SCAN_API = version.parse(flax_version) < version.parse("0.10.0")
 
-PHYSICS_SPECS = primitive_equations.PrimitiveEquationsSpecs.from_si(scale = SI_SCALE)
+class ModelPredictions:
+    """User-facing container for model prediction outputs.
 
-@tree_math.struct
-class Predictions:
-    """Container for model prediction outputs from a single timestep.
+    Wraps the internal :class:`Predictions` pytree with the coordinate system
+    and physics module needed for xarray conversion. Returned by
+    :meth:`Model.run`, :meth:`Model.resume`, and :meth:`Model.run_from_state`.
 
     Attributes:
-        dynamics (PhysicsState): The physical state variables converted from
-            the dynamical state.
-        physics (Any): Diagnostic physics data computed by the physics package.
+        dynamics (PhysicsState): The physical state variables.
+        physics (Any): Diagnostic physics data.
         times (Any): Timestamps of the predictions.
 
     """
 
-    dynamics: PhysicsState
-    physics: Any
-    times: Any
+    def __init__(self, predictions: Predictions, coords, physics: Physics):  # noqa: D107
+        self._predictions = predictions
+        self._coords = coords
+        self._physics = physics
 
-    def to_xarray(self, physics_module: Physics=None):
-        """Convert the full prediction trajectory to a final xarray.Dataset.
-        This function unpacks the nested dictionary structure from the simulation
-        output, formats the data, and converts the time coordinate to a
-        datetime object.
+    @property
+    def dynamics(self):
+        return self._predictions.dynamics
 
-        Args:
-            physics_module (optional): instance of the Physics module used to generate the predictions, used to parse physics fields (default SpeedyPhysics).
+    @property
+    def physics(self):
+        return self._predictions.physics
+
+    @property
+    def times(self):
+        return self._predictions.times
+
+    def to_xarray(self):
+        """Convert the full prediction trajectory to an xarray.Dataset.
 
         Returns:
-            A final `xarray.Dataset` ready for analysis and plotting.
+            An xarray.Dataset ready for analysis and plotting.
 
         """
         from jcm.utils import data_to_xarray
-        
-        # float0s are placeholders representing the lack of tangent space for non-differentiable variables
-        # jax.numpy arrays cannot have float0 dtype, so jcm handles them with numpy arrays
-        # substituting jax.numpy arrays here allows us to handle Predictions objects that contain derivatives
-        float0s_to_nans = lambda pytree: tree_map(lambda x: jnp.full_like(x, jnp.nan, dtype=float) if x.dtype == jax.dtypes.float0 else x, pytree)
 
-        # extract dynamics predictions (PhysicsState format)
-        # and physics predictions from postprocessed output
+        # float0s are placeholders representing the lack of tangent space for non-differentiable variables.
+        # jax.numpy arrays cannot have float0 dtype, so jcm handles them with numpy arrays;
+        # substituting jax.numpy arrays here allows us to handle Predictions objects that contain derivatives.
+        float0s_to_nans = lambda pytree: tree_map(
+            lambda x: jnp.full_like(x, jnp.nan, dtype=float) if x.dtype == jax.dtypes.float0 else x,
+            pytree,
+        )
 
         dynamics_predictions = float0s_to_nans(self.dynamics)
         physics_predictions = float0s_to_nans(self.physics)
 
         nodal_shape = dynamics_predictions.u_wind.shape[1:]
-        from jcm.physics.speedy.speedy_coords import get_speedy_coords
-        coords = get_speedy_coords(layers=nodal_shape[0], nodal_shape=nodal_shape[1:])
 
-        # prepare physics predictions for xarray conversion
-        # (e.g. separate multi-channel fields so they are compatible with data_to_xarray)
-        physics_module = physics_module or SpeedyPhysics()
-        physics_module.cache_coords(coords)
-        physics_preds_dict = physics_module.data_struct_to_dict(physics_predictions, nodal_shape=nodal_shape)
+        # Per-physics flattening of the diagnostic struct into a dict of named fields.
+        physics_preds_dict = self._physics.data_struct_to_dict(physics_predictions, nodal_shape=nodal_shape)
 
         times = jax.device_get(self.times)
-        coords = jax.device_get(coords)
+        coords = jax.device_get(self._coords)
 
-        pred_ds = data_to_xarray(dynamics_predictions.asdict() | physics_preds_dict, 
-                                 coords=coords, serialize_coords_to_attrs=False,
-                                 times=times - times[0],
-                                 additional_coords={'wvi_id': jnp.array([1,2]),
-                                                    'hsg_level': jnp.arange(nodal_shape[0]+1)})
+        additional_coords = {}
+        if self._physics.cached_coords is not None and hasattr(self._physics.cached_coords, 'xarray_additional_coords'):
+            additional_coords = self._physics.cached_coords.xarray_additional_coords()
 
-        # Import units attribute associated with each xarray output from units_table.csv
+        pred_ds = data_to_xarray(
+            dynamics_predictions.asdict() | physics_preds_dict,
+            coords=coords, serialize_coords_to_attrs=False,
+            times=times - times[0],
+            additional_coords=additional_coords,
+        )
+
+        # Attach units / descriptions from the physics-specific units table.
         units_df = pd.read_csv(DYNAMICS_UNITS_TABLE_CSV_PATH)
-        if physics_module.UNITS_TABLE_CSV_PATH is not None:
-            units_df = pd.concat([units_df, pd.read_csv(physics_module.UNITS_TABLE_CSV_PATH)], ignore_index=True)
+        if self._physics.UNITS_TABLE_CSV_PATH is not None:
+            units_df = pd.concat([units_df, pd.read_csv(self._physics.UNITS_TABLE_CSV_PATH)], ignore_index=True)
         for var, unit, desc in zip(units_df["Variable"], units_df["Units"], units_df["Description"]):
             if var in pred_ds:
                 pred_ds[var].attrs["units"] = unit
                 pred_ds[var].attrs["description"] = desc
-        
-        # Flip the vertical dimension so that it goes from the surface to the top of the atmosphere
+
+        # Flip the vertical dimension so that it goes from the surface to the top of the atmosphere.
         pred_ds = pred_ds.isel(level=slice(None, None, -1))
 
-        # convert time in days to datetime
+        # Convert sim-day timestamps to datetimes.
         pred_ds['time'] = (
-            times*(timedelta64(1, 'D')/timedelta64(1, 'ns'))
+            times * (timedelta64(1, 'D') / timedelta64(1, 'ns'))
         ).astype('datetime64[ns]')
-        
+
         return pred_ds
 
-class DiagnosticsCollector(nnx.Module):
-    data: nnx.Variable
-    i: nnx.Variable
-    physical_step: nnx.Variable
-    steps_to_average: int
 
-    def __init__(self, steps_to_average):
-        """Initialize DiagnosticsCollector for accumulating physics diagnostics over multiple steps."""
-        self.i = nnx.Variable(0)
-        self.physical_step = nnx.Variable(True)
-        self.steps_to_average = steps_to_average
+def _model_predictions_flatten(mp):
+    """Flatten ModelPredictions for JAX pytree operations (tree_map, etc.).
 
-    def accumulate_if_physical_step(self, new_data):
-        if self.physical_step.value:
-            self.data.value = tree_map(
-                lambda stacked_array, new_array: stacked_array.at[self.i.value].add(new_array/self.steps_to_average),
-                self.data.value,
-                new_data
-            )
-            self.physical_step.value = False
+    Only the internal Predictions pytree is treated as array data. Coords and
+    physics are not in aux_data so that ``tree_map`` works across ModelPredictions
+    from different Model instances.
+    """
+    children = (mp._predictions,)
+    return children, None
 
-def averaged_trajectory_from_step(
-    step_fn: typing.TimeStepFn,
+
+def _model_predictions_unflatten(aux_data, children):
+    return ModelPredictions(children[0], None, None)
+
+
+jax.tree_util.register_pytree_node(
+    ModelPredictions,
+    _model_predictions_flatten,
+    _model_predictions_unflatten,
+)
+
+
+def _op_split_trajectory(
+    step_fn: Callable[[Any, Any], tuple[Any, Any]],
+    initial_physics_state: Any,
+    empty_diagnostics: Any,
     outer_steps: int,
     inner_steps: int,
-    post_process_fn=lambda x: x,
-    **kwargs
-) -> Callable[[typing.PyTreeState], tuple[typing.PyTreeState, Any]]:
-    """Return a function that accumulates repeated applications of `step_fn`.
-    Compute a trajectory by repeatedly calling `step_fn()`
-    `outer_steps * inner_steps` times.
+    post_process_fn: Callable[[Any, Any], Any] = lambda x, ps: x,
+    output_averages: bool = False,
+) -> Callable[[Any], tuple[Any, Any, Any]]:
+    """Trajectory builder for the operator-split path.
+
+    The op-split ``step_fn`` has signature ``(state, physics_state) ->
+    (state_next, physics_state_next)``. ``physics_state`` is the cross-step
+    physics carry (radiation flux for sub-cycling, prev TKE for the analytic
+    source update, etc.) and flows through the ``lax.scan`` as a first-class
+    pytree.
+
+    ``post_process_fn`` takes ``(state, physics_state)``. In snapshot mode the
+    saved physics carry is exactly the one used by the integration — radiation
+    sub-cycle cache, TKE memory, etc. — so diagnostics reported in
+    ``predictions.physics`` match what the dycore actually consumed.
+
+    In averaged mode, the per-step physics dict (the same dict that becomes
+    ``physics_state_next``) is accumulated as a running mean across the inner
+    steps and saved per outer step. The running mean uses POST-step states
+    (``x_next``); this matches the snapshot path's end-of-step samples, so
+    ``mean(snapshots)`` and ``averaged(...)`` agree to numerical roundoff.
 
     Args:
-        step_fn: function that takes a state and returns state after one time step.
-        outer_steps: number of steps to save in the generated trajectory.
-        inner_steps: number of repeated calls to step_fn() between saved steps.
-        start_with_input: unused, kept to match dinosaur.time_integration.trajectory_from_step API.
-        post_process_fn: function to apply to trajectory outputs.
+        step_fn: Operator-split per-``dt`` step.
+        initial_physics_state: Cross-step carry initial value (built via
+            :meth:`ComposablePhysics.initial_carry_state` unioned with a
+            structural template from :meth:`ComposablePhysics.get_empty_data`).
+        empty_diagnostics: Zero-shaped diagnostics dict used to seed the
+            running-mean accumulator in averaged mode. Same structure as the
+            per-step ``physics_state_next``.
+        outer_steps: Number of saved frames.
+        inner_steps: Inner ``dt`` steps between saved frames.
+        post_process_fn: Applied to the state at save time (snapshot mode) or
+            to the running mean (averaged mode).
+        output_averages: When True, the saved frame is the running mean of
+            ``post_process_fn(state)`` over the inner steps.
 
     Returns:
-        A function that takes an initial state and returns a tuple consisting of:
-        (1) the final frame of the trajectory.
-        (2) trajectory of length `outer_steps` representing time evolution (averaged over the inner steps between each outer step).
+        A function ``initial_state -> (final_state, final_physics_state,
+        saved_trajectory)`` where ``saved_trajectory`` has a leading axis of
+        length ``outer_steps``. ``final_physics_state`` is the cross-step carry
+        coming out of the last ``dt`` — exposing it lets callers (e.g.
+        ``Model.resume``) thread a continuous carry across API boundaries so
+        a 5d + resume(5d) integration matches a single 10d integration. In
+        averaged mode the returned trajectory's ``physics`` field is the
+        time-averaged diagnostics dict.
 
     """
-    def integrate(x_initial, empty_data):
-        diagnostics_collector = DiagnosticsCollector(steps_to_average=inner_steps)
-        stacked_empty_data = tree_map(
-            lambda x: jnp.zeros((outer_steps,) + jnp.array(x).shape, dtype=float),
-            empty_data
-        )
-        diagnostics_collector.data = nnx.Variable(stacked_empty_data)
-        graphdef, init_diag_state = nnx.split(diagnostics_collector)
-
-        empty_sum = tree_map(jnp.zeros_like, x_initial)
-
-        out_axes = (nnx.Carry,) if _LEGACY_SCAN_API else (nnx.Carry, 0)
-        empty_output = (None,) if _LEGACY_SCAN_API else None
-
-        @nnx.scan(in_axes=(nnx.Carry,), out_axes=out_axes, length=inner_steps)
+    # Snapshot and averaged modes only differ in what the inner scan
+    # accumulates and what the outer step saves; the surrounding outer
+    # ``lax.scan`` over ``(state, physics_state)`` and the
+    # ``(x_final, ps_final, preds)`` return are identical, so define them
+    # once.
+    def _averaged_outer_step():
         @jax.checkpoint
-        def inner_step(carry):
-            x, x_sum, diag_state = carry
-            x_sum += x  # include initial state, not final state
-            temp_collector_inner = nnx.merge(graphdef, diag_state)
-            temp_collector_inner.physical_step.value = True
-            x_next = step_fn(temp_collector_inner)(x)
-            _, updated_diag_state = nnx.split(temp_collector_inner)
-            return (x_next, x_sum, updated_diag_state), empty_output
+        def inner_step(carry, _):
+            x, physics_state, x_sum, diag_sum = carry
+            x_next, physics_state_next = step_fn(x, physics_state)
+            # Sum POST-step states so that mean(state_1..state_N) matches the
+            # snapshot path (which saves state_N at outer steps). Summing
+            # pre-step states would be off by one timestep — tolerable for
+            # slow fields, but the op-split per-step transient is large
+            # enough to surface as test failures at the rtol=1e-3 the
+            # averaging test runs at.
+            x_sum = tree_map(lambda a, b: a + b, x_sum, x_next)
+            diag_sum = tree_map(
+                lambda acc, new: acc + new / inner_steps,
+                diag_sum, physics_state_next,
+            )
+            return (x_next, physics_state_next, x_sum, diag_sum), None
 
-        @nnx.scan(in_axes=(nnx.Carry,), out_axes=out_axes, length=outer_steps)
-        def outer_step(carry):
-            (x_final, x_sum, diag_state), _ = inner_step(carry)
-            temp_collector_outer = nnx.merge(graphdef, diag_state)
-            temp_collector_outer.i.value += 1
-            _, updated_diag_state = nnx.split(temp_collector_outer)
-            return (x_final, empty_sum, updated_diag_state), (x_sum / inner_steps,)
-        
-        carry = (x_initial, empty_sum, init_diag_state)
-        (x_final, _, final_diag_state), (preds,) = outer_step(carry)
-        return x_final, post_process_fn(preds).replace(
-            physics=nnx.merge(graphdef, final_diag_state).data.value,
+        def outer_step(carry, _, empty_sum, empty_diag_sum):
+            x, physics_state = carry
+            init = (x, physics_state, empty_sum, empty_diag_sum)
+            (x_next, ps_next, x_sum, diag_sum), _ = jax.lax.scan(
+                inner_step, init, None, length=inner_steps,
+            )
+            averaged_state = tree_map(lambda s: s / inner_steps, x_sum)
+            preds = post_process_fn(averaged_state, ps_next)
+            preds = preds.replace(physics=diag_sum)
+            return (x_next, ps_next), preds
+
+        return outer_step
+
+    def _snapshot_outer_step():
+        @jax.checkpoint
+        def inner_step(carry, _):
+            x, physics_state = carry
+            x_next, physics_state_next = step_fn(x, physics_state)
+            return (x_next, physics_state_next), None
+
+        def outer_step(carry, _):
+            (x_final, ps_final), _ = jax.lax.scan(
+                inner_step, carry, None, length=inner_steps,
+            )
+            # Save the carried physics state alongside the dynamics state.
+            # Calling ``post_process_fn`` with ``ps_final`` lets snapshot
+            # diagnostics reflect the sub-cycled radiation cache / TKE
+            # memory the dycore actually consumed — recomputing physics at
+            # save time with a freshly-seeded carry would zero out radiation
+            # on non-radiation outer steps (default 2-hour
+            # ``radiation_interval``).
+            return (x_final, ps_final), post_process_fn(x_final, ps_final)
+
+        return outer_step
+
+    def integrate(x_initial):
+        if output_averages:
+            empty_sum = tree_map(jnp.zeros_like, x_initial)
+            # Cast accumulator leaves to float so that ``acc + new / N`` doesn't
+            # promote dtype mid-scan — jax.lax.scan rejects type changes in the
+            # carry.
+            empty_diag_sum = tree_map(
+                lambda x: jnp.zeros(jnp.shape(x), dtype=float),
+                empty_diagnostics,
+            )
+            outer_step_fn = _averaged_outer_step()
+            outer_step = lambda c, _: outer_step_fn(
+                c, _, empty_sum, empty_diag_sum,
+            )
+        else:
+            outer_step = _snapshot_outer_step()
+
+        (x_final, ps_final), preds = jax.lax.scan(
+            outer_step,
+            (x_initial, initial_physics_state),
+            None, length=outer_steps,
         )
+        return x_final, ps_final, preds
 
     return integrate
 
-class Model:
-    """Top level class for a JAX-GCM configuration using the Speedy physics on an aquaplanet."""
 
-    def __init__(self, coords: CoordinateSystem, time_step=30.0, terrain: TerrainData=None,
-                 physics: Physics=None, diffusion: DiffusionFilter=None,
-                 start_date: jdt.Datetime=jdt.to_datetime('2000-01-01'), log_level=logging.CRITICAL) -> None:
-        """Initialize the model with the given time step, save interval, and total time.
+class Model:
+    """Top level class for a JAX-GCM simulation.
+
+    The Model orchestrates the run (timestep, forcing, op-split scan,
+    post-processing). Dynamics-specific work (state init, the per-``dt`` step,
+    the spectral↔gridpoint bridge) is delegated to a :class:`DynamicalCore`;
+    physics-specific work to a :class:`Physics`.
+    """
+
+    def __init__(self,
+                 dycore: DynamicalCore | None = None,
+                 *,
+                 coords=None,
+                 time_step: float = 30.0,
+                 terrain: TerrainData = None,
+                 physics: Physics = None,
+                 start_date: jdt.Datetime = jdt.to_datetime('2000-01-01'),
+                 calendar: str = "365_day",
+                 radiation_chunk_size: int | None = None,
+                 log_level=logging.CRITICAL) -> None:
+        """Initialise the model.
 
         Args:
-            coords:
-                CoordinateSystem object describing the model coordinates. To enable SPMD
-                parallelization, pass ``spmd_mesh`` to the coords helper (e.g. ``get_speedy_coords``).
-            time_step:
-                Model time step in minutes
-            terrain:
-                TerrainData object describing boundary conditions (orography, land-sea mask, etc.)
-            physics:
-                Physics object describing the model physics
-            diffusion:
-                DiffusionFilter object describing horizontal diffusion filter params
-            start_date:
-                jax_datetime.Datetime object containing start date of the simulation (default January 1, 2000)
-            log_level:
-                (int) indicates what level of messages will be output, use logging.INFO (20) for verbose (defaults logging.CRITICAL)
+            dycore: The :class:`DynamicalCore` driving the integration. When
+                ``None``, a default :class:`DinosaurDycore` is constructed
+                from ``coords`` and ``terrain`` for convenience. Backend-
+                specific knobs (diffusion, nudging-as-PhysicsTerm targets,
+                IMEX stepper details) belong to the dycore's own constructor
+                — wire them there, then pass the dycore in.
+            coords: CoordinateSystem. Required when ``dycore`` is ``None``.
+                To enable SPMD parallelization, pass ``spmd_mesh`` to the
+                coords helper (e.g. :func:`get_speedy_coords`).
+            time_step: Model time step in minutes.
+            terrain: :class:`TerrainData` (orography, land-sea mask, etc.).
+                Defaults to an aquaplanet when building the default dycore.
+            physics: :class:`Physics` describing the model physics. Defaults
+                to :func:`speedy_physics`. Add nudging via the
+                :class:`jcm.nudging.NudgingTerm` PhysicsTerm.
+            start_date: ``jax_datetime.Datetime`` for the start of the run.
+                Used to convert ``state.sim_time`` to a :class:`DateData`
+                that's threaded into the physics-step diagnostics dict (so
+                forcing-driven and date-aware terms can read it).
+            calendar: Calendar string (``"365_day"`` or ``"gregorian"``) for
+                the same date conversion.
+            radiation_chunk_size: Override the RRTMGP chunked-vmap chunk size
+                (cells per chunk). Default ``None`` auto-detects from the JAX
+                device's HBM. No-op when the active radiation scheme is not
+                RRTMGP.
+            log_level: Logging verbosity level.
 
         """
-        # Set root logging level to be log_level so it propagates to other modules
         logging.getLogger().setLevel(log_level)
-
-        self.physics_specs = PHYSICS_SPECS
-        self.dt_si = (time_step * units.minute).to(units.second)
-        self.dt = self.physics_specs.nondimensionalize(self.dt_si)
-
-        # Store coords - used by dynamics and physics
-        self.coords = coords
-
-        # Store terrain (boundary conditions)
-        self.terrain = terrain if terrain is not None else TerrainData.aquaplanet(self.coords)
-
-        # Get the reference temperature and orography. This also returns the initial state function (if wanted to start from rest)
-        self.default_state_fn, aux_features = primitive_equations_states.isothermal_rest_atmosphere(
-            coords=self.coords,
-            physics_specs=self.physics_specs,
-            p0=p0*units.pascal,
-            p1=0.01*p0*units.pascal,
-        )
-        
-        self.physics = physics or SpeedyPhysics()
-        self.physics.cache_coords(self.coords)
-
-        self.diffusion = diffusion or DiffusionFilter.default()
-
-        # TODO: make the truncation number a parameter consistent with the grid shape
-        self.truncated_orography = primitive_equations.truncated_modal_orography(self.terrain.orog, self.coords, wavenumbers_to_clip=2)
-
-        self.primitive = primitive_equations.PrimitiveEquations(
-            reference_temperature=aux_features[dinosaur.xarray_utils.REF_TEMP_KEY],
-            orography=self.truncated_orography,
-            coords=self.coords,
-            physics_specs=self.physics_specs,
-        )
-        
-        def conserve_global_mean_surface_pressure(u, u_next):
-            return u_next.replace(
-                # prevent global mean (0th spectral component) surface pressure drift by setting it to its value before timestep
-                log_surface_pressure=u_next.log_surface_pressure.at[0, 0, 0].set(u.log_surface_pressure[0, 0, 0])
-            )
-        
-        # create diffusion filter function handles
-        diffuse_div = self._make_diffusion_fn(
-            self.diffusion.div_timescale,
-            self.diffusion.div_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(divergence=u_temp.divergence)
-        )
-
-        diffuse_vor_q = self._make_diffusion_fn(
-            self.diffusion.vor_q_timescale,
-            self.diffusion.vor_q_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(vorticity=u_temp.vorticity,tracers={'specific_humidity': u_temp.tracers['specific_humidity']})
-        )
-
-        diffuse_temp = self._make_diffusion_fn(
-            self.diffusion.temp_timescale,
-            self.diffusion.temp_order,
-            replace_fn=lambda u_next, u_temp: u_next.replace(temperature_variation=u_temp.temperature_variation)
-        )
-        
-        self.filters = [
-            conserve_global_mean_surface_pressure,
-            diffuse_div,
-            diffuse_vor_q,
-            diffuse_temp,
-        ]
-
+        self.calendar = calendar
         self.start_date = start_date
 
-        # grid space PhysicsState set upon calling model.run
+        # Wire the RRTMGP chunked-vmap chunk-size override (only takes
+        # effect if the physics actually uses RRTMGP — the setter is a
+        # no-op for other radiation backends).
+        if radiation_chunk_size is not None:
+            from jcm.physics.radiation import rrtmgp as _rrtmgp_mod
+            _rrtmgp_mod.set_chunk_size(radiation_chunk_size)
+
+        self.dt_si = (time_step * units.minute).to(units.second)
+        self.physics = physics if physics is not None else speedy_physics()
+
+        tracer_specs = {spec.name: spec for spec in self.physics.required_tracers()}
+        if dycore is None:
+            if coords is None:
+                raise ValueError(
+                    "Model requires either an explicit ``dycore`` or a "
+                    "``coords`` argument (used to build the default "
+                    "DinosaurDycore)."
+                )
+            terrain = terrain if terrain is not None else TerrainData.aquaplanet(coords)
+            dycore = DinosaurDycore(
+                coords=coords,
+                terrain=terrain,
+                dt_seconds=float(self.dt_si.m),
+                tracer_specs=tracer_specs,
+            )
+        self.dycore = dycore
+        # Synchronise the dycore's tracer specs with the active physics so
+        # the explicit-dycore path can ship with default (empty) specs and
+        # still mis-scale-correctly on tracers whose
+        # ``TracerSpec.nondimensionalize=False``.
+        self.dycore.required_tracers_ok(self.physics.required_tracers())
+        self.dycore.tracer_specs = tracer_specs
+        # Convenience aliases so callers don't have to type ``self.dycore.coords``.
+        self.coords = dycore.coords
+        self.terrain = dycore.terrain
+
+        self.physics.cache_coords(self.coords)
+        # Hand the model's timestep to the physics. ``ComposablePhysics``
+        # injects it into the diagnostics dict every step under
+        # ``"_dt_seconds"`` so any term that integrates by ``dt`` (chemistry,
+        # microphysics, vertical diffusion, …) reads a single source of truth
+        # instead of going through date plumbing.
+        if hasattr(self.physics, "dt_seconds"):
+            self.physics.dt_seconds = float(self.dt_si.m)
+
+        # Initial gridpoint state set upon calling model.run.
         self.initial_nodal_state = None
 
-        # spectral space primitive_equations.State updated by model.run and model.resume
-        self._final_modal_state = None
-    
-    def _make_diffusion_fn(self, timescale: jnp.float_, order: jnp.int_, replace_fn):
-        """Return diffusion filter function handle for use in the model time step.
+        # Dycore-native state at end of last run/resume.
+        self._final_dycore_state = None
 
-        timescale: diffusion timescale (s)
-        order: order of diffusion operator
-        replace_fn: function that takes (u_next, u_temp) and returns the updated u_next after diffusion (selects which variables to diffuse)
-        """
-        from dinosaur.filtering import horizontal_diffusion_filter
-
-        def diffusion_filter(u, u_next):
-            eigenvalues = self.coords.horizontal.laplacian_eigenvalues
-            scale = self.dt / (timescale * abs(eigenvalues[-1]) ** order)
-
-            filter_fn = horizontal_diffusion_filter(self.coords.horizontal, scale, order)
-
-            u_temp = filter_fn(u_next)
-            return replace_fn(u_next, u_temp)
-        return diffusion_filter
-    
-    def _prepare_initial_modal_state(self, physics_state: PhysicsState=None, random_seed=0, sim_time=0.0, humidity_perturbation=False) -> primitive_equations.State:
-        """Prepare initial dinosaur.primitive_equations.State for a model run.
-
-        Args:
-            physics_state:
-                Optional nodal PhysicsState from which to generate the modal state. If none provided, initial state will be isothermal atmosphere with random noise surface pressure perturbation.
-            random_seed:
-                Seed for pressure perturbation (default 0).
-            sim_time:
-                Optionally specify the sim_time attribute for the state (default 0.0).
-            humidity_perturbation:
-                If True and using the default state, adds a horizontally localized perturbation to specific humidity.
-
-        Returns:
-            A `primitive_equations.State` object ready for integration.
-
-        """
-        from jcm.physics_interface import physics_state_to_dynamics_state
-
-        # Either use the designated initial state, or generate one. The initial state to the dycore is a modal primitive_equations.State,
-        # but the optional initial state from the user is a nodal PhysicsState
-        if physics_state is not None:
-            state = physics_state_to_dynamics_state(physics_state, self.primitive)
-        else:
-            state = self.default_state_fn(jax.random.PRNGKey(random_seed))
-            # default state returns log surface pressure, we want it to be log(normalized_surface_pressure)
-            # there are several ways to do this operation (in modal vs nodal space, with log vs absolute pressure), this one has the least error
-            state.log_surface_pressure = self.coords.horizontal.to_modal(
-                self.coords.horizontal.to_nodal(state.log_surface_pressure) - jnp.log(self.physics_specs.nondimensionalize(p0 * units.pascal)) # Makes this robust to different physics_specs, which will change default_state_fn behavior
-            )
-
-            # need to add specific humidity as a tracer
-            state.tracers = {
-                'specific_humidity': (1e-2 if humidity_perturbation else 0.0) * primitive_equations_states.gaussian_scalar(self.coords, self.physics_specs)
-            }
-        return primitive_equations.State(**state.asdict(), sim_time=sim_time)
+        # Cross-step physics carry threaded through op-split run/resume.
+        # ``None`` means "build a fresh carry on the next call"; set by
+        # ``bootstrap_state`` so that ``run() + resume()`` matches a single
+        # ``run()`` of the combined duration.
+        self._final_physics_state = None
 
     def _date_from_sim_time(self, sim_time) -> DateData:
+        # Stop gradient: date/calendar computations use non-differentiable ops
+        # (floor, round, int casts) and should not be part of the AD graph.
+        sim_time = jax.lax.stop_gradient(sim_time)
         return DateData.set_date(
             model_time=self.start_date + jdt.Timedelta(
                 days=jnp.floor(sim_time / 86400).astype(jnp.int32),
-                seconds=jnp.round(sim_time % 86400).astype(jnp.int32)
+                seconds=jnp.round(sim_time % 86400).astype(jnp.int32),
             ),
             model_step=jnp.int32(sim_time / self.dt_si.m),
-            dt_seconds=self.dt_si.m
+            dt_seconds=float(self.dt_si.m),
+            calendar=self.calendar,
         )
 
-    def _get_step_fn_factory(self, forcing: ForcingData) -> Callable[[DiagnosticsCollector], Callable[[typing.PyTreeState], typing.PyTreeState]]:
-        """For given surface forcing conditions, return a function that, when optionally passed a DiagnosticsCollector, will return a function representing one step of the model.
+    def _prepare_initial_dycore_state(self, physics_state: PhysicsState = None,
+                                      random_seed=0, sim_time=0.0):
+        """Build the dycore-native initial state.
 
-        Args:
-            forcing: ForcingData object containing surface forcing conditions.
-
-        Returns:
-            A function that, when optionally passed a DiagnosticsCollector, will return a function representing one step of the model, which will write to that DiagnosticsCollector.
-
+        Thin wrapper around :meth:`DynamicalCore.initial_state` that supplies
+        the tracer specs aggregated from the active physics package.
         """
-        physics_forcing_eqn = lambda d: ExplicitODE.from_functions(lambda state:
-            get_physical_tendencies(
-                state=state,
-                dynamics=self.primitive,
-                time_step=self.dt_si.m,
+        tracer_specs = {spec.name: spec for spec in self.physics.required_tracers()}
+        return self.dycore.initial_state(
+            physics_state,
+            sim_time=sim_time,
+            random_seed=random_seed,
+            tracer_specs=tracer_specs,
+        )
+
+    def _get_op_split_step_fn(self, forcing: ForcingData):
+        """Build the operator-split single-step function (Lie split a).
+
+        One call: ``(state, physics_state) -> (state_next, physics_state_next)``.
+
+        Order: ``state → gridpoint projection → physics_tendency → dycore.step``
+        (which itself does the forward-Euler add, the dynamics step, and the
+        spectral filters). Mirrors ECHAM6's ``physc`` → ``sccd``/``scctp`` →
+        ``hdiff`` chain.
+        """
+        def step(state, physics_state):
+            date = self._date_from_sim_time(self.dycore.sim_time(state))
+            forcing_now = forcing.select(date, calendar=self.calendar)
+            physics_state_grid = self.dycore.to_physics_state(state)
+            physics_tendency, new_physics_state = compute_physics_step_gridpoint(
+                physics_state_grid, forcing_now, self.terrain, physics_state,
                 physics=self.physics,
-                forcing=forcing,
-                terrain=self.terrain,
-                diffusion=self.diffusion,
-                date=self._date_from_sim_time(state.sim_time),
-                diagnostics_collector=d
+                time_step=self.dt_si.m,
             )
-        )
-        primitive_with_speedy = lambda d: dinosaur.time_integration.compose_equations([self.primitive, physics_forcing_eqn(d)])
-        unfiltered_step_fn = lambda d: dinosaur.time_integration.imex_rk_sil3(primitive_with_speedy(d), self.dt)
-        return lambda d=None: dinosaur.time_integration.step_with_filters(unfiltered_step_fn(d), self.filters)
+            state_next = self.dycore.step(state, physics_tendency)
+            return state_next, new_physics_state
 
-    def _post_process(self, state: primitive_equations.State, forcing: ForcingData, output_averages: bool) -> Predictions:
-        """Post-process a single state from the simulation trajectory. This function is called by the integrator at each save point. It converts the dynamical state to a physical state and, if enabled, runs the physics package to compute diagnostic variables.
-        
-        Args:
-            state: 
-                A `primitive_equations.State` object from the simulation.
-        
-        Returns:
-            A dictionary containing the `PhysicsState` ('dynamics') and the
-            diagnostic physics variables (data structure determined by model.physics).
+        return step
 
+    def _post_process(
+        self,
+        state,
+        physics_state: Any,
+        output_averages: bool,
+    ) -> Predictions:
+        """Post-process a single saved state from the op-split trajectory.
+
+        The op-split scan threads ``physics_state`` — the cross-step carry
+        returned by the prior ``compute_tendencies`` call — into this function
+        at save time. We use it directly as the ``predictions.physics`` payload
+        in snapshot mode rather than re-running physics with a freshly-seeded
+        carry. That avoids the bug where sub-cycled radiation diagnostics
+        (default ``radiation_interval=7200s``) would be reported as zero on
+        non-radiation outer steps because the recompute path didn't see the
+        cached radiation fields the dycore was actually consuming.
+
+        In averaged mode the caller overrides ``predictions.physics`` with the
+        inner-step running mean, so the value attached here is discarded — we
+        leave it as ``physics_state`` for symmetry and pytree-structure stability.
+
+        Non-negative tracers (``specific_humidity``, ``qc``/``qi``, GHG VMRs)
+        get a final ``verify_state`` clamp at the dycore→gridpoint output
+        boundary so spectral Gibbs ringing of the physics tendency doesn't leak
+        negative values into user-visible output.
         """
-        from jcm.physics_interface import verify_state
-        jax.debug.callback(lambda t: logger.info("Post processing: %s simulated seconds", t), state.sim_time)
-
-        predictions = Predictions(
-            dynamics=dynamics_state_to_physics_state(state, self.primitive),
-            physics=None,
-            times=None
+        jax.debug.callback(
+            lambda t: logger.info("Post processing: %s simulated seconds", t),
+            self.dycore.sim_time(state),
+        )
+        return Predictions(
+            dynamics=verify_state(self.dycore.to_physics_state(state)),
+            physics=physics_state if not output_averages else None,
+            times=None,
         )
 
-        if not output_averages:
-            date = self._date_from_sim_time(state.sim_time)
-            clamped_physics_state = verify_state(predictions.dynamics)
-            _, physics_data = self.physics.compute_tendencies(clamped_physics_state, forcing, self.terrain, date)
-            predictions = predictions.replace(physics=physics_data)
+    def _build_initial_physics_carry(self) -> Any:
+        """Build the cross-step physics carry seed for an op-split run.
 
-        return predictions
-    
-    def _get_integrate_fn(self, step_fn, outer_steps, inner_steps, post_process_fn, output_averages, **kwargs):
-        trajectory_fn = averaged_trajectory_from_step if output_averages else dinosaur.time_integration.trajectory_from_step
+        Pulls per-term initial state from :meth:`Physics.initial_carry_state`
+        (deterministic, no zero-state probe). Unions with the *structural
+        template* from :meth:`Physics.get_empty_data` so the ``lax.scan`` carry
+        pytree matches the post-step ``compute_tendencies`` output structure
+        on iteration 1 (within-step diagnostic keys terms write are
+        zero-filled). ``get_empty_data`` is internal-only in this role.
+        """
+        template = self.physics.get_empty_data(self.coords)
+        initial_carry = self.physics.initial_carry_state(self.coords)
+        if isinstance(initial_carry, dict) and isinstance(template, dict):
+            return {**template, **initial_carry}
+        # Explicit ``is None`` check: ``initial_carry or template`` would
+        # trigger ``bool(carry)`` and raise an ambiguous-truth ``ValueError``
+        # if a ``Physics`` subclass returns a JAX array (or any object with
+        # non-scalar truth semantics).
+        return template if initial_carry is None else initial_carry
 
-        def _integrate_fn(state):
-            integrate_fn = trajectory_fn(
+    def _get_op_split_integrate_fn(
+        self,
+        step_fn,
+        outer_steps,
+        inner_steps,
+        post_process_fn,
+        output_averages,
+    ):
+        """Integrate-fn builder for the operator-split path.
+
+        Returns a closure ``(state, initial_physics_state) -> (final_state,
+        final_physics_state, predictions)``. The running-mean accumulator
+        template comes from :meth:`Physics.get_empty_data` — a zero-filled
+        snapshot of the dict ``compute_tendencies`` produces, which is exactly
+        the pytree structure the scan carries.
+        """
+        template = self.physics.get_empty_data(self.coords)
+
+        def _integrate_fn(state, initial_physics_state):
+            trajectory = _op_split_trajectory(
                 step_fn=step_fn,
+                initial_physics_state=initial_physics_state,
+                empty_diagnostics=template,
                 outer_steps=outer_steps,
                 inner_steps=inner_steps,
-                **kwargs,
-                post_process_fn=post_process_fn
+                post_process_fn=post_process_fn,
+                output_averages=output_averages,
             )
-
-            # integrate_fn for avgs has different signature b/c empty physics data structure needed for DiagnosticsCollector initialization
-            return integrate_fn(state, self.physics.get_empty_data(self.coords)) if output_averages else integrate_fn(state)
+            return trajectory(state)
 
         return _integrate_fn
 
-    @partial(jax.jit, static_argnums=(0, 3, 4, 5)) # Note: if model fields assumed to be static are changed, the changes will not be picked up here
+    @partial(jax.jit, static_argnums=(0, 4, 5, 6))  # Note: changing fields assumed static won't propagate.
+    def _run_from_state(self,
+                        initial_state,
+                        initial_physics_state: Any,
+                        forcing: ForcingData,
+                        save_interval=10.0,
+                        total_time=120.0,
+                        output_averages=False,
+    ):
+        """JIT-compiled simulation loop. Returns raw :class:`Predictions` pytree.
+
+        Physics is computed once per ``dt`` outside the dycore's stage loop
+        and applied as a gridpoint :class:`PhysicsTendency` that the dycore
+        adds via forward-Euler (operator-split Lie a from #471). The
+        cross-step physics carry is first-class — threaded in as
+        ``initial_physics_state`` and returned as the final carry so callers
+        can continue a run across API boundaries without re-seeding (e.g.
+        :meth:`Model.resume`).
+        """
+        inner_steps = int(save_interval / self.dt_si.to(units.day).m)
+        outer_steps = int(total_time / save_interval)
+        # Op-split saves end-of-step states (snapshot mode) or post-step
+        # running means (averaged mode), so the first saved frame is at
+        # ``initial_state.sim_time + save_interval``, not ``+ 0``. Index by
+        # ``arange(outer_steps) + 1`` to label frames at the times they
+        # actually correspond to.
+        times = self.start_date.delta.days \
+                + (self.dycore.sim_time(initial_state) * units.second).to(units.day).m \
+                + save_interval * (jnp.arange(outer_steps) + 1)
+
+        op_split_step = self._get_op_split_step_fn(forcing)
+        integrate = self._get_op_split_integrate_fn(
+            op_split_step,
+            outer_steps=outer_steps,
+            inner_steps=inner_steps,
+            post_process_fn=lambda state, physics_state: self._post_process(
+                state, physics_state, output_averages,
+            ),
+            output_averages=output_averages,
+        )
+        final_dycore_state, final_physics_state, predictions = integrate(
+            initial_state, initial_physics_state,
+        )
+
+        return final_dycore_state, final_physics_state, predictions.replace(times=times)
+
     def run_from_state(self,
-                       initial_state: primitive_equations.State,
+                       initial_state,
                        forcing: ForcingData,
                        save_interval=10.0,
                        total_time=120.0,
                        output_averages=False,
-    ) -> tuple[primitive_equations.State, Predictions]:
-        """Run the full simulation forward in time starting from given initial state.
-        Alternative to model.run / model.resume which does not read/write model's internal current state.
-        
+    ):
+        """Run the simulation forward from a given dycore-native initial state.
+
+        Alternative to ``model.run`` / ``model.resume`` which does not read or
+        write the model's internal state.
+
+        Note: the operator-split path carries a cross-step physics state
+        (radiation cache, prior-step TKE, …). This method rebuilds that carry
+        from scratch at every call. For chaining runs continuously (so the
+        carry persists across API boundaries), use ``run`` / ``resume`` —
+        those thread ``self._final_physics_state`` automatically. For an
+        advanced caller that wants explicit control of the carry, use
+        :meth:`run_from_state_with_carry`.
+
         Args:
-            initial_state:
-                dinosaur.primitive_equations.State containing initial state of the run.
-            forcing:
-                ForcingData containing forcing conditions for the run.
-            save_interval:
-                (float) interval at which to save model outputs in days (default 10.0).
-            total_time:
-                (float) total time to run the model in days (default 120.0).
-            output_averages:
-                Whether to output time-averaged quantities (default False).
-    
+            initial_state: Dycore-native initial state (e.g.
+                ``primitive_equations.State`` for the dinosaur backend).
+            forcing: :class:`ForcingData` containing forcing for the run.
+            save_interval: Interval at which to save outputs. Number of days
+                (float) or a calendar string like ``'1 month'``.
+            total_time: Total time to run. Same units as ``save_interval``.
+            output_averages: Whether to output time-averaged quantities.
+
         Returns:
-            A tuple containing (final dinosaur.primitive_equations.State, Predictions object containing trajectory of post-processed model states).
+            A tuple ``(final_dycore_state, ModelPredictions)``.
 
         """
-        step_fn_factory = self._get_step_fn_factory(forcing)
-        # If output_averages is True, pass step_fn_factory directly so that averaged_trajectory_from_step can pass in the DiagnosticsCollector
-        step_fn = step_fn_factory if output_averages else jax.checkpoint(step_fn_factory())
-
-        inner_steps = int(save_interval / self.dt_si.to(units.day).m)
-        outer_steps = int(total_time / save_interval)
-        times = self.start_date.delta.days \
-                + (initial_state.sim_time*units.second).to(units.day).m \
-                + save_interval * jnp.arange(outer_steps)
-
-        integrate = self._get_integrate_fn(
-            step_fn,
-            outer_steps=outer_steps,
-            inner_steps=inner_steps,
-            start_with_input=True,
-            post_process_fn=lambda state: self._post_process(state, forcing, output_averages),
-            output_averages=output_averages
+        final_state, _, predictions = self.run_from_state_with_carry(
+            initial_state,
+            forcing,
+            save_interval=save_interval,
+            total_time=total_time,
+            output_averages=output_averages,
         )
-        
-        final_modal_state, predictions = integrate(initial_state)
-        return final_modal_state, predictions.replace(times=times)
+        return final_state, predictions
+
+    def run_from_state_with_carry(self,
+                                  initial_state,
+                                  forcing: ForcingData,
+                                  save_interval=10.0,
+                                  total_time=120.0,
+                                  output_averages=False,
+                                  initial_physics_state: Any = None,
+    ):
+        """Lower-level ``run_from_state`` that exposes the cross-step physics carry."""
+        save_interval_days = parse_duration_days(save_interval, calendar=self.calendar)
+        total_time_days = parse_duration_days(total_time, calendar=self.calendar)
+        if initial_physics_state is None:
+            initial_physics_state = self._build_initial_physics_carry()
+        final_dycore_state, final_physics_state, predictions = self._run_from_state(
+            initial_state, initial_physics_state, forcing,
+            save_interval_days, total_time_days,
+            output_averages,
+        )
+        return (
+            final_dycore_state,
+            final_physics_state,
+            ModelPredictions(predictions, self.coords, self.physics),
+        )
 
     def resume(self,
-               forcing: ForcingData=None,
+               forcing: ForcingData = None,
                save_interval=10.0,
                total_time=120.0,
-               output_averages=False
-    ) -> Predictions:
-        """Run the full simulation forward in time starting from end of previous call to model.run or model.resume.
+               output_averages=False,
+    ) -> ModelPredictions:
+        """Continue from end of previous ``run`` / ``resume``.
 
-        Args:
-            forcing:
-                ForcingData containing forcing conditions for the run.
-            save_interval:
-                Interval at which to save model outputs (float).
-            total_time:
-                Total time to run the model (float).
-            output_averages:
-                Whether to output time-averaged quantities (default False).
-
-        Returns:
-            A Predictions object containing the trajectory of post-processed model states.
-
+        Continues the cross-step physics carry across the call boundary:
+        ``self._final_physics_state`` from the previous ``run``/``resume`` is
+        threaded back in so sub-cycled radiation, prior-step TKE, etc. don't
+        reset at the API seam. A run broken into ``run()`` then ``resume()``
+        for the same total duration therefore matches a single ``run()`` of
+        the combined duration (to numerical roundoff).
         """
-        # starts from preexisting self._final_modal_state, then updates self._final_modal_state
         jax.debug.callback(
-            lambda: logger.info("Model starting with params: save_interval: %s, total_time: %s, output_averages: %s",
-                                save_interval, total_time, output_averages)
+            lambda: logger.info(
+                "Model starting with params: save_interval: %s, total_time: %s, output_averages: %s",
+                save_interval, total_time, output_averages),
         )
-        final_modal_state, predictions = self.run_from_state(
-            initial_state=self._final_modal_state,
+        final_dycore_state, final_physics_state, predictions = self.run_from_state_with_carry(
+            initial_state=self._final_dycore_state,
             forcing=forcing or default_forcing(self.coords.horizontal),
             save_interval=save_interval,
             total_time=total_time,
-            output_averages=output_averages
+            output_averages=output_averages,
+            initial_physics_state=self._final_physics_state,
         )
         jax.debug.callback(lambda: logger.info("Run completed."))
-        self._final_modal_state = final_modal_state
+        self._final_dycore_state = final_dycore_state
+        self._final_physics_state = final_physics_state
         return predictions
 
     def run(self,
-            initial_state: PhysicsState | primitive_equations.State = None,
-            forcing: ForcingData=None,
+            initial_state=None,
+            forcing: ForcingData = None,
             save_interval=10.0,
             total_time=120.0,
-            output_averages=False
-    ) -> Predictions:
-        """Set model.initial_nodal_state and model.start_date and run the full simulation forward in time.
+            output_averages=False,
+    ) -> ModelPredictions:
+        """Set the initial state and run the full simulation forward in time.
 
-        Args:
-            initial_state:
-                PhysicsState or dinosaur.primitive_equations.State containing initial state of the model (default isothermal atmosphere).
-            forcing:
-                ForcingData containing forcing conditions for the run (default aquaplanet).
-            save_interval:
-                (float) interval at which to save model outputs in days (default 10.0).
-            total_time:
-                (float) total time to run the model in days (default 120.0).
-            output_averages:
-                Whether to output time-averaged quantities (default False).
-
-        Returns:
-            A Predictions object containing the trajectory of post-processed model states.
-
+        ``initial_state`` may be:
+            * ``None`` — the dycore builds its own default initial state.
+            * a :class:`PhysicsState` — gridpoint state, projected onto the
+              dycore via :meth:`DynamicalCore.initial_state`.
+            * a dycore-native state (e.g. ``primitive_equations.State`` for
+              the dinosaur backend) — used directly.
         """
-        if isinstance(initial_state, primitive_equations.State):
-            self.initial_nodal_state = dynamics_state_to_physics_state(initial_state, self.primitive)
-            self._final_modal_state = initial_state
-        else:
-            self.initial_nodal_state = initial_state
-            self._final_modal_state = self._prepare_initial_modal_state(initial_state)
+        self.bootstrap_state(initial_state)
+        return self.resume(
+            forcing=forcing, save_interval=save_interval,
+            total_time=total_time, output_averages=output_averages,
+        )
 
-        return self.resume(forcing=forcing, save_interval=save_interval, total_time=total_time, output_averages=output_averages)
+    def bootstrap_state(self, initial_state=None) -> None:
+        """Populate ``_final_dycore_state`` and ``_final_physics_state`` without integrating.
+
+        Equivalent to the prep that ``run`` does before its first ``resume``
+        call, but exposed as a standalone method so callers that need only the
+        initial pytrees — checkpoint restore (where ``flax.serialization.from_bytes``
+        requires a template), state introspection, or a bring-your-own-stepper
+        workflow — don't have to spin up a zero-length integration to get them.
+
+        ``initial_state`` may be ``None``, a gridpoint :class:`PhysicsState`,
+        or a dycore-native state.
+        """
+        if initial_state is None:
+            self.initial_nodal_state = None
+            self._final_dycore_state = self._prepare_initial_dycore_state(None)
+        elif isinstance(initial_state, PhysicsState):
+            self.initial_nodal_state = initial_state
+            self._final_dycore_state = self._prepare_initial_dycore_state(initial_state)
+        else:
+            # Assume the caller has supplied a dycore-native state object.
+            self.initial_nodal_state = self.dycore.to_physics_state(initial_state)
+            self._final_dycore_state = initial_state
+
+        # Eagerly build the physics carry. ``resume`` would otherwise build it
+        # lazily on first call, but materialising it here makes the pytree
+        # available as a checkpoint-restore template and to any caller that
+        # wants to inspect / mutate the seed state before stepping.
+        self._final_physics_state = self._build_initial_physics_carry()

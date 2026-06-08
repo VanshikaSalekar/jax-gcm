@@ -1,0 +1,49 @@
+# ECHAM atmospheric physics package.
+#
+# Each entry under ``terms`` is a Hydra-style term spec — a target
+# class plus optional kwargs. Per-scheme parameters live in their own
+# ``params`` block; each unspecified field falls back to that scheme's
+# ``Parameters.default()``. Because ``params`` is intentionally absent
+# from this yaml (so the scheme default is used), overriding an
+# individual field at the CLI requires the Hydra ``+`` append prefix::
+#
+#     python -m jcm.main physics=echam \
+#         +physics.terms.tiedtke_convection.params.entrpen=4e-4
+#
+# Swap a term entirely from a curated preset (see ``echam-rrtmgp.yaml``)
+# or inline at the CLI by overriding ``_target_`` and the param block.
+
+vectorize_columns: true
+checkpoint_terms: true
+
+# RRTMGP chunked-vmap chunk size (cells per chunk). null = auto-detect
+# from device HBM (recommended). Set to a positive int to fix the chunk
+# count — useful on shared GPUs with reduced free memory or for
+# reproducible kernel launches. Plumbs through to ``Model.__init__``.
+radiation_chunk_size: null
+
+terms:
+  moist_air_state:
+    _target_: jcm.physics.diagnostics.moist_air_state.MoistAirColumnState
+  echam_boundary_conditions:
+    _target_: jcm.physics.forcing.echam_boundary_conditions.EchamBoundaryConditions
+  macv2_sp_aerosol:
+    _target_: jcm.physics.aerosol.Macv2SpAerosol
+  simple_chemistry:
+    _target_: jcm.physics.chemistry.SimpleChemistry
+  sundqvist_cloud_fraction:
+    _target_: jcm.physics.clouds.sundqvist.SundqvistCloudFraction
+  grey_two_stream_radiation:
+    _target_: jcm.physics.radiation.grey_two_stream.GreyTwoStreamRadiation
+  tiedtke_convection:
+    _target_: jcm.physics.convection.tiedtke_nordeng.TiedtkeConvection
+  echam_1m_microphysics:
+    _target_: jcm.physics.clouds.echam_1m.Echam1MMicrophysics
+  tte_tke_vertical_diffusion:
+    _target_: jcm.physics.vertical_diffusion.tte_tke.TteTkeVerticalDiffusion
+  echam_surface:
+    _target_: jcm.physics.surface.echam.surface_physics.EchamSurface
+  hines_gwd:
+    _target_: jcm.physics.gravity_waves.hines.HinesGwd
+  lott_miller_sso:
+    _target_: jcm.physics.gravity_waves.sso.LottMillerSso

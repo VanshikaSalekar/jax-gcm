@@ -424,24 +424,16 @@ Forcing and Boundary Conditions
 - Soil moisture
 - Surface albedo
 - Orographic parameters
+- CO₂ mixing ratio
 
-**CO₂ Forcing**: Optional increasing CO₂ concentration over time.
+All boundary conditions live on :py:class:`jcm.forcing.ForcingData`. They
+can be constant or time-varying — when a field varies in time, the model
+takes care of picking the right value for each step (see
+:py:class:`jcm.forcing.ForcingData` for details).
 
-**Configurable Parameters** (:py:class:`ForcingParameters`):
-
-.. list-table::
-   :header-rows: 1
-   :widths: 20 60 20
-
-   * - Parameter
-     - Description
-     - Default
-   * - ``increase_co2``
-     - Enable time-varying CO₂
-     - True
-   * - ``co2_year_ref``
-     - Reference year for CO₂
-     - 1950
+**CO₂ Forcing**: ``ForcingData.co2_vmr`` is the CO₂ mixing ratio in ppmv.
+Pass a scalar for a constant-CO₂ run, or a time series for a historical /
+scenario run. The default is 360 ppmv (SPEEDY's reference value).
 
 Using Custom Parameters
 -----------------------
@@ -450,8 +442,9 @@ To customize physics parameters:
 
 .. code-block:: python
 
-   from jcm.physics.speedy.speedy_physics import SpeedyPhysics
+   from jcm.physics.speedy.speedy_terms import speedy_physics
    from jcm.physics.speedy.params import Parameters
+   from jcm.physics.speedy.speedy_coords import get_speedy_coords
    from jcm.model import Model
 
    # Get default parameters
@@ -473,10 +466,10 @@ To customize physics parameters:
    )
 
    # Create physics with custom parameters
-   physics = SpeedyPhysics(parameters=params)
+   physics = speedy_physics(parameters=params)
 
    # Use in model
-   model = Model(physics=physics)
+   model = Model(coords=get_speedy_coords(), physics=physics)
 
 Viewing All Parameters
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -489,6 +482,59 @@ To see all parameter values:
 
    params = Parameters.default()
    print(params)
+
+
+Composable Physics API
+-----------------------
+
+The SPEEDY physics is also available as composable ``PhysicsTerm`` instances:
+
+.. code-block:: python
+
+   from jcm.physics.speedy.speedy_terms import speedy_physics
+
+   # Create composable SPEEDY physics with all standard terms
+   physics = speedy_physics(parameters=params)
+
+   # Remove a term
+   physics = speedy_physics().remove("vertical_diffusion")
+
+Each SPEEDY term stores its own tunable parameters as ``nnx.Param`` attributes,
+enabling per-scheme gradient-based optimization via ``flax.nnx``.
+
+Module Locations
+^^^^^^^^^^^^^^^^
+
+After the directory reorganization, SPEEDY process modules live under their
+respective process directories:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Process
+     - Module path
+   * - Shortwave Radiation
+     - ``jcm.physics.radiation.speedy_shortwave``
+   * - Longwave Radiation
+     - ``jcm.physics.radiation.speedy_longwave``
+   * - Convection
+     - ``jcm.physics.convection.speedy_convection``
+   * - Humidity
+     - ``jcm.physics.clouds.speedy_humidity``
+   * - Large-Scale Condensation
+     - ``jcm.physics.clouds.speedy_condensation``
+   * - Surface Fluxes
+     - ``jcm.physics.surface.speedy_surface_flux``
+   * - Vertical Diffusion
+     - ``jcm.physics.vertical_diffusion.speedy_vdiff``
+   * - Forcing
+     - ``jcm.physics.forcing.speedy_forcing``
+   * - Orographic Correction
+     - ``jcm.physics.orographic_correction.speedy_orographic``
+
+SPEEDY infrastructure (parameters, coordinates, physics data, orchestrators)
+remains at ``jcm.physics.speedy``.
 
 Scientific References
 ---------------------
@@ -528,9 +574,11 @@ Assumptions and Limitations
 
 **Forcing Data**:
 
-- Requires either daily climatological or constant boundary conditions
-- Assumes 365-day year for climatological forcing
-- SST and other boundary conditions are prescribed (not predicted)
+- One-year climatology files are reused on every simulated year. Multi-year
+  files are aligned by date.
+- SPEEDY uses a no-leap (365-day) year by default. Pass
+  ``Model(calendar='gregorian')`` if you need real Gregorian timestamps.
+- SST and other boundary conditions are prescribed (not predicted).
 
 **Domain**:
 
@@ -568,7 +616,7 @@ Comparison with Other Physics Packages
 
    * - Feature
      - SPEEDY
-     - ICON (future)
+     - ECHAM
      - Comprehensive GCMs
    * - Complexity
      - Intermediate
@@ -592,11 +640,11 @@ Comparison with Other Physics Packages
      - Prognostic+Microphysics
    * - Aerosols
      - Fixed climatology
-     - Interactive
+     - Prescribed MACv2-SP
      - Fully interactive
    * - Use Case
      - Dynamics, ML
-     - Research
+     - Climate-quality beta runs
      - Climate projections
 
 Next Steps

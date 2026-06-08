@@ -1,0 +1,50 @@
+# Default run configuration: short integration with daily snapshots.
+time_step: 10              # minutes
+save_interval: 10          # days
+total_time: 10             # days
+output_averages: false
+output: model_state.nc
+log_level: CRITICAL
+
+# Optional upper-sponge layer applied to (u, v) in the topmost ``levels``.
+# Off by default — set ``run.sponge.levels`` to a positive integer to enable.
+sponge:
+  levels: 0
+  timescale_h: 3.0
+  enspodi: 2.0
+
+# Chunked-mode options. When ``chunk_days > 0`` the integration is broken
+# into chunks and run through ``jcm.diagnostics.check_health`` between each
+# one — useful for long runs that may need to bail out on a NaN. Chunks are
+# written to ``{output_prefix}_day{N}.nc``.
+chunk_days: 0
+output_prefix: chunked_run
+
+# Checkpointing for preemptible chunked runs. When set, the model state
+# (modal + physics carry) and elapsed sim-day count are saved to this
+# path after each chunk; if the file already exists at startup the run
+# resumes from it, skipping completed chunks. Single file per run, flax
+# msgpack format. Leave ``null`` to disable.
+checkpoint_path: null
+
+# Runtime mode:
+#   full        — standard dynamical-core integration (Model.run)
+#   prescribed  — diagnose physics tendencies from a saved state file
+#                 (PrescribedStateModel)
+#   scm         — single-column physics evolution at one (lat, lon)
+#                 (SingleColumnModel)
+mode: full
+
+# State file (xarray netCDF written by a previous JCM run) — required when
+# ``mode`` is ``prescribed`` or ``scm``.
+state_file: null
+
+# Tracer variables to load from the state file (mapping tracer name →
+# variable name). Defaults to none; set e.g. ``{qc: qc, qi: qi}`` for the
+# ICON 1-moment scheme.
+tracer_vars: null
+
+# Column location for ``mode: scm`` (degrees).
+column:
+  lat_deg: 0.0
+  lon_deg: 0.0

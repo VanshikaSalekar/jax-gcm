@@ -1,0 +1,95 @@
+"""Date: 2/11/2024
+Parametrization of large-scale condensation.
+"""
+from jax import jit
+import jax.numpy as jnp
+from jcm.terrain import TerrainData
+from jcm.forcing import ForcingData
+from jcm.physics.speedy.params import Parameters
+from jcm.physics_interface import PhysicsTendency, PhysicsState
+from jcm.physics.speedy.physics_data import PhysicsData
+import jcm.constants as c
+# alhc is SPEEDY's latent heat in J/g (q is in g/kg). cpd, p0, grav are shared
+# and read as module attributes from jcm.constants.
+from jcm.physics.speedy.physical_constants import alhc
+
+@jit
+def get_large_scale_condensation_tendencies(
+    state: PhysicsState,
+    physics_data: PhysicsData,
+    parameters: Parameters,
+    forcing: ForcingData,
+    terrain: TerrainData
+) -> tuple[PhysicsTendency, PhysicsData]:
+    """Compute large-scale condensation and associated tendencies of temperature and moisture
+
+    Args:
+        psa: Normalized surface pressure
+        qa: Specific humidity [g/kg] - state.specific_humidity
+        qsat: Saturation specific humidity [g/kg] - humidity.qsat
+        iptop: Cloud top diagnosed from precipitation due to convection and large-scale condensation conv.iptop
+
+    Returns:
+        iptop: Cloud top diagnosed from precipitation due to convection and large-scale condensation
+        precls: Precipitation due to large-scale condensation
+        dtlsc: Temperature tendency due to large-scale condensation
+        dqlsc: Specific humidity tendency due to large-scale condensation
+
+    """
+    # 1. Initialization
+    humidity = physics_data.humidity
+    conv = physics_data.convection
+    
+    # Initialize outputs
+    dtlsc = jnp.zeros_like(state.specific_humidity)
+    dqlsc = jnp.zeros_like(state.specific_humidity)
+    
+    # Constants for computation
+    qsmax = 10.0
+
+    rtlsc = 1.0 / (parameters.condensation.trlsc * 3600.0)
+    tfact = alhc / c.cpd
+    prg = c.p0 / c.grav
+
+    psa2 = state.normalized_surface_pressure ** 2.0
+
+    # Tendencies of temperature and moisture
+    # NB. A maximum heating rate is imposed to avoid grid-point-storm 
+    # instability
+    
+    # Compute sig2, rhref, and dqmax arrays
+    sig2 = physics_data.speedy_coords.fsg**2.0
+    
+    rhref = parameters.condensation.rhlsc + parameters.condensation.drhlsc * (sig2 - 1.0)
+    # Apply rhblsc threshold only at bottom level (k=kx), not all levels
+    rhref = rhref.at[-1].set(jnp.maximum(rhref[-1], parameters.condensation.rhblsc))
+    dqmax = qsmax * sig2 * rtlsc
+
+    # Compute dqa array
+    dqa = rhref[:, jnp.newaxis, jnp.newaxis] * humidity.qsat - state.specific_humidity
+
+    # Calculate dqlsc and dtlsc where dqa < 0
+    negative_dqa_mask = dqa < 0
+    dqlsc = dqlsc.at[1:].set(jnp.where(negative_dqa_mask[1:], dqa[1:] * rtlsc, 0.0))
+    dtlsc = dtlsc.at[1:].set(jnp.where(negative_dqa_mask[1:], tfact * jnp.minimum(-dqlsc[1:], dqmax[1:, jnp.newaxis, jnp.newaxis] * psa2), 0.))
+
+    # Update iptop to first level with condensation (dqa < 0), or keep conv.iptop if no condensation
+    condensation_mask = dqa[1:] < 0
+    first_cond_level = jnp.where(
+        jnp.any(condensation_mask, axis=0),
+        jnp.argmax(condensation_mask, axis=0) + 2,  # +2 for 1-indexed and [1:] slice
+        conv.iptop  # No condensation: keep conv.iptop unchanged
+    )
+    iptop = jnp.minimum(first_cond_level, conv.iptop)
+
+    # Large-scale precipitation
+    pfact = physics_data.speedy_coords.dhs * prg
+    precls = 0. - jnp.sum(pfact[1:, jnp.newaxis, jnp.newaxis] * dqlsc[1:], axis=0)
+    precls *= state.normalized_surface_pressure
+
+    condensation_out = physics_data.condensation.copy(precls=precls)
+    convection_out = physics_data.convection.copy(iptop=iptop)
+    physics_data = physics_data.copy(condensation=condensation_out, convection=convection_out)
+    physics_tendencies = PhysicsTendency.zeros(shape=state.temperature.shape,temperature=dtlsc, specific_humidity=dqlsc)
+    
+    return physics_tendencies, physics_data

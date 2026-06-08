@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import tree_math
 from dinosaur.coordinate_systems import CoordinateSystem
-from jcm.constants import p0, grav, cp
+import jcm.constants as c
 from jcm.physics.speedy.physical_constants import SIGMA_LAYER_BOUNDARIES
 from jcm.utils import get_coords
 
@@ -27,7 +27,7 @@ def get_speedy_coords(layers=8, spectral_truncation=31, nodal_shape=None, spmd_m
         raise ValueError(f"SPEEDY physics supports {list(SIGMA_LAYER_BOUNDARIES.keys())} layers, got {layers}")
 
     return get_coords(
-        sigma_boundaries=SIGMA_LAYER_BOUNDARIES[layers],
+        vertical_coords=SIGMA_LAYER_BOUNDARIES[layers],
         spectral_truncation=spectral_truncation,
         nodal_shape=nodal_shape,
         spmd_mesh=spmd_mesh
@@ -56,8 +56,8 @@ def compute_speedy_vertical_coords(kx: int):
         sigl = jnp.log(fsg)
 
         # Conversion factors for fluxes -> tendencies
-        grdsig = grav / (dhs * p0)
-        grdscp = grdsig / cp
+        grdsig = c.grav / (dhs * c.p0)
+        grdscp = grdsig / c.cpd
 
         # Weights for vertical interpolation at half-levels(1,kx) and surface
         # Note that for phys.par. half-lev(k) is between full-lev k and k+1
@@ -131,6 +131,13 @@ class SpeedyCoords:
             sia=sia if sia is not None else self.sia,
             coa=coa if coa is not None else self.coa
         )
+
+    def xarray_additional_coords(self):
+        """Return additional xarray coordinates for SPEEDY physics fields."""
+        return {
+            'wvi_id': jnp.array([1, 2]),
+            'hsg_level': jnp.arange(len(self.hsg)),
+        }
 
     @classmethod
     def single_column_coords(cls, radang=0., num_levels=8):

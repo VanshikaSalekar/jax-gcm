@@ -1,7 +1,15 @@
 Architecture & Design
 =====================
 
-JAX-GCM is designed to be a fully differentiable climate model that balances ease of use for novices with extensibility for experts. This document describes the key architectural decisions and design principles.
+JAX-GCM is designed to be a fully differentiable climate model that balances ease of use for novices with extensibility for experts. This document is the high-level architectural overview; the design references below cover the same machinery in depth.
+
+.. toctree::
+   :maxdepth: 1
+   :caption: In-depth design references
+
+   design/composable_physics
+   design/operator_split_physics
+   design/writing_a_physics_scheme
 
 Core Architecture
 -----------------
@@ -9,56 +17,106 @@ Core Architecture
 Model Structure
 ^^^^^^^^^^^^^^^
 
-The :py:class:`jcm.model.Model` class serves as the central orchestrator, linking the Dinosaur dynamical core with physics implementations through a clean interface:
+The :py:class:`jcm.model.Model` class is the central orchestrator. It links a
+pluggable dynamical-core backend to a physics package without reaching into the
+backend's native state representation. See :doc:`design/operator_split_physics`
+for the per-step coupling between the dycore and physics.
 
 .. code-block:: text
 
-   ┌─────────────────────────────────────────┐
-   │             Model                       │
-   │  ┌───────────────────────────────────┐  │
-   │  │   Dinosaur Dynamical Core         │  │
-   │  │   (Spectral, Primitive Equations) │  │
-   │  └───────────────────────────────────┘  │
-   │                  ↕                      │
-   │  ┌───────────────────────────────────┐  │
-   │  │   Physics Interface               │  │
-   │  └───────────────────────────────────┘  │
-   │                  ↕                      │
-   │  ┌───────────────────────────────────┐  │
-   │  │   Physics Implementations         │  │
-   │  │   • SpeedyPhysics                 │  │
-   │  │   • (Future: ICON, custom, ...)   │  │
-   │  └───────────────────────────────────┘  │
-   └─────────────────────────────────────────┘
+   ┌───────────────────────────────────────────────┐
+   │ Model                                         │
+   │                                               │
+   │   DynamicalCore                               │
+   │   native state ↔ gridpoint PhysicsState       │
+   │          │                                    │
+   │          ▼                                    │
+   │   physics_interface                           │
+   │   verify state → tendencies → verify tendency │
+   │          │                                    │
+   │          ▼                                    │
+   │   ComposablePhysics                           │
+   │   ordered PhysicsTerm modules                 │
+   └───────────────────────────────────────────────┘
+
+Pluggable Dynamical Cores
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The :py:class:`jcm.dycore.base.DynamicalCore` protocol owns every operation
+that depends on a dycore's native representation: initial-state construction,
+one-step integration, terrain preparation, conversion to gridpoint
+:py:class:`~jcm.physics_interface.PhysicsState`, simulation-time accounting,
+and xarray output. The shipped
+:py:class:`jcm.dycore.dinosaur.dycore.DinosaurDycore` backend wraps Dinosaur's
+spectral primitive-equation state, IMEX-RK step, and spectral filters.
+
+The physics-dynamics boundary is gridpoint space on the dycore's native
+horizontal layout, so physics never sees spectral coefficients. The protocol
+permits non-lat/lon layouts, although the current column-vectorized
+``ComposablePhysics`` path still expects exactly two horizontal dimensions;
+a backend with an element-plus-GLL layout must flatten or adapt that layout
+before using the shipped column physics packages. Backends perform any output
+regridding in ``to_xarray()``, outside the per-step physics path.
+
+For convenience, ``Model(coords=...)`` constructs ``DinosaurDycore``
+automatically. Expert callers can construct and pass a backend explicitly:
+
+.. code-block:: python
+
+   from jcm.dycore.dinosaur import DinosaurDycore
+   from jcm.model import Model
+   from jcm.physics.speedy.speedy_coords import get_speedy_coords
+   from jcm.terrain import TerrainData
+
+   coords = get_speedy_coords()
+   dycore = DinosaurDycore(
+       coords=coords,
+       terrain=TerrainData.aquaplanet(coords),
+       dt_seconds=1800.0,
+   )
+   model = Model(dycore=dycore, time_step=30.0)
+
+The v2.0 Hydra CLI currently constructs the Dinosaur backend explicitly;
+selecting a different registered backend is a Python-API workflow. When
+constructing a backend explicitly, its ``dt_seconds`` and
+``Model(time_step=...)`` (minutes) must represent the same duration after unit
+conversion.
 
 The Physics Interface
 ^^^^^^^^^^^^^^^^^^^^^^
 
-The :py:class:`jcm.physics_interface.Physics` abstract base class defines a clean contract between the dynamical core and physics packages:
+The :py:class:`jcm.physics_interface.Physics` base class defines the contract
+between the gridpoint state supplied by the dycore and a physics package:
 
 .. code-block:: python
 
    class Physics:
-       def __call__(
+       def compute_tendencies(
            self,
            state: PhysicsState,
-           physics_data: PhysicsData,
            forcing: ForcingData,
            terrain: TerrainData,
-       ) -> tuple[PhysicsTendency, PhysicsData]:
+           prev_physics_data=None,
+       ) -> tuple[PhysicsTendency, PhysicsCarryState]:
            """Compute physics tendencies for the current state.
 
            Args:
                state: Current atmospheric state (temperature, winds, etc.)
-               physics_data: Diagnostic data from previous timesteps
-               forcing: Boundary conditions (SST, orography, etc.)
-               terrain: Orography/terrain information
+               forcing: Boundary conditions for the *current step*. The
+                   Model collapses every `TimeSeries` leaf and populates
+                   `forcing.solar` via ``forcing.select(date, calendar)``
+                   before this call, so physics terms see only flat 2-D
+                   spatial fields and a precomputed `SolarGeometry` —
+                   no time axis, no `DateData`.
+               terrain: Orography / land-sea mask information
+               prev_physics_data: Cross-step physics carry from the
+                   preceding timestep.
 
            Returns:
                tendencies: Changes to apply to the state
-               updated_data: Updated diagnostic information
+               updated_data: Updated diagnostics and cross-step carry
            """
-           pass
+           raise NotImplementedError
 
 This interface enables:
 
@@ -80,32 +138,32 @@ The physics code follows functional programming principles:
 
    def compute_convection(
        state: PhysicsState,
-       physics_data: PhysicsData,
+       diagnostics: dict,
        parameters: Parameters,
-   ) -> tuple[PhysicsTendency, ConvectionData]:
+   ) -> tuple[PhysicsTendency, dict]:
        """Pure function computing convective tendencies."""
        # No global state, no mutations
        tendencies = ...
        diagnostics = ...
        return tendencies, diagnostics
 
-**Clear Separation**: Each physics term is clearly separated, making the code easy to understand and modify:
+**Clear Separation**: Each physics term is clearly separated, making the code easy to understand and modify. The ``speedy_physics()`` factory builds an ordered list of ``PhysicsTerm`` instances:
 
 .. code-block:: python
 
-   class SpeedyPhysics(Physics):
-       def __init__(self, parameters: Parameters = None):
-           self.parameters = parameters or Parameters.default()
-
-           # Physics terms are explicit and ordered
-           self.terms = [
-               compute_convection,
-               compute_large_scale_condensation,
-               compute_shortwave_radiation,
-               compute_longwave_radiation,
-               compute_surface_fluxes,
-               compute_vertical_diffusion,
-           ]
+   def speedy_physics(parameters: Parameters | None = None) -> ComposablePhysics:
+       params = parameters or Parameters.default()
+       return ComposablePhysics(terms=[
+           SpeedyFlags(),
+           SpeedyForcing(...),
+           SpeedyConvection(params.convection),
+           SpeedyLargeScaleCondensation(params.condensation),
+           SpeedyShortwaveRadiation(params.shortwave_radiation),
+           SpeedyDownwardLongwaveRadiation(...),
+           SpeedySurfaceFlux(params.surface_flux),
+           SpeedyUpwardLongwaveRadiation(...),
+           SpeedyVerticalDiffusion(params.vertical_diffusion),
+       ])
 
 This design makes it easy to:
 
@@ -117,20 +175,35 @@ This design makes it easy to:
 Composability
 ^^^^^^^^^^^^^
 
-The model is designed to be composable at multiple levels:
+The model is composable at multiple levels through the ``ComposablePhysics`` framework. See :doc:`design/composable_physics` for the contract, validation rules, diagnostics-dict convention, and differentiability patterns; :doc:`design/writing_a_physics_scheme` for a single-file plugin walkthrough.
 
-**Physics Packages**: Different physics implementations can be easily swapped:
+**Composable Physics**: Individual parameterizations (``PhysicsTerm`` instances) can be mixed across packages:
 
 .. code-block:: python
 
-   # Use SPEEDY physics
-   model = Model(coords=get_speedy_coords(),physics=SpeedyPhysics())
+   from jcm.physics.speedy.speedy_terms import speedy_physics
+   from jcm.physics.echam.echam_terms import echam_physics
+   from jcm.physics.convection.tiedtke_nordeng.tiedtke_nordeng import (
+       ConvectionParameters,
+       TiedtkeConvection,
+   )
 
-   # Use custom physics (future), this could use any existing or custom coords that are compatible with the physics implementation
-   model = Model(coords,physics=CustomPhysics())
+   # Use pre-built SPEEDY defaults
+   physics = speedy_physics()
 
-   # Combine multiple physics packages (future)
-   model = Model(coords,physics=HybridPhysics([speedy_radiation, ml_convection]))
+   # Use ECHAM with the NN radiation emulator
+   physics = echam_physics(radiation_scheme="emulated")
+
+   # Replace one term with a separately configured instance
+   convection = TiedtkeConvection(
+       params=ConvectionParameters.default(tau=10800.0),
+   )
+   physics = echam_physics().replace("convection", convection)
+
+   # Remove a term
+   physics = echam_physics().remove("hines")
+
+Each ``PhysicsTerm`` is a ``flax.nnx.Module`` that stores its own tunable parameters as ``nnx.Param`` attributes and coordinate caches as ``nnx.Variable``. Terms communicate through a ``diagnostics`` dict threaded through the term list. The dict serves a dual role: keys without a leading underscore are exposed as user-facing diagnostic output (written to xarray); keys prefixed with ``_`` (e.g. ``_radiation``, ``_convection``) are internal inter-term state and are filtered out of the user-facing output.
 
 **Configurations**: Model components can be configured independently:
 
@@ -138,8 +211,8 @@ The model is designed to be composable at multiple levels:
 
    coords = get_speedy_coords(nodal_shape=(256, 128), layers=8, spectral_truncation=85)
    terrain = TerrainData.from_coords(coords)
-   physics = SpeedyPhysics(parameters=custom_params)
-   
+   physics = speedy_physics(parameters=custom_params)
+
    model = Model(
        coords,
        terrain=terrain,
@@ -156,14 +229,34 @@ A core design goal is full differentiability through the model. This enables:
 .. code-block:: python
 
    def loss(params):
-       physics = SpeedyPhysics(parameters=params)
-       model = Model(coords=get_speedy_coords(),physics=physics)
+       physics = speedy_physics(parameters=params)
+       model = Model(coords=get_speedy_coords(), physics=physics)
        predictions = model.run(...)
        return compute_loss(predictions, observations)
 
-   # Compute gradients with respect to physics parameters
    grad_fn = jax.grad(loss)
    gradients = grad_fn(initial_params)
+
+**Per-Scheme Optimization** (using ``nnx.grad`` to differentiate w.r.t.
+individual term parameters):
+
+.. code-block:: python
+
+   from flax import nnx
+
+   physics = speedy_physics()
+   physics.cache_coords(coords)
+
+   def loss_fn(physics):
+       model = Model(coords=coords, terrain=terrain, physics=physics)
+       return compute_loss(model.run(total_time=...))
+
+   # Gradient w.r.t. all physics parameters
+   grads = nnx.grad(loss_fn)(physics)
+
+   # Gradient w.r.t. convection parameters only
+   convection_filter = nnx.PathContains("convection")
+   grads = nnx.grad(loss_fn, wrt=convection_filter)(physics)
 
 **Sensitivity Analysis**: Understand how initial conditions affect outcomes:
 
@@ -234,7 +327,8 @@ For Experts
 
 Every component can be customized or extended:
 
-- **Custom Physics**: Implement the ``Physics`` interface for new parameterizations
+- **Custom Physics**: Add a new ``PhysicsTerm`` — see :doc:`design/writing_a_physics_scheme` for the one-file plugin contract.
+- **Custom Dynamical Core**: Implement the :py:class:`jcm.dycore.base.DynamicalCore` protocol and pass the backend to ``Model(dycore=...)``.
 - **Custom Forcing**: Create specialized boundary condition handlers
 - **Custom Diagnostics**: Add new output variables and computations
 - **Integration**: Couple with other models or ML components
@@ -248,9 +342,10 @@ The codebase maintains high standards to support future complexity:
 
 .. code-block:: bash
 
-   # Tests for each physics module
-   pytest jcm/physics/speedy/convection_test.py
-   pytest jcm/physics/speedy/radiation_test.py
+   # Tests are co-located with source in process directories
+   pytest jcm/physics/convection/speedy_convection_test.py
+   pytest jcm/physics/radiation/speedy_shortwave_test.py
+   pytest jcm/physics/radiation/grey_two_stream/radiation_scheme_test.py
    # ... etc
 
 **Documentation**: All public APIs are documented with clear docstrings.
@@ -259,16 +354,55 @@ The codebase maintains high standards to support future complexity:
 
 **Continuous Integration**: Automated testing ensures changes don't break existing functionality.
 
+Physics Directory Organization
+-------------------------------
+
+Physics code is organized by **physical process**, with files named after the
+**scheme** rather than the model they were ported from. New schemes drop in
+beside existing ones without nesting:
+
+.. code-block:: text
+
+   jcm/physics/
+   ├── radiation/
+   │   ├── grey_two_stream/      # fast grey two-stream package
+   │   ├── rrtmgp.py             # RRTMGP wrapper
+   │   ├── nn_emulator.py        # NN radiation emulator
+   │   ├── speedy_shortwave.py
+   │   └── speedy_longwave.py
+   ├── convection/
+   │   ├── tiedtke_nordeng/      # Tiedtke-Nordeng mass flux
+   │   └── speedy_convection.py
+   ├── clouds/
+   │   ├── sundqvist.py          # Sundqvist diagnostic cloud fraction
+   │   ├── echam_1m.py           # ECHAM 1-moment microphysics
+   │   ├── speedy_humidity.py
+   │   └── speedy_condensation.py
+   ├── vertical_diffusion/
+   │   ├── tte_tke/              # TTE-TKE closure
+   │   └── speedy_vdiff.py
+   ├── gravity_waves/             # hines/ (Hines 1997), sso/ (Lott-Miller 1997), simple/
+   ├── aerosol/macv2_sp.py       # Stevens MACv2-SP simple plumes
+   ├── chemistry/simple_chemistry.py
+   ├── surface/                  # SPEEDY and ECHAM surface schemes
+   ├── speedy/                   # SPEEDY infrastructure (params, coords)
+   └── echam/                    # ECHAM infrastructure (params, coords)
+
+Model-specific *infrastructure* (parameter containers, coordinate caches,
+data structs) lives under ``speedy/`` and ``echam/``. Everything else is
+named after the scheme so an ECHAM port and a CAM port of the same
+parameterization sit side-by-side without per-model subfolders.
+
 Future Directions
 -----------------
 
-The architecture is designed to support:
+The composable architecture is designed to support:
 
-- **Multiple Physics Packages**: ICON physics, custom ML-based physics
-- **Hybrid Models**: Combine traditional physics with machine learning
+- **Hybrid Models**: Combine traditional physics with machine learning — a neural network ``PhysicsTerm`` slots into the composable term list and automatically participates in gradient computation
 - **Multi-Component Coupling**: Ocean, land surface, chemistry models
-- **Ensemble Workflows**: Efficient parallel ensemble generation
-- **Adjoint Sensitivity**: Large-scale sensitivity studies
-- **Optimization**: Parameter estimation, model calibration
+- **Ensemble Workflows**: Efficient parallel ensemble generation with ``vmap``
+- **Adjoint Sensitivity**: Large-scale sensitivity studies through end-to-end differentiability
+- **Parameter Estimation**: Per-scheme gradient-based calibration using ``nnx.grad``
+- **New Parameterizations**: Add new schemes (e.g., Betts-Miller convection) as ``PhysicsTerm`` subclasses that drop into existing workflows
 
 The modular, functional design with clean interfaces makes these extensions straightforward while maintaining the core simplicity of the base model.

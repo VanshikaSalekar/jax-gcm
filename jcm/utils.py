@@ -7,10 +7,10 @@ from importlib import resources
 import dinosaur
 import functools
 from dinosaur.coordinate_systems import CoordinateSystem, HorizontalGridTypes
-from dinosaur.primitive_equations import PrimitiveEquationsSpecs
-from dinosaur.scales import SI_SCALE
+from dinosaur.hybrid_coordinates import HybridCoordinates
+from dinosaur.sigma_coordinates import SigmaCoordinates
 from dinosaur import typing
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Mapping, MutableMapping, Union
 from dinosaur.xarray_utils import _maybe_update_shape_and_dim_with_realization_time_sample
 import xarray
 
@@ -20,6 +20,7 @@ TRUNCATION_FOR_NODAL_SHAPE = {
     (64, 32): 21,
     (96, 48): 31,
     (128, 64): 42,
+    (192, 96): 63,    # T63 — ECHAM standard production grid
     (256, 128): 85,
     (320, 160): 106,
     (360, 180): 119,
@@ -32,15 +33,27 @@ TRUNCATION_FOR_NODAL_SHAPE = {
 VALID_NODAL_SHAPES = tuple(TRUNCATION_FOR_NODAL_SHAPE.keys())
 VALID_TRUNCATIONS = tuple(TRUNCATION_FOR_NODAL_SHAPE.values())
 
-def get_coords(sigma_boundaries, spectral_truncation=31, nodal_shape=None, spmd_mesh=None) -> CoordinateSystem:
-    """Return a CoordinateSystem object for the given sigma boundaries and horizontal resolution.
+def get_coords(
+    vertical_coords: Union[typing.Array, SigmaCoordinates, HybridCoordinates],
+    spectral_truncation=31,
+    nodal_shape=None,
+    spmd_mesh=None,
+    constants=None,
+) -> CoordinateSystem:
+    """Return a CoordinateSystem object for the given vertical and horizontal resolution.
 
-    This is a physics-agnostic function. Use physics-specific helpers for default sigma boundaries:
+    This is a physics-agnostic function. Use physics-specific helpers for default
+    vertical coordinates:
     - jcm.physics.speedy.utils.get_speedy_coords()
     - jcm.physics.held_suarez.utils.get_held_suarez_coords()
+    - jcm.physics.echam.echam_levels.get_echam_levels()
 
     Args:
-        sigma_boundaries: Array of sigma layer boundaries (required)
+        vertical_coords: Vertical coordinate specification. Can be one of:
+            - An array of sigma layer boundaries (wrapped in SigmaCoordinates).
+            - A SigmaCoordinates instance (passed through).
+            - A HybridCoordinates instance (passed through), e.g. from
+              jcm.physics.echam.echam_levels.get_echam_levels().
         spectral_truncation: Spectral truncation number (default 31)
         nodal_shape: Optional nodal shape (ix, il) to infer spectral_truncation
         spmd_mesh: Optional tuple ``(x, y, z)`` describing the SPMD device mesh
@@ -51,7 +64,7 @@ def get_coords(sigma_boundaries, spectral_truncation=31, nodal_shape=None, spmd_
 
     Returns:
         CoordinateSystem object
-        
+
     """
     from dinosaur.spherical_harmonic import FastSphericalHarmonics, RealSphericalHarmonics
 
@@ -61,9 +74,27 @@ def get_coords(sigma_boundaries, spectral_truncation=31, nodal_shape=None, spmd_
         spectral_truncation = TRUNCATION_FOR_NODAL_SHAPE[nodal_shape]
     elif spectral_truncation not in VALID_TRUNCATIONS:
         raise ValueError(f"Invalid horizontal resolution: {spectral_truncation}. Must be one of: {VALID_TRUNCATIONS}.")
-    horizontal_grid = getattr(dinosaur.spherical_harmonic.Grid, f'T{spectral_truncation}')
+    # Most truncations have a dedicated dinosaur factory (Grid.T31, T42, …);
+    # T63 doesn't, so build it directly via Grid.construct with
+    # gaussian_nodes=(max_wavenumber+1)/2-rounded so the nodal grid matches
+    # the ECHAM T63 file (192 lon × 96 lat). For all other supported
+    # truncations the dedicated Grid.T* factory uses the same convention,
+    # so we use it where available.
+    if spectral_truncation == 63:
+        def horizontal_grid(**kwargs):
+            return dinosaur.spherical_harmonic.Grid.construct(
+                max_wavenumber=63, gaussian_nodes=48, **kwargs)
+    else:
+        horizontal_grid = getattr(
+            dinosaur.spherical_harmonic.Grid, f'T{spectral_truncation}')
 
-    physics_specs = PrimitiveEquationsSpecs.from_si(scale=SI_SCALE)
+    # The horizontal grid's radius is part of the physical-constants set and
+    # must match the dycore's physics_specs.radius (dinosaur enforces this).
+    # Source it from the live PhysicalConstants singleton so coords and dynamics
+    # agree and a prior set_constants(...) is honoured.
+    import jcm.constants as _jcm_constants
+    constants = constants if constants is not None else _jcm_constants.physical_constants
+    grid_radius = constants.rearth
 
     if spmd_mesh is not None:
         spmd_mesh = jax.make_mesh(spmd_mesh, ('x', 'y', 'z'))
@@ -71,10 +102,15 @@ def get_coords(sigma_boundaries, spectral_truncation=31, nodal_shape=None, spmd_
     else:
         spherical_harmonics_impl = RealSphericalHarmonics
 
+    if isinstance(vertical_coords, (SigmaCoordinates, HybridCoordinates)):
+        vertical = vertical_coords
+    else:
+        vertical = SigmaCoordinates(vertical_coords)
+
     return CoordinateSystem(
-        horizontal=horizontal_grid(radius=physics_specs.radius,
+        horizontal=horizontal_grid(radius=grid_radius,
                                    spherical_harmonics_impl=spherical_harmonics_impl),
-        vertical=dinosaur.sigma_coordinates.SigmaCoordinates(sigma_boundaries),
+        vertical=vertical,
         spmd_mesh=spmd_mesh
     )
 
@@ -203,12 +239,22 @@ def _infer_dims_shape_and_coords(
     
     lon_k, lat_k = coords.horizontal.modal_axes  # k stands for wavenumbers
     lon, sin_lat = coords.horizontal.nodal_axes
+
+    # HybridCoordinates uses `get_sigma_centers(p_ref)` and doesn't expose
+    # a .centers attribute; fall back to that for xarray's level axis.
+    vertical = coords.vertical
+    if hasattr(vertical, 'centers'):
+        level_coords = vertical.centers
+    else:
+        from jcm.constants import p0
+        level_coords = np.asarray(vertical.get_sigma_centers(p0))
+
     all_xr_coords = {
         XR_LON_NAME: lon * 180 / np.pi,
         XR_LAT_NAME: np.arcsin(sin_lat) * 180 / np.pi,
         XR_LON_MODE_NAME: lon_k,
         XR_LAT_MODE_NAME: lat_k,
-        XR_LEVEL_NAME: coords.vertical.centers,
+        XR_LEVEL_NAME: level_coords,
         **additional_coords,
     }
     if times is not None:
@@ -227,6 +273,30 @@ def _infer_dims_shape_and_coords(
     ) + NODAL_AXES_NAMES
     basic_shape_to_dims[nodal_shape] = NODAL_AXES_NAMES
     basic_shape_to_dims[modal_shape] = MODAL_AXES_NAMES
+    # Column-vectorized layout: physics terms running under
+    # ``ComposablePhysics(vectorize_columns=True)`` write per-column
+    # scalars and profiles in flattened ``(ncols,)`` / ``(nlev, ncols)``
+    # shape rather than ``(lon, lat)`` / ``(nlev, lon, lat)``. Map the
+    # flat shapes back to the same xarray dims so downstream reshape is
+    # a no-op axis relabel.
+    nlon, nlat = nodal_shape
+    nlev = coords.vertical.layers
+    basic_shape_to_dims[(nlon * nlat,)] = NODAL_AXES_NAMES
+    basic_shape_to_dims[(nlev, nlon * nlat)] = (
+        XR_LEVEL_NAME,
+    ) + NODAL_AXES_NAMES
+    # Half-level fields (e.g. fluxes, half-pressure) — emit them on a
+    # ``level_i`` (interface) axis so they don't clash with the full-level
+    # ``level`` coord, which has length nlev.
+    XR_LEVEL_INTERFACE_NAME = 'level_i'
+    if XR_LEVEL_INTERFACE_NAME not in all_xr_coords:
+        all_xr_coords[XR_LEVEL_INTERFACE_NAME] = np.arange(nlev + 1)
+    basic_shape_to_dims[(nlev + 1,) + nodal_shape] = (
+        XR_LEVEL_INTERFACE_NAME,
+    ) + NODAL_AXES_NAMES
+    basic_shape_to_dims[(nlev + 1, nlon * nlat)] = (
+        XR_LEVEL_INTERFACE_NAME,
+    ) + NODAL_AXES_NAMES
     basic_shape_to_dims[(coords.vertical.layers,)] = (XR_LEVEL_NAME,)
     basic_shape_to_dims[sin_lat.shape] = (XR_LAT_NAME,)
     # Add unconventional shape for nodal covariate surface data, which have dim=2
@@ -310,6 +380,17 @@ def data_to_xarray(
 
   if additional_coords is None:
     additional_coords = {}
+
+  def _maybe_reshape_to_dims(value, dims, all_coords):
+    """If ``value`` has a flattened ncols axis but ``dims`` calls for
+    separate (lon, lat) axes, reshape it. Otherwise pass through.
+    """
+    if 'lon' not in dims or 'lat' not in dims:
+      return value
+    expected = tuple(len(all_coords[d]) for d in dims)
+    if value.shape == expected:
+      return value
+    return value.reshape(expected)
   # if XR_SURFACE_NAME is not specified manually, set by default.
   if (coords.vertical.layers != 1) and (
       XR_SURFACE_NAME not in additional_coords
@@ -329,6 +410,7 @@ def data_to_xarray(
       )
     else:
       dims = shape_to_dims[value.shape]
+      value = _maybe_reshape_to_dims(value, dims, all_coords)
       data_vars[key] = (dims, value)
       dims_in_state.update(set(dims))
 
@@ -338,6 +420,7 @@ def data_to_xarray(
       raise ValueError(f'Value of shape {value.shape} is not recognized.')
     else:
       dims = shape_to_dims[value.shape]
+      value = _maybe_reshape_to_dims(value, dims, all_coords)
       data_vars[key] = (dims, value)
       dims_in_state.update(set(dims))
 
@@ -347,6 +430,7 @@ def data_to_xarray(
       raise ValueError(f'Value of shape {value.shape} is not recognized.')
     else:
       dims = shape_to_dims[value.shape]
+      value = _maybe_reshape_to_dims(value, dims, all_coords)
       data_vars[key] = (dims, value)
       dims_in_state.update(set(dims))
 
@@ -359,3 +443,128 @@ def data_to_xarray(
   # only include coordinates for dimensions that are present in the dataset.
   coords = {k: v for k, v in all_coords.items() if k in dims_in_state}
   return xarray.Dataset(data_vars, coords, attrs=dataset_attrs)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for ``SingleColumnModel`` / ``PrescribedStateModel``
+# ---------------------------------------------------------------------------
+
+def load_states_from_xarray(
+    ds,
+    u_wind_var: str = 'u_wind',
+    v_wind_var: str = 'v_wind',
+    temperature_var: str = 'temperature',
+    specific_humidity_var: str = 'specific_humidity',
+    geopotential_var: str = 'geopotential',
+    surface_pressure_var: str = 'normalized_surface_pressure',
+    tracer_vars: Mapping[str, str] | None = None,
+):
+    """Load a ``PhysicsState`` time series from an xarray ``Dataset``.
+
+    Args:
+      ds: Dataset containing the required variables.
+      *_var: Variable names in ``ds`` for each ``PhysicsState`` field.
+      tracer_vars: Mapping ``tracer_name → ds_variable_name`` for additional
+        tracers beyond ``specific_humidity``.
+
+    Returns:
+      ``PhysicsState`` whose leading axis is time.
+
+    """
+    from jcm.physics_interface import PhysicsState
+
+    tracers = {}
+    if tracer_vars:
+        for tracer_name, var_name in tracer_vars.items():
+            tracers[tracer_name] = jnp.asarray(ds[var_name].values)
+
+    return PhysicsState(
+        u_wind=jnp.asarray(ds[u_wind_var].values),
+        v_wind=jnp.asarray(ds[v_wind_var].values),
+        temperature=jnp.asarray(ds[temperature_var].values),
+        specific_humidity=jnp.asarray(ds[specific_humidity_var].values),
+        geopotential=jnp.asarray(ds[geopotential_var].values),
+        normalized_surface_pressure=jnp.asarray(ds[surface_pressure_var].values),
+        tracers=tracers,
+    )
+
+
+def create_single_column_state(
+    temperature: jnp.ndarray,
+    specific_humidity: jnp.ndarray,
+    u_wind: jnp.ndarray | None = None,
+    v_wind: jnp.ndarray | None = None,
+    surface_pressure: float = 101325.0,
+    nlev: int | None = None,
+):
+    """Build a 1-D column ``PhysicsState`` for ``SingleColumnModel``.
+
+    Geopotential is approximated hydrostatically from the column-mean
+    temperature and ``surface_pressure``.
+
+    Args:
+      temperature: Temperature profile [K], shape ``(nlev,)``.
+      specific_humidity: Specific humidity profile [kg/kg], shape ``(nlev,)``.
+      u_wind: Optional zonal wind profile [m/s]; defaults to zeros.
+      v_wind: Optional meridional wind profile [m/s]; defaults to zeros.
+      surface_pressure: Surface pressure [Pa].
+      nlev: Optional explicit level count (otherwise inferred).
+
+    Returns:
+      ``PhysicsState`` whose array fields are 1-D ``(nlev,)`` and
+      ``normalized_surface_pressure`` is a scalar.
+
+    """
+    from jcm.physics_interface import PhysicsState
+    from jcm.constants import grav, rd, p0
+
+    if nlev is None:
+        nlev = temperature.shape[0]
+
+    temperature = jnp.asarray(temperature).reshape(nlev)
+    specific_humidity = jnp.asarray(specific_humidity).reshape(nlev)
+    u_wind = jnp.zeros(nlev) if u_wind is None else jnp.asarray(u_wind).reshape(nlev)
+    v_wind = jnp.zeros(nlev) if v_wind is None else jnp.asarray(v_wind).reshape(nlev)
+
+    p_levels = surface_pressure * jnp.linspace(0.1, 1.0, nlev)[::-1]
+    scale_height = rd * jnp.mean(temperature) / grav
+    z_approx = -scale_height * jnp.log(p_levels / surface_pressure)
+    geopotential = (grav * z_approx).reshape(nlev)
+
+    return PhysicsState(
+        u_wind=u_wind,
+        v_wind=v_wind,
+        temperature=temperature,
+        specific_humidity=specific_humidity,
+        geopotential=geopotential,
+        normalized_surface_pressure=jnp.asarray(surface_pressure / p0),
+        tracers={},
+    )
+
+
+def create_initial_tracers(
+    shape: tuple | int,
+    tracer_names: list[str] | None = None,
+    cloud_water: float = 0.0,
+    cloud_ice: float = 0.0,
+) -> dict:
+    """Build a tracer dict for SCM/prescribed-state runs.
+
+    ``qc`` and ``qi`` are populated with ``cloud_water`` and ``cloud_ice``;
+    any other listed tracer names get zero arrays. ``shape`` is normally a
+    tuple but ``int`` is accepted for the 1-D SCM case
+    (``shape=nlev`` ⇒ ``(nlev,)``).
+    """
+    if isinstance(shape, int):
+        shape = (shape,)
+    if tracer_names is None:
+        tracer_names = ['qc', 'qi']
+    tracers = {}
+    for name in tracer_names:
+        if name == 'qc':
+            tracers[name] = jnp.full(shape, cloud_water)
+        elif name == 'qi':
+            tracers[name] = jnp.full(shape, cloud_ice)
+        else:
+            tracers[name] = jnp.zeros(shape)
+    return tracers
