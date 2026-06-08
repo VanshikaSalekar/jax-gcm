@@ -1,4 +1,4 @@
-dinosaur @ git+https://github.com/neuralgcm/dinosaur@main
+dinosaur
 flax>=0.12.0
 jax-datetime
 tree-math
