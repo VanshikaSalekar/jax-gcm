@@ -62,8 +62,14 @@ Run a short SPEEDY aquaplanet integration from Python:
 from jcm.model import Model
 from jcm.physics.speedy.speedy_coords import get_speedy_coords
 
+# Build coords (pass spmd_mesh=(x, y, z) here to enable multi-device sharding)
 coords = get_speedy_coords(layers=8, spectral_truncation=31)
-model = Model(coords=coords, time_step=30.0)
+
+# Create a model with default configuration
+model = Model(
+    coords=coords,
+    time_step=30.0,  # minutes
+)
 
 predictions = model.run(save_interval=10.0, total_time=120.0)
 ds = predictions.to_xarray()
