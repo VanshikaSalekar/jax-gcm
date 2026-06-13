@@ -21,7 +21,7 @@ JCM is a physical climate model that combines the [Dinosaur](https://github.com/
 Clone the repository and install in development mode:
 
 ```bash
-git clone https://github.com/yourusername/jax-gcm.git
+git clone [https://github.com/yourusername/jax-gcm.git](https://github.com/yourusername/jax-gcm.git)
 cd jax-gcm
 pip install -e .
 ```
@@ -45,7 +45,6 @@ from jcm.model import Model
 # Create a model with default configuration
 model = Model(
     time_step=30.0,          # minutes
-    layers=8,                 # vertical levels
     horizontal_resolution=31  # T31 spectral grid
 )
 
@@ -59,6 +58,35 @@ predictions = model.run(
 ds = predictions.to_xarray()
 print(ds)
 ```
+
+## Running with Docker
+
+You can easily run JCM using Docker, leveraging Hydra syntax to override model parameters on the fly. 
+
+### Run with default configuration
+```bash
+docker run --rm jcm-test
+```
+
+### Override individual parameters
+```bash
+docker run --rm jcm-test +time_step=20
+docker run --rm jcm-test +total_time=30
+```
+
+### Override multiple parameters
+```bash
+docker run --rm jcm-test +time_step=20 +total_time=30
+```
+
+### Accessing Model Outputs
+To access the dynamically generated output files (like `model_state.nc`) created during the simulation, map the container's output directory back to your local host using a volume mount:
+
+```bash
+# Map the container's output directory to your local host
+docker run --rm -v $(pwd)/outputs:/workspace/outputs jcm-test +time_step=20
+```
+*(Note: The default working directory for the JAX-GCM Docker container is `/workspace`.)*
 
 ## Examples
 
@@ -123,7 +151,7 @@ If you use JAX-GCM in your research, please cite:
   title = {JAX-GCM: A Differentiable General Circulation Model},
   author = {J. Madan, E. Davenport, et al.},
   year = {2025},
-  url = {https://github.com/climate-analytics-lab/jax-gcm}
+  url = {[https://github.com/climate-analytics-lab/jax-gcm](https://github.com/climate-analytics-lab/jax-gcm)}
 }
 ```
 
