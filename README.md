@@ -1,186 +1,148 @@
 # JAX-GCM (JCM)
 
-[![Docs](https://readthedocs.org/projects/jax-gcm/badge/?version=latest)](https://jax-gcm.readthedocs.io/en/latest/)
-[![Tests](https://github.com/climate-analytics-lab/jax-gcm/actions/workflows/run_test.yaml/badge.svg?branch=dev)](https://github.com/climate-analytics-lab/jax-gcm/actions/workflows/run_test.yaml)
-[![Lint](https://github.com/climate-analytics-lab/jax-gcm/actions/workflows/run_linter.yaml/badge.svg?branch=dev)](https://github.com/climate-analytics-lab/jax-gcm/actions/workflows/run_linter.yaml)
-[![PyPI](https://img.shields.io/pypi/v/jcm.svg)](https://pypi.org/project/jcm/)
-[![Python](https://img.shields.io/pypi/pyversions/jcm.svg)](https://pypi.org/project/jcm/)
-[![License](https://img.shields.io/github/license/climate-analytics-lab/jax-gcm.svg)](LICENSE)
+<img src="logo.png" alt="Logo" width="200">
 
-<img src="logo.png" alt="JAX-GCM logo" width="180">
+A fully differentiable General Circulation Model (GCM) for climate science and machine learning applications, written entirely in JAX.
 
-JAX-GCM is a differentiable atmospheric general circulation model written
-in JAX. Its pluggable dynamical-core interface currently ships with the
-[Dinosaur](https://github.com/neuralgcm/dinosaur) spectral backend and
-couples it to modular SPEEDY, Held-Suarez, and ECHAM-style physics packages,
-with support for gradient-based calibration, ML-physics experiments, and
-accelerated CPU/GPU/TPU runs.
+## Overview
 
-The v2.0 release focus is the ECHAM T63L47 hybrid-coordinate stack with
-RRTMGP radiation:
+JCM is a physical climate model that combines the [Dinosaur](https://github.com/google-research/dinosaur) dynamical core with JAX implementations of atmospheric physics parameterizations. The entire model is differentiable, enabling gradient-based optimization, data assimilation, and ML-enhanced climate modeling.
 
-```bash
-python -m jcm.main physics=echam-rrtmgp grid=echam_t63_l47_hybrid run=longrun
-```
+### Key Features
 
-## Highlights
-
-- Fully differentiable JAX implementation compatible with `jit`, `grad`, and `vmap`
-- Pluggable dynamical-core protocol with a shipped Dinosaur spectral backend
-- Dycore-agnostic, operator-split gridpoint physics coupling
-- SPEEDY, Held-Suarez, and composable ECHAM physics configurations
-- ECHAM T63L47 hybrid-coordinate target setup with grey, RRTMGP, or neural-emulated radiation
-- xarray/netCDF output, chunked long-run health checks, and resumable checkpoints
-- Docker and Kubernetes deployment examples for GPU batch runs
+- **Fully Differentiable**: Automatic differentiation through the entire model using JAX
+- **GPU/TPU Accelerated**: JIT compilation and hardware acceleration via JAX
+- **Modular Physics**: SPEEDY physics package with radiation, convection, clouds, and surface processes
+- **Flexible Grids**: Spectral dynamical core supporting multiple resolutions (T21 to T425)
+- **ML-Ready**: Designed for hybrid physics-ML workflows and parameter optimization
 
 ## Installation
 
-Install the latest release:
+Clone the repository and install in development mode:
 
 ```bash
-pip install jcm
-```
-
-For the development branch:
-
-```bash
-git clone https://github.com/climate-analytics-lab/jax-gcm.git
+git clone [https://github.com/yourusername/jax-gcm.git](https://github.com/yourusername/jax-gcm.git)
 cd jax-gcm
-git switch dev
 pip install -e .
 ```
 
-JCM requires Python 3.11 or newer. The full dependency set is listed in
-[`requirements.txt`](requirements.txt), including JAX, Flax, Dinosaur,
-Hydra, xarray, and optional RRTMGP support.
+### Requirements
+
+- Python ≥ 3.11
+- JAX
+- [Dinosaur](https://github.com/google-research/dinosaur) (dynamical core)
+- XArray (for I/O and data handling)
+
+See `requirements.txt` for the complete list of dependencies.
 
 ## Quick Start
 
-Run a short SPEEDY aquaplanet integration from Python:
+Run a simple aquaplanet simulation:
 
 ```python
 from jcm.model import Model
-from jcm.physics.speedy.speedy_coords import get_speedy_coords
-
-# Build coords (pass spmd_mesh=(x, y, z) here to enable multi-device sharding)
-coords = get_speedy_coords(layers=8, spectral_truncation=31)
 
 # Create a model with default configuration
 model = Model(
-    coords=coords,
-    time_step=30.0,  # minutes
+    time_step=30.0,          # minutes
+    layers=8,                 # vertical levels
+    horizontal_resolution=31  # T31 spectral grid
 )
 
-predictions = model.run(save_interval=10.0, total_time=120.0)
+# Run a 120-day simulation
+predictions = model.run(
+    save_interval=10.0,  # save every 10 days
+    total_time=120.0     # total simulation time in days
+)
+
+# Convert output to xarray Dataset for analysis
 ds = predictions.to_xarray()
 print(ds)
 ```
 
-Most production runs use the Hydra CLI:
+## Running with Docker
 
+You can easily run JCM using Docker, leveraging Hydra syntax to override model parameters on the fly. 
+
+### Run with default configuration
 ```bash
-# Default 10-day SPEEDY aquaplanet
-python -m jcm.main
-
-# ECHAM T63L47 with production RRTMGP radiation
-python -m jcm.main physics=echam-rrtmgp grid=echam_t63_l47_hybrid
-
-# Cheaper ECHAM development run with grey two-stream radiation
-python -m jcm.main physics=echam grid=echam_t63_l47_hybrid
-
-# Chunked, resumable long run
-python -m jcm.main physics=echam-rrtmgp grid=echam_t63_l47_hybrid run=longrun \
-    run.checkpoint_path=/scratch/$JOB_ID.ckpt
-
-# Inspect available config groups and the composed config
-python -m jcm.main --help
-python -m jcm.main --cfg job grid=echam_t63_l47_hybrid
+docker run --rm jcm-test
 ```
 
-Config groups live under [`jcm/config/`](jcm/config/) (`physics`, `grid`,
-`run`, `init`, `terrain`, `forcing`, and `diffusion`).
+### Override individual parameters
+```bash
+docker run --rm jcm-test +time_step=20
+docker run --rm jcm-test +layers=4
+docker run --rm jcm-test +total_time=30
+```
+
+### Override multiple parameters
+```bash
+docker run --rm jcm-test +time_step=20 +layers=4 +total_time=30
+```
+
+### Accessing Model Outputs
+To access the dynamically generated output files (like `model_state.nc`) created during the simulation, map the container's output directory back to your local host using a volume mount:
+
+```bash
+# Map the container's output directory to your local host
+docker run --rm -v $(pwd)/outputs:/app/outputs jcm-test +time_step=20 +layers=4
+```
+*(Note: Ensure `/app` matches your Docker container's working directory.)*
+
+## Examples
+
+Example notebooks are available in the `notebooks/` directory:
+
+- **`run-speedy.ipynb`**: Basic model simulation with SPEEDY physics
+- **`run-speedy-gradients.ipynb`**: Computing gradients through the model
+- **`optimization_example.ipynb`**: Parameter optimization examples
+- **`autodiff_userguide.ipynb`**: Guide to automatic differentiation features
 
 ## Physics Packages
 
-**SPEEDY** provides a compact climate-physics package for development,
-testing, and optimization examples: simplified convection, large-scale
-condensation, radiation, surface fluxes, vertical diffusion, and
-orographic drag.
+### SPEEDY Physics
 
-**ECHAM** is the v2.0 release target for climate-quality integrations. It
-includes Tiedtke-Nordeng convection, Sundqvist cloud cover, 1M/2M cloud
-microphysics, TTE-TKE vertical diffusion, multi-tile surface physics,
-gravity-wave drag, MACv2-SP aerosols, simple chemistry, and selectable
-radiation backends (`grey`, `rrtmgp`, `emulated`). See
-[`docs/source/echam_physics.rst`](docs/source/echam_physics.rst) for
-scheme notes, references, and current performance guidance.
+The SPEEDY (Simplified Parameterizations, primitivE-Equation DYnamics) physics package includes:
 
-Individual parameterizations are `PhysicsTerm` modules and can be
-combined with the composable physics API:
+- Convection (simplified mass-flux scheme)
+- Large-scale condensation
+- Shortwave and longwave radiation
+- Surface fluxes (land, ocean, sea ice)
+- Vertical diffusion
+- Orographic drag
 
-```python
-from jcm.physics.echam.echam_terms import echam_physics
-
-physics = echam_physics(radiation_scheme="rrtmgp")
-physics = echam_physics().remove("hines")
-```
-
-## Notebooks
-
-Examples live in [`notebooks/`](notebooks/):
-
-- `01_jcm_demo.ipynb`: SPEEDY aquaplanet and basic xarray analysis
-- `02_optimization_example.ipynb`: differentiable parameter optimization
-- `03_generate_speedy_default_stats.ipynb`: bundled SPEEDY reference statistics
-- `04_jcm_era5_example.ipynb`: ERA5-style initial state workflow
-- `04_jcm_slides.ipynb`: presentation overview
-- `05_jcm_echam_demo.ipynb`: ECHAM and composable physics demo
-- `06_macv2_aerosols.py`: MACv2-SP aerosol parameter workflow
-
-## Docker And Deployment
-
-Build the CUDA-enabled image locally:
-
-```bash
-docker build -t jcm .
-docker run --rm --gpus all jcm physics=echam-rrtmgp grid=echam_t63_l47_hybrid
-```
-
-Mount `/app/outputs` to persist Hydra output directories:
-
-```bash
-docker run --rm --gpus all -v "$(pwd)/outputs:/app/outputs" jcm \
-    physics=echam-rrtmgp grid=echam_t63_l47_hybrid run.total_time=30
-```
-
-Kubernetes examples for the NRP Nautilus cluster are in
-[`deploy/k8s/`](deploy/k8s/).
+> **Note**: ICON atmospheric physics is currently under development but not yet available in released versions.
 
 ## Documentation
 
-Read the hosted documentation at
-[jax-gcm.readthedocs.io](https://jax-gcm.readthedocs.io/en/latest/) or
-build it locally:
+For more details, see the [documentation](https://jax-gcm.readthedocs.io) (or build locally):
 
 ```bash
 cd docs
 make html
 ```
 
-Then open `docs/build/html/index.html`.
+Then open `docs/build/html/index.html` in your browser.
 
-## Testing And Development
+## Testing
 
-Run the fast suite locally:
+Run the test suite with pytest:
 
 ```bash
-pytest -m "not slow"
-ruff check .
+# Run all tests
+pytest
+
+# Run specific test file
+pytest jcm/model_test.py
+
+# Run with verbose output
+pytest -v
 ```
 
-The GitHub test workflow enforces coverage on push and pull requests. New
-work should target the `dev` branch; clean release points are merged to
-`main` and tagged.
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.
 
 ## Citation
 
@@ -191,10 +153,20 @@ If you use JAX-GCM in your research, please cite:
   title = {JAX-GCM: A Differentiable General Circulation Model},
   author = {J. Madan, E. Davenport, et al.},
   year = {2025},
-  url = {https://github.com/climate-analytics-lab/jax-gcm}
+  url = {[https://github.com/climate-analytics-lab/jax-gcm](https://github.com/climate-analytics-lab/jax-gcm)}
 }
 ```
 
 ## License
 
-JAX-GCM is licensed under Apache 2.0. See [`LICENSE`](LICENSE).
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- **Dinosaur**: JAX-GCM builds on the [Dinosaur](https://github.com/google-research/dinosaur) dynamical core developed by Google Research
+- **SPEEDY**: Physics parameterizations adapted from the [SPEEDY](https://users.ictp.it/~kucharsk/speedy-net.html) model by F. Molteni
+- **SPEEDY.f90**: We referenced the [Fortran 90 version](https://github.com/samhatfield/speedy.f90) of SPEEDY by Sam Hatfield and Leo Saffin for our specific implementation.
+
+## Contact
+
+For questions or collaboration inquiries, please open an issue or contact dwatsonparris@ucsd.edu.
