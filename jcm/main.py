@@ -8,8 +8,7 @@ from pathlib import Path
 def main(cfg: DictConfig):
     """Run Speedy Model with adjustable parameters"""
     model = Model(
-        time_step=cfg.model.time_step,
-        layers=cfg.model.layers
+        time_step=cfg.model.time_step
     )
     
     predictions = model.run(
@@ -18,20 +17,13 @@ def main(cfg: DictConfig):
     )
     
     ds = predictions.to_xarray()
+    
     hydra_cfg = HydraConfig.get()
-    print(hydra_cfg.mode)
-    base_dir = Path('outputs') / hydra_cfg.run.dir.split('outputs/')[-1]
-    
-    if str(hydra_cfg.mode) == "RunMode.MULTIRUN":
-        output_dir = base_dir / 'multirun' / str(hydra_cfg.job.num)
-    else:
-        output_dir = base_dir
-    
+    output_dir = Path(hydra_cfg.runtime.output_dir)
     
     filename = "model_state.nc"
     output_path = output_dir / filename
     
-    output_dir.mkdir(parents=True, exist_ok=True)
     ds.to_netcdf(str(output_path))
 
 if __name__ == "__main__":
